@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# Compiled Compact contract (~37MB of ZK prover keys). Regenerate with `npm run build`.
+src/managed/
+
+# env — keep .env.example committed, ignore the real values
+.env
+.env.local
+
+# Cached synced wallet state (contains wallet state — keep private)
+.wallet-cache/
+
+# Midnight private-state LevelDB (wallet/contract private state — keep private)
+.midnight-state/
+
+# Deployment records — CONTAIN THE OWNER SECRET KEY. Never commit.
+deployments/*.json
+
+# misc
+.DS_Store
+*.log
+*.tsbuildinfo
+*.pem
+
+dareu-contract-run.sh
