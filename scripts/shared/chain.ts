@@ -1,6 +1,7 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 
+import pg from 'pg'
 import { findDeployedContract } from '@midnight-ntwrk/midnight-js-contracts'
 import { fromHex } from '@midnight-ntwrk/midnight-js-utils'
 
@@ -13,15 +14,31 @@ import {
   ensureCompiledContract,
   requiredWalletSeedOrMnemonic,
   waitForDustSyncedState,
-  type SupportedNetwork,
 } from './midnight.js'
+import { type SupportedNetwork } from './network.js'
 
-// Shared bootstrap for privileged ("keeper") operations that used to be relayer
-// endpoints: create_market, resolve_market, cancel_market, withdraw_treasury.
-// These hold the owner/oracle secret key and submit transactions directly — they
-// are on-demand admin scripts, NOT a long-running service.
+// Re-export so existing importers (admin/market.ts, keeper/*) keep getting
+// resolveNetwork from chain.js; the implementation lives in network.ts.
+export { resolveNetwork } from './network.js'
+
+// Shared chain/env infrastructure: env loading, network resolution, deployment
+// lookup, Postgres exec, and `connectKeeper` (owner-authenticated contract handle).
+// Consumed by BOTH the local admin scripts (deploy.ts, market.ts) and the keeper
+// SERVICE (scripts/keeper/*). It is plumbing, not an entrypoint.
 
 const envFiles = ['.env', '.env.local']
+
+// One-shot Postgres exec (standard `pg`; opens/closes a connection per call).
+// Shared by the local market admin and the keeper service.
+export async function pgExec(connectionString: string, text: string, params: unknown[]) {
+  const client = new pg.Client({ connectionString })
+  await client.connect()
+  try {
+    return await client.query(text, params)
+  } finally {
+    await client.end()
+  }
+}
 
 export function loadEnvFiles() {
   for (const filename of envFiles) {
@@ -56,14 +73,6 @@ export function parseHexBytes(value: string, expectedLength: number, label: stri
     throw new Error(`${label} must be ${expectedLength} bytes (${expectedLength * 2} hex chars).`)
   }
   return new Uint8Array(bytes)
-}
-
-export function resolveNetwork(arg?: string): SupportedNetwork {
-  const network = (arg || process.env.MIDNIGHT_NETWORK || 'preprod') as SupportedNetwork
-  if (network !== 'preprod' && network !== 'preview') {
-    throw new Error(`Unsupported network "${network}". Use "preprod" or "preview".`)
-  }
-  return network
 }
 
 export function readDeployment(network: SupportedNetwork): { contractAddress: string; privateStateId: string } {

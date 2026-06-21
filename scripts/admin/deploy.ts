@@ -18,8 +18,8 @@ import {
   submitTransactionOnce,
   syncAllowedGap,
   waitForUnshieldedSyncedState,
-  type SupportedNetwork,
-} from './midnight.js';
+} from '../shared/midnight.js';
+import { resolveNetwork } from '../shared/network.js';
 
 const deploymentDir = path.join(contractRoot, 'deployments');
 const envFiles = ['.env', '.env.local'];
@@ -235,10 +235,7 @@ async function main() {
   loadEnvFiles();
   ensureCompiledContract();
 
-  const network = (process.argv[2] || process.env.MIDNIGHT_NETWORK || 'preprod') as SupportedNetwork;
-  if (network !== 'preprod' && network !== 'preview') {
-    throw new Error(`Unsupported network "${network}". Use "preprod" or "preview".`);
-  }
+  const network = resolveNetwork(process.argv[2]);
 
   const config = configureNetwork(network);
   const walletSeed = requiredWalletSeedOrMnemonic();

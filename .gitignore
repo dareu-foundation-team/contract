@@ -9,7 +9,7 @@ src/managed/
 
 # env — keep .env.example committed, ignore the real values
 .env
-.env.local
+.env.local*
 
 # Cached synced wallet state (contains wallet state — keep private)
 .wallet-cache/
@@ -26,4 +26,7 @@ deployments/*.json
 *.tsbuildinfo
 *.pem
 
-dareu-contract-run.sh
+contract-keeper-run.sh
+contract-runbook.md
+keeper-runbook.md
+proof-server-runbook.md

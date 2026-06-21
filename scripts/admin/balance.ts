@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { unshieldedToken } from '@midnight-ntwrk/ledger-v8';
 import WebSocket from 'ws';
 
-type SupportedNetwork = 'preprod' | 'preview';
+import { resolveNetwork, resolveNetworkConfig } from '../shared/network.js';
 
 type UnshieldedUtxo = {
   owner: string;
@@ -38,14 +38,10 @@ type UnshieldedProgressUpdate = {
 type UnshieldedUpdate = UnshieldedTransactionUpdate | UnshieldedProgressUpdate;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const contractRoot = path.resolve(__dirname, '..');
+// This file lives in scripts/admin/, so the contract root is two levels up.
+const contractRoot = path.resolve(__dirname, '..', '..');
 const envFiles = ['.env', '.env.local'];
 const unshieldedTokenType = unshieldedToken().raw;
-
-const defaultIndexerWs: Record<SupportedNetwork, string> = {
-  preprod: 'wss://indexer.preprod.midnight.network/api/v4/graphql/ws',
-  preview: 'wss://indexer.preview.midnight.network/api/v4/graphql/ws',
-};
 
 const query = `
   subscription UnshieldedTransactions($address: UnshieldedAddress!, $transactionId: Int) {
@@ -121,12 +117,8 @@ function usage() {
 }
 
 function parseArgs() {
-  const network = (process.argv[2] || process.env.MIDNIGHT_NETWORK || 'preprod') as SupportedNetwork;
+  const network = resolveNetwork(process.argv[2]);
   const address = process.argv[3]?.trim();
-
-  if (network !== 'preprod' && network !== 'preview') {
-    throw new Error(`Unsupported network "${network}". Use "preprod" or "preview".`);
-  }
 
   if (!address) {
     throw new Error(usage());
@@ -137,7 +129,7 @@ function parseArgs() {
     throw new Error(`Expected an unshielded ${network} address starting with "${expectedPrefix}".`);
   }
 
-  const indexerWs = process.env.MIDNIGHT_INDEXER_WS_URL || defaultIndexerWs[network];
+  const indexerWs = resolveNetworkConfig(network).indexerWS;
   return { network, address, indexerWs };
 }
 

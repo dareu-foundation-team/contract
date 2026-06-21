@@ -26,19 +26,10 @@ import * as ledger from '@midnight-ntwrk/ledger-v8';
 import * as Rx from 'rxjs';
 import WebSocket from 'ws';
 
-import { Contract, type Witnesses } from '../src/managed/dareu/contract/index.js';
+import { Contract, type Witnesses } from '../../src/managed/dareu/contract/index.js';
+import { type SupportedNetwork, type NetworkConfig, resolveNetworkConfig } from './network.js';
 
-type SupportedNetwork = 'preprod' | 'preview';
 type WalletSyncedState = Awaited<ReturnType<WalletFacade['waitForSyncedState']>>;
-
-export type NetworkConfig = {
-  indexer: string;
-  indexerWS: string;
-  node: string;
-  nodeWS: string;
-  proofServer: string;
-  faucet: string;
-};
 
 export type WalletContext = {
   wallet: WalletFacade;
@@ -50,7 +41,8 @@ export type WalletContext = {
 };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-export const contractRoot = path.resolve(__dirname, '..');
+// This file lives in scripts/shared/, so the contract root is two levels up.
+export const contractRoot = path.resolve(__dirname, '..', '..');
 export const zkConfigPath = path.resolve(contractRoot, 'src', 'managed', 'dareu');
 
 // On-disk cache of synced wallet state so repeated deploy/keeper runs sync
@@ -94,38 +86,6 @@ function loadWalletStateCache(network: SupportedNetwork, address: string): Walle
 export const stateRoot = path.resolve(contractRoot, '.midnight-state');
 let dustReplayPatchInstalled = false;
 let skippedDustDtimeUpdates = 0;
-
-const defaultConfigs: Record<SupportedNetwork, NetworkConfig> = {
-  preprod: {
-    indexer: 'https://indexer.preprod.midnight.network/api/v4/graphql',
-    indexerWS: 'wss://indexer.preprod.midnight.network/api/v4/graphql/ws',
-    node: 'https://rpc.preprod.midnight.network',
-    nodeWS: 'wss://rpc.preprod.midnight.network',
-    proofServer: 'http://127.0.0.1:6300',
-    faucet: 'https://midnight-tmnight-preprod.nethermind.dev/',
-  },
-  preview: {
-    indexer: 'https://indexer.preview.midnight.network/api/v4/graphql',
-    indexerWS: 'wss://indexer.preview.midnight.network/api/v4/graphql/ws',
-    node: 'https://rpc.preview.midnight.network',
-    nodeWS: 'wss://rpc.preview.midnight.network',
-    proofServer: 'http://127.0.0.1:6300',
-    faucet: 'https://midnight-tmnight-preview.nethermind.dev/',
-  },
-};
-
-export function resolveNetworkConfig(network: SupportedNetwork, env = process.env): NetworkConfig {
-  const defaults = defaultConfigs[network];
-
-  return {
-    indexer: env.MIDNIGHT_INDEXER_URL || defaults.indexer,
-    indexerWS: env.MIDNIGHT_INDEXER_WS_URL || defaults.indexerWS,
-    node: env.MIDNIGHT_NODE_URL || defaults.node,
-    nodeWS: env.MIDNIGHT_NODE_WS_URL || defaults.nodeWS,
-    proofServer: env.MIDNIGHT_PROOF_SERVER || defaults.proofServer,
-    faucet: env.MIDNIGHT_FAUCET_URL || defaults.faucet,
-  };
-}
 
 function timeoutMs(name: string, fallback: number) {
   const rawValue = process.env[name]?.trim();
@@ -653,5 +613,3 @@ export async function createProviders(
     },
   };
 }
-
-export type { SupportedNetwork };

@@ -1,30 +1,19 @@
-import pg from 'pg'
-
-import { Outcome } from '../src/managed/dareu/contract/index.js'
-import { prepareMarket } from './market-metadata.js'
+import { Outcome } from '../../src/managed/dareu/contract/index.js'
+import { prepareMarket } from '../shared/market-metadata.js'
 import {
   connectKeeper,
   loadEnvFiles,
   optionalEnv,
   parseHexBytes,
+  pgExec,
   readDeployment,
   requiredEnv,
   resolveNetwork,
-} from './keeper.js'
+} from '../shared/chain.js'
 
-// One-shot Postgres exec via the standard `pg` driver (works with local Postgres
-// and any hosted Postgres). Opens and closes a connection per call.
-async function pgExec(connectionString: string, text: string, params: unknown[]) {
-  const client = new pg.Client({ connectionString })
-  await client.connect()
-  try {
-    return await client.query(text, params)
-  } finally {
-    await client.end()
-  }
-}
-
-// Admin CLI that replaces the old relayer's privileged write endpoints.
+// LOCAL admin CLI (run manually): one-off privileged writes against the deployed
+// contract. The automated keeper SERVICE (publish/sync/autopropose) lives in
+// scripts/keeper/ and runs on a server — keep the two separate.
 //   npm run market:create     -- preprod   (reads MARKET_* env for metadata)
 //   npm run market:resolve    -- preprod   (MARKET_ID + MARKET_OUTCOME=YES|NO)
 //   npm run market:cancel     -- preprod   (MARKET_ID)
@@ -83,6 +72,21 @@ async function createMarket(network: ReturnType<typeof resolveNetwork>) {
       BigInt(prepared.contractCall.args.close_time),
     )
     logTx('create_market', result)
+
+    // 3) Record the on-chain tx id so the webapp knows this market is live on-chain
+    //    (it gates betting on onchain_tx_id IS NOT NULL). Off-chain-only metadata
+    //    rows stay NULL and the UI greys out betting for them.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const r = result as any
+    const txId: string = r?.public?.txId ?? r?.txId ?? r?.finalizedTxData?.txId ?? ''
+    if (txId) {
+      await pgExec(
+        requiredEnv('DATABASE_URL'),
+        `UPDATE markets SET onchain_tx_id = $2, updated_at = now() WHERE id = $1`,
+        [prepared.marketId, txId],
+      )
+      console.log(`Marked on-chain. marketId: ${prepared.marketId} onchain_tx_id: ${txId}`)
+    }
   } finally {
     await walletCtx.wallet.stop()
   }

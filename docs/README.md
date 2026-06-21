@@ -19,6 +19,19 @@ explains **why and how**; the second half (["Using the contract"](#using-the-con
 is the practical build/deploy/CLI reference. Where this document and the code disagree,
 **the code is authoritative.**
 
+### Operational runbooks
+
+`contract/` ships three independently deployable on-chain units, each with its own
+runbook:
+
+| Unit | What it does | Runbook |
+| --- | --- | --- |
+| **Smart contract** | Compile + deploy the contract to Midnight (first launch / on source changes) | [contract-runbook.md](./contract-runbook.md) |
+| **Proof server** | Local ZK proving service (`:6300`); deploy / keeper / webapp all depend on it | [proof-server-runbook.md](./proof-server-runbook.md) |
+| **Keeper** | Always-on automation: chain↔DB sync, draft markets on-chain, auto-propose resolutions | [keeper-runbook.md](./keeper-runbook.md) |
+
+> Start order: **proof server** first → **deploy** (one-off) → **keeper** (long-running).
+
 ---
 
 ## Why — public prediction markets leak everything
@@ -99,7 +112,7 @@ off-chain without the contract storing the wallet link.
 Rich market content (title, description, category, image, …) is **not** stored
 on-chain — it lives off-chain in Postgres. The chain commits only to a hash of it. The
 id and hash are computed deterministically by
-[`scripts/market-metadata.ts`](../scripts/market-metadata.ts) (`prepareMarket`):
+[`scripts/shared/market-metadata.ts`](../scripts/shared/market-metadata.ts) (`prepareMarket`):
 
 ```
 metadata_hash = sha256( canonicalJSON(metadata) )
@@ -118,7 +131,7 @@ serializes to identical bytes. Consequences:
 - **Domain separation** — the `namespace` tag prevents `market_id` from colliding with
   the participant/position/vote/commitment hash schemes.
 
-A **drift guard** ([`scripts/market-metadata.golden.ts`](../scripts/market-metadata.golden.ts),
+A **drift guard** ([`scripts/shared/market-metadata.golden.ts`](../scripts/shared/market-metadata.golden.ts),
 `npm run test:metadata`) pins this function to known-good outputs. DataProvider vendors
 a copy of the same logic and runs the same golden values, so the two implementations
 cannot diverge silently (see [Drift-guard test](#drift-guard-test)).
@@ -342,7 +355,7 @@ npm run start-proof-server
 npm run deploy:preprod
 ```
 
-[`scripts/deploy.ts`](../scripts/deploy.ts) loads `.env` / `.env.local`, requires a
+[`scripts/admin/deploy.ts`](../scripts/admin/deploy.ts) loads `.env` / `.env.local`, requires a
 compiled contract, funds + DUST-registers the wallet, then submits the deploy
 transaction. On success it writes `deployments/<network>.json` — **which contains the
 owner secret key**, so that file is git-ignored. Keep it private. Constructor args come
@@ -368,7 +381,7 @@ Copy [`.env.example`](../.env.example) to `.env.local` and fill in. Key variable
 
 ## Admin & keeper CLI
 
-[`scripts/market.ts`](../scripts/market.ts) provides the privileged operations
+[`scripts/admin/market.ts`](../scripts/admin/market.ts) provides the privileged operations
 (owner/oracle keyed). It upserts off-chain metadata to Postgres first, then submits the
 matching circuit:
 
@@ -387,7 +400,7 @@ npm run balance:preprod    -- <mn_addr_preprod...>   # query an unshielded balan
 ## Drift-guard test
 
 ```bash
-npm run test:metadata      # → tsx scripts/market-metadata.golden.ts (exits 1 on mismatch)
+npm run test:metadata      # → tsx scripts/shared/market-metadata.golden.ts (exits 1 on mismatch)
 ```
 
 `prepareMarket` is the single source of truth for `market_id` / `metadata_hash`, and
@@ -400,18 +413,30 @@ DataProvider side, so if the two implementations ever diverge a golden test fail
 
 ```
 contract/
-├── src/dareu.compact            # the contract (12 circuits)
+├── src/dareu.compact                  # the contract (12 circuits)
 ├── scripts/
-│   ├── market-metadata.ts       # deterministic market_id / metadata_hash (prepareMarket)
-│   ├── market-metadata.golden.ts# drift guard (npm run test:metadata)
-│   ├── deploy.ts                # deploy a fresh contract
-│   ├── keeper.ts                # shared connect-as-owner bootstrap
-│   ├── market.ts                # admin CLI (create/propose/dispute/finalize/vote/...)
-│   ├── midnight.ts              # wallet, providers, network config, sync/cache
-│   └── balance.ts               # unshielded balance query
-├── deployments/<network>.json   # deploy record (git-ignored; holds owner secret)
-├── .env.example                 # env reference
-└── docs/README.md               # this document
+│   ├── shared/                        # cross-cutting helpers
+│   │   ├── chain.ts                   #   env / pg / connect-as-owner bootstrap
+│   │   ├── midnight.ts                #   wallet, providers, network config, sync/cache
+│   │   ├── network.ts                 #   per-network endpoints (single source of truth)
+│   │   ├── market-metadata.ts         #   deterministic market_id / metadata_hash (prepareMarket)
+│   │   └── market-metadata.golden.ts  #   drift guard (npm run test:metadata)
+│   ├── admin/                         # privileged, run by hand
+│   │   ├── deploy.ts                  #   deploy a fresh contract
+│   │   ├── market.ts                  #   admin CLI (create/propose/dispute/finalize/vote/...)
+│   │   └── balance.ts                 #   unshielded balance query
+│   └── keeper/                        # always-on automation service
+│       ├── run.ts                     #   scheduler loop (sync + publish + autopropose)
+│       ├── publish.ts                 #   draft markets → create_market on-chain
+│       ├── sync.ts                    #   chain markets → Postgres mirror
+│       └── autopropose.ts             #   closed markets → propose_resolution
+├── deployments/<network>.json         # deploy record (git-ignored; holds owner secret)
+├── .env.example                       # env reference
+└── docs/
+    ├── README.md                      # this document (design + usage)
+    ├── contract-runbook.md            # build + deploy runbook
+    ├── proof-server-runbook.md        # proof server runbook
+    └── keeper-runbook.md              # keeper operations runbook
 ```
 
 ---
