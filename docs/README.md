@@ -12,7 +12,7 @@ leaves the client, so the link between a wallet and its positions/PnL stays priv
 
 - **Network:** Midnight (Compact, `language_version >= 0.22`)
 - **Source:** [`src/dareu.compact`](../src/dareu.compact)
-- **Deployed (preprod):** `d62e23dce7a2439b1ff36903e21917ff6feb62d944b0426c403e09d5e74ba78d`
+- **Deployed (preprod):** `96bf851024c7207e141c8c4a3f4dd3ef2968f293e2d6dc66b73ccd564db644d9`
 
 This document doubles as the design rationale and the usage guide. The first half
 explains **why and how**; the second half (["Using the contract"](#using-the-contract))
@@ -60,7 +60,7 @@ The contract takes exactly one private input — the caller's secret key, via th
 `local_secret_key()`. Identity is derived from it as a one-way hash:
 
 ```compact
-circuit participant_id(sk: Bytes<32>): Bytes<32> {
+export pure circuit participant_id(sk: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<2, Bytes<32>>>([pad(32, "dareu:participant:"), sk]);
 }
 circuit current_participant(): Bytes<32> {            // the contract's private "msg.sender"
@@ -72,6 +72,11 @@ The chain only ever sees this `participant_id` — never the key. Positions are 
 under an unguessable `position_id = hash("dareu:position:", market_id, bettor, nonce)`,
 so a wallet's bets are **not enumerable** from its public address, and a `nonce` lets
 one identity hold many independent positions.
+
+`participant_id` and `position_id` are exported as **`pure` circuits**, so the
+generated bindings expose them on `pureCircuits` — a client (browser, keeper, tests)
+derives the exact same ids locally, with **zero proving and no risk of a TypeScript
+re-implementation drifting** from the on-chain hash.
 
 **Private vs public.** DareU protects the *linkage* between a real wallet and its
 activity, not the aggregate market state. Pool sizes, bet amounts, sides, and payout
@@ -148,14 +153,23 @@ and the optimistic-oracle parameters `resolution_bond`, `challenge_window`, and
 
 ## The 12 circuits
 
-The contract exports **12 circuits**, grouped by purpose.
+The contract exports **12 circuits**, grouped by purpose. (It also exports two `pure`
+helper circuits — `participant_id` and `position_id` — for off-chain id derivation;
+pure circuits carry no verifier key and so do not count toward the deploy budget below.)
+
+> **Why exactly 12.** Each provable circuit adds a verifier key to the single deploy
+> transaction, and **13 circuits exceed Midnight's per-block transaction limit** (a
+> deploy of 13 fails with `Transaction would exhaust the block limits`). The
+> escape-hatch logic is therefore folded into `cancel_market` rather than shipped as a
+> separate circuit, and `withdraw_credit` multiplexes two payout paths behind an
+> `is_leader_reward` flag — both to stay at 12.
 
 ### Market management
 | Circuit | Who | What it does |
 | --- | --- | --- |
 | `create_market` | owner | Create a market from an `(market_id, metadata_hash, oracle, close_time)` commitment. Pools start empty; market opens. |
 | `place_bet` | anyone | Escrow a stake on YES or NO, grow the chosen pool, record a private `Position`, return its `position_id`. Optional copy-trading `leader`. |
-| `cancel_market` | owner / oracle | Cancel an **OPEN** market; pools are kept intact for refunds. |
+| `cancel_market` | owner / oracle | Two modes: (a) owner **or** oracle cancels an **OPEN** market immediately; (b) owner-only **escape hatch** for a stuck **PROPOSED/DISPUTED** market, allowed only after a grace period, refunding both bonds. Pools are kept intact for refunds. |
 
 ### Optimistic-oracle resolution
 | Circuit | Who | What it does |
@@ -208,12 +222,21 @@ copy-trading commission if it later wins.
 3. **Dispute** — `dispute_resolution`, during the window, posts an equal counter-bond
    and sets `status = DISPUTED`. Two competing claims are now bonded.
 4. **Vote** — `vote_dispute` lets each enrolled **arbiter** (DVM council, managed via
-   `set_arbiter`) vote once (deduplicated by `vote_key` in `dispute_votes`). When a side
-   reaches `arbiter_threshold`, the market settles to that outcome and whichever party
-   (proposer or disputer) backed the winning side is credited **both** bonds.
+   `set_arbiter`) vote once (deduplicated by `vote_key` membership in the
+   `dispute_votes: Set`). When a side reaches `arbiter_threshold`, the market settles to
+   that outcome and whichever party (proposer or disputer) backed the winning side is
+   credited **both** bonds.
 
 Settlement (`settle_market`) sets `status = RESOLVED` and refuses to resolve a market
 whose winning pool is empty (nobody to pay) — such markets must be cancelled instead.
+
+**Escape hatch for a stuck market.** If a PROPOSED/DISPUTED market can never complete
+(e.g. the arbiter council is unavailable or stalls), its bets + both bonds would
+otherwise be locked forever. `cancel_market` therefore lets the **owner** cancel such a
+market — but only after an extra `challenge_window` of grace beyond `propose_deadline`,
+so it can never front-run a still-possible finalize/vote. Both bonds are credited back
+and the market becomes CANCELLED, so every bettor can recover their exact stake via
+`refund_cancelled_position`.
 
 **Claim (ZK-proven entitlement).** `claim_winnings` proves entitlement: the caller must
 be the position's `bettor` (proven via the private key), the position unclaimed, the
@@ -304,6 +327,31 @@ correct one, an assertion fails and the claim reverts.
 - **The arbiter council** — disputed markets are decided by a majority of enrolled
   arbiters up to `arbiter_threshold`; their honesty is the final backstop.
 
+### Hardening (security pass)
+
+Changes from the most recent audit + hardening pass, all reflected in the current code:
+
+- **No funds locked in a stalled dispute** — `cancel_market` gained the owner-only,
+  time-gated escape hatch (above) so a PROPOSED/DISPUTED market that the arbiter council
+  never resolves can still be unwound, refunding bets and both bonds.
+- **Immutable config enforced by the compiler** — `owner` and `payment_token` are
+  `sealed ledger` fields; the compiler rejects any circuit that reassigns them.
+- **Owner key never on disk** — deploy requires `DAREU_OWNER_SECRET_KEY` explicitly
+  (no silent auto-generation) and records only its `participant_id`.
+- **Tighter guards** — explicit `resolutions.member(...)` checks before every lookup,
+  and a proposer cannot dispute their own proposal.
+- **Set, not Map, for `dispute_votes`** — membership-only state modelled with the right
+  ADT. `bet_commitment` was renamed `bet_content_hash` to make clear it is a content
+  hash, not a hiding commitment.
+- **Full unit suite** — 64 in-process tests cover every circuit's happy and revert
+  paths (see [Testing](#testing)).
+
+> **Concurrency note (unchanged limitation).** `treasury` and the `*_credits` /
+> `*_rewards` maps are read-modify-write accumulators, so simultaneous claims/withdrawals
+> on the same key can conflict under Midnight's optimistic concurrency and require a
+> retry. This is inherent to the model (a `Counter` cannot hold `Uint<64>` fees) and is
+> handled at the client layer, not the contract.
+
 ---
 
 ## Limitations & future work
@@ -357,9 +405,11 @@ npm run deploy:preprod
 
 [`scripts/admin/deploy.ts`](../scripts/admin/deploy.ts) loads `.env` / `.env.local`, requires a
 compiled contract, funds + DUST-registers the wallet, then submits the deploy
-transaction. On success it writes `deployments/<network>.json` — **which contains the
-owner secret key**, so that file is git-ignored. Keep it private. Constructor args come
-from env (below).
+transaction. On success it writes `deployments/<network>.json`. The owner secret key
+**must be supplied explicitly** via `DAREU_OWNER_SECRET_KEY` (it is never auto-generated),
+and the deployment record stores **only its public `participant_id`** — the raw secret
+key is never written to disk. The file is still git-ignored as a precaution.
+Constructor args come from env (below).
 
 ## Environment
 
@@ -372,7 +422,7 @@ Copy [`.env.example`](../.env.example) to `.env.local` and fill in. Key variable
 | `MIDNIGHT_PROOF_SERVER` | Proof server URL (default `http://127.0.0.1:6300`) |
 | `MIDNIGHT_WALLET_MNEMONIC` **or** `MIDNIGHT_WALLET_SEED` | Wallet key — a BIP39 recovery phrase (precedence) or a hex HD seed |
 | `MIDNIGHT_PRIVATE_STATE_PASSWORD` | Encrypts the local private-state store |
-| `DAREU_OWNER_SECRET_KEY` | 32-byte hex; deploy generates one if unset, keeper requires it |
+| `DAREU_OWNER_SECRET_KEY` | 32-byte hex; **required** by deploy and keeper (never auto-generated). Only its `participant_id` is recorded on disk; keep this value safe — it is the admin credential for the contract's whole lifetime |
 | `DAREU_PAYMENT_TOKEN_HEX` | 32-byte token type (defaults to the native unshielded token) |
 | `DAREU_LEADER_COMMISSION_BPS` / `DAREU_PLATFORM_FEE_BPS` | Fee rates in basis points (defaults `1000` / `200`) |
 | `DATABASE_URL` + `MARKET_*` / `TREASURY_AMOUNT` / `ARBITER_*` | Admin market CLI inputs |
@@ -397,6 +447,27 @@ npm run treasury:withdraw  -- preprod   # TREASURY_AMOUNT
 npm run balance:preprod    -- <mn_addr_preprod...>   # query an unshielded balance
 ```
 
+## Testing
+
+A network-free unit suite runs the **real compiled circuits in-process** via
+`@midnight-ntwrk/compact-runtime` — no node / proof server / indexer needed. ZK proving
+is skipped; the circuit logic (asserts, ledger writes, token effects, `kernel.blockTime*`
+checks) is exercised directly. See [`tests/README.md`](../tests/README.md).
+
+```bash
+npm test           # 64 tests across constructor + all 12 circuits
+npm run test:watch # re-run on change
+npm run typecheck  # also type-checks the tests
+```
+
+Each circuit has happy-path coverage plus negative tests for its `assert` guards
+(authorization, state-machine phase, time windows, double-claim, and the exact-floor
+bracket bounds in `claim_winnings`). The stuck-market escape hatch in `cancel_market`
+is covered end-to-end (grace gate, owner-only, both-bond refunds, then refund). The
+harness derives identities/ids through the exported `pureCircuits`, so tests never
+re-implement the contract's hashing. Run `npm run build` first if `src/managed/dareu`
+is missing or the contract changed.
+
 ## Drift-guard test
 
 ```bash
@@ -414,6 +485,12 @@ DataProvider side, so if the two implementations ever diverge a golden test fail
 ```
 contract/
 ├── src/dareu.compact                  # the contract (12 circuits)
+├── tests/                             # network-free unit tests (node --test, see Testing)
+│   ├── helpers/                       #   simulator + fixtures (runs circuits in-process)
+│   ├── admin.test.ts                  #   constructor + set_arbiter
+│   ├── markets.test.ts                #   create_market + place_bet
+│   ├── oracle.test.ts                 #   propose/dispute/finalize/vote + escape hatch
+│   └── payouts.test.ts                #   claim_winnings math, refunds, withdrawals
 ├── scripts/
 │   ├── shared/                        # cross-cutting helpers
 │   │   ├── chain.ts                   #   env / pg / connect-as-owner bootstrap
@@ -430,7 +507,7 @@ contract/
 │       ├── publish.ts                 #   draft markets → create_market on-chain
 │       ├── sync.ts                    #   chain markets → Postgres mirror
 │       └── autopropose.ts             #   closed markets → propose_resolution
-├── deployments/<network>.json         # deploy record (git-ignored; holds owner secret)
+├── deployments/<network>.json         # deploy record (git-ignored; owner participant_id only, never the secret)
 ├── .env.example                       # env reference
 └── docs/
     ├── README.md                      # this document (design + usage)

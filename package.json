@@ -25,7 +25,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test:metadata": "tsx scripts/shared/market-metadata.golden.ts",
     "start-proof-server": "docker run -p 6300:6300 midnightntwrk/proof-server:8.0.3 -- midnight-proof-server -v",
-    "test": "echo \"Tests not yet implemented\""
+    "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "test:watch": "node --import tsx --watch --test \"tests/**/*.test.ts\""
   },
   "dependencies": {
     "pg": "^8.13.1",

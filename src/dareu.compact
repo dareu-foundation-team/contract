@@ -88,9 +88,13 @@ export struct Resolution {
   no_votes: Uint<64>,         // arbiter votes for NO
 }
 
-// ---- Platform configuration (set in the constructor; a few are owner-tunable) ----
-export ledger owner: Bytes<32>;                 // participant_id of the admin/owner
-export ledger payment_token: Bytes<32>;         // token type used for all bets/payouts
+// ---- Platform configuration (all set once in the constructor) ----
+// owner and payment_token are `sealed`: the compiler rejects any reassignment in a
+// circuit, locking in the deploy-time values. The remaining fields are left unsealed
+// so owner-only setters could be added later — but NO setters exist today, so every
+// field below is effectively immutable after deployment.
+export sealed ledger owner: Bytes<32>;          // participant_id of the admin/owner
+export sealed ledger payment_token: Bytes<32>;  // token type used for all bets/payouts
 export ledger leader_commission_rate: Uint<64>; // Basis points: 1000 = 10%.
 export ledger platform_fee_rate: Uint<64>;      // Basis points: 200 = 2%.
 export ledger treasury: Uint<64>;               // accumulated platform fees (owner withdraws)
@@ -107,7 +111,7 @@ export ledger challenge_window: Uint<64>;   // minimum seconds between close and
 export ledger arbiter_threshold: Uint<64>;  // votes needed to settle a dispute.
 export ledger arbiters: Map<Bytes<32>, Boolean>;          // participant_id -> authorized (DVM council).
 export ledger resolutions: Map<Bytes<32>, Resolution>;    // market_id -> proposal record.
-export ledger dispute_votes: Map<Bytes<32>, Boolean>;     // hash(market_id, arbiter) -> voted (one vote/arbiter).
+export ledger dispute_votes: Set<Bytes<32>>;              // vote_key(market_id, arbiter); membership == already voted.
 export ledger bond_credits: Map<Bytes<32>, Uint<64>>;     // participant_id -> withdrawable bond (pull payments).
 
 // Optional audit trail for privacy-preserving clients: position_id -> bet commitment.
@@ -124,7 +128,7 @@ witness local_secret_key(): Bytes<32>;
 // tag ("dareu:participant:") namespaces this hash so it can't collide with the
 // position/vote/commitment hashes below. Same key in -> same id out, but the key
 // itself can't be recovered from the id.
-circuit participant_id(sk: Bytes<32>): Bytes<32> {
+export pure circuit participant_id(sk: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<2, Bytes<32>>>([pad(32, "dareu:participant:"), sk]);
 }
 
@@ -137,14 +141,28 @@ circuit current_participant(): Bytes<32> {
 // Deterministic, unlinkable key for a Position. The `nonce` lets one bettor hold
 // several distinct positions in the same market, and keeps the id unguessable by
 // others (so positions can't be enumerated from a public address).
-circuit position_id(market_id: Bytes<32>, bettor: Bytes<32>, nonce: Bytes<32>): Bytes<32> {
+export pure circuit position_id(market_id: Bytes<32>, bettor: Bytes<32>, nonce: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<4, Bytes<32>>>([pad(32, "dareu:position:"), market_id, bettor, nonce]);
 }
 
-// Hash commitment to the full contents of a bet (stored in `commitments`). An
-// off-chain client can later reveal market_id/bettor/side/amount/nonce and prove
-// they hash to this value, without the chain having recorded the wallet link.
-circuit bet_commitment(
+// Pre-image struct for the bet content hash below. Declared before its use.
+export struct BetCommitment {
+  market_id: Bytes<32>,
+  bettor: Bytes<32>,
+  side: Outcome,
+  amount: Uint<64>,
+  nonce: Bytes<32>,
+}
+
+// Content HASH (NOT a hiding commitment) over the full contents of a bet, stored in
+// `commitments`. It uses persistentHash, which provides no blinding: every field
+// hashed here (bettor/side/amount) is ALSO public in the Position record at the same
+// key, so this hash adds no secrecy over the already-disclosed Position fields — it
+// only lets an off-chain client prove a bet's contents by inclusion. The 32-byte
+// nonce keeps the preimage unguessable. If real hiding is ever required, switch to
+// persistentCommit with a fresh secret salt and stop disclosing the matching Position
+// fields. (Renamed from `bet_commitment` to avoid implying a cryptographic commitment.)
+pure circuit bet_content_hash(
   market_id: Bytes<32>,
   bettor: Bytes<32>,
   side: Outcome,
@@ -158,14 +176,6 @@ circuit bet_commitment(
     amount: amount,
     nonce: nonce,
   });
-}
-
-export struct BetCommitment {
-  market_id: Bytes<32>,
-  bettor: Bytes<32>,
-  side: Outcome,
-  amount: Uint<64>,
-  nonce: Bytes<32>,
 }
 
 // Runs once at deployment. The owner is identified by the participant_id of the
@@ -186,25 +196,31 @@ constructor(
   platform_fee_rate = disclose(init_platform_rate);
   treasury = 0;
 
-  // Optimistic-oracle defaults (owner can tune via setters).
+  // Optimistic-oracle defaults. NOTE: there are currently no setters for these, so
+  // they are fixed at deployment. If setters are added later, cap them to avoid the
+  // bond-doubling / deadline-addition overflows flagged in the audit.
   resolution_bond = 1000000;  // token base units.
   challenge_window = 7200;    // 2 hours.
   arbiter_threshold = 1;      // majority-of-1 until the owner enrolls more arbiters.
 }
 
 // Authorization guard: aborts unless the caller's private key hashes to `owner`.
-circuit require_owner(): [] {
-  assert(owner == current_participant(), "Only owner can call this circuit");
+// Returns the caller's participant_id so callers that also need it (e.g. create_market)
+// reuse it instead of recomputing the witness + hash a second time.
+circuit require_owner(): Bytes<32> {
+  const caller = current_participant();
+  assert(owner == caller, "Only owner can call this circuit");
+  return caller;
 }
 
 // Reject NONE — bets and proposed/voted outcomes must pick a real side.
-circuit require_valid_side(side: Outcome): [] {
+pure circuit require_valid_side(side: Outcome): [] {
   assert(side == Outcome.YES || side == Outcome.NO, "Outcome must be YES or NO");
 }
 
 // The all-zero id, used as the "no participant" sentinel (e.g. no disputer yet,
 // no copy-trading leader). A real participant_id is a hash and never all-zero.
-circuit empty_participant(): Bytes<32> {
+pure circuit empty_participant(): Bytes<32> {
   return default<Bytes<32>>;
 }
 
@@ -216,12 +232,12 @@ circuit get_market(market_id: Bytes<32>): Market {
 }
 
 // The pool that gets paid out (the winners' stakes) for a resolved market.
-circuit winning_pool(market: Market): Uint<64> {
+pure circuit winning_pool(market: Market): Uint<64> {
   return market.outcome == Outcome.YES ? market.yes_pool : market.no_pool;
 }
 
 // The pool that is distributed as profit to the winners (the losers' stakes).
-circuit losing_pool(market: Market): Uint<64> {
+pure circuit losing_pool(market: Market): Uint<64> {
   return market.outcome == Outcome.YES ? market.no_pool : market.yes_pool;
 }
 
@@ -238,7 +254,7 @@ circuit accrue_leader_reward(leader: Bytes<32>, amount: Uint<64>): [] {
 }
 
 // Per-(market, arbiter) vote key to prevent an arbiter voting twice on a dispute.
-circuit vote_key(market_id: Bytes<32>, arbiter: Bytes<32>): Bytes<32> {
+pure circuit vote_key(market_id: Bytes<32>, arbiter: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<3, Bytes<32>>>([pad(32, "dareu:vote:"), market_id, arbiter]);
 }
 
@@ -295,12 +311,11 @@ export circuit create_market(
   const public_oracle = disclose(oracle);
   const public_close_time = disclose(close_time);
 
-  require_owner();
+  const creator = require_owner();
   assert(!markets.member(public_market_id), "Market already exists");
   assert(public_oracle != empty_participant(), "Oracle cannot be empty");
   assert(kernel.blockTimeLessThan(public_close_time), "Close time must be in the future");
 
-  const creator = current_participant();
   markets.insert(public_market_id, Market {
     creator: disclose(creator),
     oracle: public_oracle,
@@ -373,7 +388,7 @@ export circuit place_bet(
   });
 
   // Audit commitment: lets a client later prove this bet's contents off-chain.
-  commitments.insert(disclose(pos_id), disclose(bet_commitment(public_market_id, bettor, public_side, public_amount, nonce)));
+  commitments.insert(disclose(pos_id), disclose(bet_content_hash(public_market_id, bettor, public_side, public_amount, nonce)));
 
   // Return the position_id so the caller can store it and later claim/refund.
   return disclose(pos_id);
@@ -435,10 +450,12 @@ export circuit dispute_resolution(market_id: Bytes<32>): [] {
   const market = get_market(public_market_id);
   assert(market.status == MarketStatus.PROPOSED, "Market is not in proposed state");
 
+  assert(resolutions.member(public_market_id), "Resolution record missing");
   const resolution = resolutions.lookup(public_market_id);
   assert(kernel.blockTimeLessThan(resolution.propose_deadline), "Challenge window has closed");
 
   const disputer = current_participant();
+  assert(disputer != resolution.proposer, "Proposer cannot dispute their own resolution");
   receiveUnshielded(payment_token, resolution_bond as Uint<128>);
 
   markets.insert(public_market_id, Market {
@@ -473,6 +490,7 @@ export circuit finalize_proposal(market_id: Bytes<32>): [] {
   const market = get_market(public_market_id);
   assert(market.status == MarketStatus.PROPOSED, "Market is not awaiting finalization");
 
+  assert(resolutions.member(public_market_id), "Resolution record missing");
   const resolution = resolutions.lookup(public_market_id);
   assert(kernel.blockTimeGreaterThan(resolution.propose_deadline), "Challenge window still open");
 
@@ -499,8 +517,9 @@ export circuit vote_dispute(market_id: Bytes<32>, result: Outcome): [] {
 
   const vkey = vote_key(public_market_id, arbiter);
   assert(!dispute_votes.member(vkey), "Arbiter already voted");
-  dispute_votes.insert(vkey, true);
+  dispute_votes.insert(vkey);
 
+  assert(resolutions.member(public_market_id), "Resolution record missing");
   const resolution = resolutions.lookup(public_market_id);
   const next_yes = public_result == Outcome.YES ? (resolution.yes_votes + 1) as Uint<64> : resolution.yes_votes;
   const next_no = public_result == Outcome.NO ? (resolution.no_votes + 1) as Uint<64> : resolution.no_votes;
@@ -551,17 +570,44 @@ export circuit withdraw_credit(is_leader_reward: Boolean, payout_address: UserAd
   );
 }
 
-// [CIRCUIT 8/ markets] Owner or the market's oracle cancels an OPEN market (e.g. an
-// ambiguous question or one that can't be resolved). Status -> CANCELLED; pools are
-// left intact so every bettor can pull their exact stake back via
-// refund_cancelled_position. Only OPEN markets can be cancelled (not mid-resolution).
+// [CIRCUIT 8/ markets] Cancel a market; bettors then reclaim their stakes via
+// refund_cancelled_position. Two modes, selected by the market's current status:
+//   • OPEN: the owner OR the market's oracle may cancel immediately (e.g. an ambiguous
+//     or unresolvable question). Pools are left intact; no bonds are involved.
+//   • PROPOSED / DISPUTED that is STUCK: only the owner may cancel, and only after an
+//     extra `challenge_window` of grace beyond `propose_deadline`, so this can never
+//     front-run a still-possible finalize/vote. Both posted bonds are credited back
+//     (pull payment). This is the escape hatch that stops bets + bonds being locked
+//     forever if the arbiter council stalls.
+// Any other status (RESOLVED / CANCELLED) is rejected. The two modes are folded into
+// one circuit (rather than a separate emergency_cancel) to stay within the contract's
+// deploy-size / circuit-count budget — each extra circuit adds a verifier key to the
+// deploy transaction, and 13 exceeds the block limit.
 export circuit cancel_market(market_id: Bytes<32>): [] {
   const public_market_id = disclose(market_id);
   const market = get_market(public_market_id);
   const caller = current_participant();
 
-  assert(market.status == MarketStatus.OPEN, "Market is not open");
-  assert(caller == owner || caller == market.oracle, "Only owner or oracle can cancel");
+  if (market.status == MarketStatus.OPEN) {
+    assert(caller == owner || caller == market.oracle, "Only owner or oracle can cancel");
+  } else {
+    assert(
+      market.status == MarketStatus.PROPOSED || market.status == MarketStatus.DISPUTED,
+      "Market cannot be cancelled in its current state"
+    );
+    assert(caller == owner, "Only owner can cancel a disputed market");
+    assert(resolutions.member(public_market_id), "Resolution record missing");
+    const resolution = resolutions.lookup(public_market_id);
+    assert(
+      kernel.blockTimeGreaterThan((resolution.propose_deadline + challenge_window) as Uint<64>),
+      "Grace period has not elapsed"
+    );
+    // Refund the proposer's bond, and the disputer's too if a dispute was posted.
+    credit_bond(resolution.proposer, resolution.bond);
+    if (resolution.disputer != empty_participant()) {
+      credit_bond(resolution.disputer, resolution.bond);
+    }
+  }
 
   markets.insert(public_market_id, Market {
     creator: market.creator,

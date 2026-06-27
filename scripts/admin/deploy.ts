@@ -1,6 +1,5 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { randomBytes } from 'node:crypto';
 
 import { deployContract } from '@midnight-ntwrk/midnight-js-contracts';
 import { fromHex, toHex } from '@midnight-ntwrk/midnight-js-utils';
@@ -20,6 +19,7 @@ import {
   waitForUnshieldedSyncedState,
 } from '../shared/midnight.js';
 import { resolveNetwork } from '../shared/network.js';
+import { pureCircuits } from '../../src/managed/dareu/contract/index.js';
 
 const deploymentDir = path.join(contractRoot, 'deployments');
 const envFiles = ['.env', '.env.local'];
@@ -240,9 +240,15 @@ async function main() {
   const config = configureNetwork(network);
   const walletSeed = requiredWalletSeedOrMnemonic();
   const privateStoragePassword = requiredEnv('MIDNIGHT_PRIVATE_STATE_PASSWORD');
-  const ownerSecretKey = parseOptionalHexBytes(process.env.DAREU_OWNER_SECRET_KEY, 32, 'DAREU_OWNER_SECRET_KEY')
-    ?? randomBytes(32);
-  const ownerSecretWasGenerated = !process.env.DAREU_OWNER_SECRET_KEY?.trim();
+  // The owner secret key must be supplied explicitly — it is NEVER auto-generated,
+  // so the raw key is never persisted to disk. We record only its public
+  // participant_id (the same hash the contract stores as `owner`).
+  const ownerSecretKey = parseHexBytes(
+    requiredEnv('DAREU_OWNER_SECRET_KEY'),
+    32,
+    'DAREU_OWNER_SECRET_KEY',
+  );
+  const ownerParticipantId = pureCircuits.participant_id(ownerSecretKey);
   const paymentToken = parseOptionalHexBytes(process.env.DAREU_PAYMENT_TOKEN_HEX, 32, 'DAREU_PAYMENT_TOKEN_HEX')
     ?? parseHexBytes(unshieldedToken().raw, 32, 'default unshielded token');
   const leaderCommissionBps = parseBps('DAREU_LEADER_COMMISSION_BPS', 1000n);
@@ -293,8 +299,8 @@ async function main() {
         paymentTokenHex: toHex(paymentToken),
         leaderCommissionBps,
         platformFeeBps,
-        ownerSecretKeyHex: toHex(ownerSecretKey),
-        ownerSecretWasGenerated,
+        // Public owner identity only — the raw secret key is NEVER written to disk.
+        ownerParticipantIdHex: toHex(ownerParticipantId),
       },
     };
 
@@ -305,9 +311,7 @@ async function main() {
     console.log('DareU contract deployed.');
     console.log(`Contract address: ${deployment.contractAddress}`);
     console.log(`Deployment record: ${deploymentPath}`);
-    if (ownerSecretWasGenerated) {
-      console.log('DAREU_OWNER_SECRET_KEY was generated and saved in the deployment record. Keep that file private.');
-    }
+    console.log('Owner secret key was read from DAREU_OWNER_SECRET_KEY; only its participant_id is recorded on disk.');
   } finally {
     await walletCtx.wallet.stop();
   }

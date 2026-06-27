@@ -84,8 +84,6 @@ function loadWalletStateCache(network: SupportedNetwork, address: string): Walle
   }
 }
 export const stateRoot = path.resolve(contractRoot, '.midnight-state');
-let dustReplayPatchInstalled = false;
-let skippedDustDtimeUpdates = 0;
 
 function timeoutMs(name: string, fallback: number) {
   const rawValue = process.env[name]?.trim();
@@ -168,44 +166,19 @@ export function isWalletStateSyncedWithin(
   );
 }
 
-function installDustDtimeUpdateWorkaround() {
-  if (dustReplayPatchInstalled) return;
-
-  const dustLocalStatePrototype = ledger.DustLocalState.prototype as unknown as {
-    replayEvents(secretKey: ledger.DustSecretKey, events: ledger.Event[]): ledger.DustLocalState;
-  };
-  const replayEvents = dustLocalStatePrototype.replayEvents;
-
-  dustLocalStatePrototype.replayEvents = function patchedReplayEvents(
-    this: ledger.DustLocalState,
-    secretKey: ledger.DustSecretKey,
-    events: ledger.Event[],
-  ) {
-    const filteredEvents = events.filter((event) => !event.toString().includes('DustGenerationDtimeUpdate'));
-
-    if (filteredEvents.length !== events.length) {
-      skippedDustDtimeUpdates += events.length - filteredEvents.length;
-      if (skippedDustDtimeUpdates <= 5) {
-        console.warn(
-          `Skipped ${events.length - filteredEvents.length} DUST dtime update(s) that this wallet SDK cannot replay.`,
-        );
-      }
-    }
-
-    return replayEvents.call(this, secretKey, filteredEvents);
-  };
-
-  dustReplayPatchInstalled = true;
-}
-
 export function configureNetwork(network: SupportedNetwork): NetworkConfig {
   setNetworkId(network);
   return resolveNetworkConfig(network);
 }
 
+// The contract uses no per-session private state (the secret key is captured by the
+// closure below, not stored in private state), so the private-state type is an empty
+// record — matching the `initialPrivateState: {}` used by deploy.ts / chain.ts.
+type DareuPrivateState = Record<string, never>;
+
 export function createCompiledDareuContract(localSecretKey: Uint8Array) {
-  const witnesses: Witnesses<unknown> = {
-    local_secret_key: (context) => [context.privateState, localSecretKey],
+  const witnesses: Witnesses<DareuPrivateState> = {
+    local_secret_key: ({ privateState }) => [privateState, localSecretKey],
   };
 
   // Effect-style Pipeable: apply both data-last transforms in one variadic pipe.
@@ -311,10 +284,9 @@ export function deriveKeys(seedOrMnemonic: string) {
 
 export async function createWallet(seedHex: string, network: SupportedNetwork, config: NetworkConfig): Promise<WalletContext> {
   globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket;
-  // ledger-v8 8.1.0 parses & replays the v9 `DustGenerationDtimeUpdate` events
-  // natively, so the old replay-filter hack is no longer needed (and would now
-  // drop legitimate dust-timing updates). Re-enable only if replay errors return.
-  // installDustDtimeUpdateWorkaround();
+  // NOTE: ledger-v8 8.1.0 parses & replays the v9 `DustGenerationDtimeUpdate` events
+  // natively, so the old replay-filter workaround (removed) is no longer needed. If
+  // DUST replay errors ever return, recover the patch from git history.
 
   const keys = deriveKeys(seedHex);
   const shieldedSecretKeys = ledger.ZswapSecretKeys.fromSeed(keys[Roles.Zswap]);
