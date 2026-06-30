@@ -1,25 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DareuSim, bytes32, EMPTY_ID } from './helpers/simulator.js';
+import { DareuSim, EMPTY_ID } from './helpers/simulator.js';
 import { deploy, KEYS, IDS, TOKEN, TIME } from './helpers/fixtures.js';
 
-test('constructor: rejects fee rates summing over 100%', () => {
+test('constructor: rejects a platform fee rate over 100%', () => {
   assert.throws(
-    () =>
-      DareuSim.deploy({ ownerKey: KEYS.owner, tokenType: TOKEN, leaderBps: 6000n, platformBps: 5000n }),
-    /Fee rates cannot exceed 100%/,
+    () => DareuSim.deploy({ ownerKey: KEYS.owner, tokenType: TOKEN, platformBps: 10001n }),
+    /Fee rate cannot exceed 100%/,
   );
 });
 
-test('constructor: accepts fee rates summing to exactly 100%', () => {
+test('constructor: accepts a platform fee rate of exactly 100%', () => {
   const sim = DareuSim.deploy({
     ownerKey: KEYS.owner,
     tokenType: TOKEN,
-    leaderBps: 4000n,
-    platformBps: 6000n,
+    platformBps: 10000n,
   });
-  assert.equal(sim.ledger.leader_commission_rate, 4000n);
-  assert.equal(sim.ledger.platform_fee_rate, 6000n);
+  assert.equal(sim.ledger.platform_fee_rate, 10000n);
 });
 
 test('set_arbiter: owner enrolls then disables an arbiter', () => {

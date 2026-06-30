@@ -251,8 +251,9 @@ async function main() {
   const ownerParticipantId = pureCircuits.participant_id(ownerSecretKey);
   const paymentToken = parseOptionalHexBytes(process.env.DAREU_PAYMENT_TOKEN_HEX, 32, 'DAREU_PAYMENT_TOKEN_HEX')
     ?? parseHexBytes(unshieldedToken().raw, 32, 'default unshielded token');
-  const leaderCommissionBps = parseBps('DAREU_LEADER_COMMISSION_BPS', 1000n);
-  const platformFeeBps = parseBps('DAREU_PLATFORM_FEE_BPS', 200n);
+  // Deploy-time DEFAULT platform fee (bps). Each market snapshots its own rate at
+  // create_market; this is the seed/guardrail value the constructor stores.
+  const platformFeeBps = parseBps('DAREU_PLATFORM_FEE_BPS', 100n);
   const privateStateId = process.env.DAREU_PRIVATE_STATE_ID?.trim() || `dareu-${network}`;
 
   console.log(`Deploying DareU contract to Midnight ${network}.`);
@@ -275,7 +276,7 @@ async function main() {
     console.log('Submitting deploy transaction...');
     const deployed = await deployContract(providers as any, {
       compiledContract,
-      args: [ownerSecretKey, paymentToken, leaderCommissionBps, platformFeeBps],
+      args: [ownerSecretKey, paymentToken, platformFeeBps],
       privateStateId,
       initialPrivateState: {},
     } as any);
@@ -297,7 +298,6 @@ async function main() {
       dustBalance,
       constructor: {
         paymentTokenHex: toHex(paymentToken),
-        leaderCommissionBps,
         platformFeeBps,
         // Public owner identity only — the raw secret key is NEVER written to disk.
         ownerParticipantIdHex: toHex(ownerParticipantId),

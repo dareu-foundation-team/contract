@@ -35,9 +35,9 @@ import CompactStandardLibrary;
 // Lifecycle states a market moves through. OPEN -> (PROPOSED -> [DISPUTED] ->)
 // RESOLVED is the happy path; CANCELLED is a terminal escape hatch that refunds.
 export enum MarketStatus {
-  OPEN,       // accepting bets
-  PROPOSED,   // an outcome has been proposed (bonded); in the challenge window
-  DISPUTED,   // the proposal was disputed (counter-bonded); awaiting arbiter vote
+  OPEN, // accepting bets
+  PROPOSED, // an outcome has been proposed (bonded); in the challenge window
+  DISPUTED, // the proposal was disputed (counter-bonded); awaiting arbiter vote
   RESOLVED,
   CANCELLED
 }
@@ -52,26 +52,28 @@ export enum Outcome {
 
 // A single binary market. All money fields are public Uint<64> token base units.
 export struct Market {
-  creator: Bytes<32>,      // participant_id of the owner who created it
-  oracle: Bytes<32>,       // participant_id allowed to cancel (alongside owner)
-  metadata_hash: Bytes<32>,// sha256 commitment to the off-chain Postgres metadata
-  close_time: Uint<64>,    // unix seconds; bets accepted only before this
+  creator: Bytes<32>, // participant_id of the owner who created it
+  oracle: Bytes<32>, // participant_id allowed to cancel (alongside owner)
+  metadata_hash: Bytes<32>, // sha256 commitment to the off-chain Postgres metadata
+  close_time: Uint<64>, // unix seconds; bets accepted only before this
   status: MarketStatus,
-  outcome: Outcome,        // final result once RESOLVED (NONE until then)
-  yes_pool: Uint<64>,      // total staked on YES
-  no_pool: Uint<64>,       // total staked on NO
-  total_pool: Uint<64>,    // yes_pool + no_pool (kept for convenience)
+  outcome: Outcome, // final result once RESOLVED (NONE until then)
+  yes_pool: Uint<64>, // total staked on YES
+  no_pool: Uint<64>, // total staked on NO
+  total_pool: Uint<64>, // yes_pool + no_pool (kept for convenience)
+  challenge_window: Uint<64>, // per-market snapshot: min seconds between close and finalize
+  platform_fee_rate: Uint<64>, // per-market snapshot: platform fee in basis points
+  betting_cutoff: Uint<64>, // per-market snapshot: stop accepting bets at close - this
 }
 
 // One bettor's stake in one market. Keyed in `positions` by a private position_id
 // so a wallet's bets are not enumerable by its public address.
 export struct Position {
   market_id: Bytes<32>,
-  bettor: Bytes<32>,       // participant_id; only this id can claim/refund
-  outcome: Outcome,        // the side this bet backed
-  amount: Uint<64>,        // stake
-  leader: Bytes<32>,       // copy-trading leader to credit a commission to (or empty)
-  claimed: Boolean,        // set true after a winning claim or cancellation refund
+  bettor: Bytes<32>, // participant_id; only this id can claim/refund
+  outcome: Outcome, // the side this bet backed
+  amount: Uint<64>, // stake
+  claimed: Boolean, // set true after a winning claim or cancellation refund
 }
 
 // Optimistic-oracle resolution record (one per market, created once an outcome is
@@ -79,13 +81,13 @@ export struct Position {
 // to a vote — the arbiter tally. The party whose claim ultimately matches the final
 // outcome reclaims the bond(s).
 export struct Resolution {
-  proposer: Bytes<32>,        // participant_id that proposed `proposed_outcome`
+  proposer: Bytes<32>, // participant_id that proposed `proposed_outcome`
   proposed_outcome: Outcome,
   propose_deadline: Uint<64>, // challenge window ends at this unix time
-  bond: Uint<64>,             // size of each side's bond (snapshot of resolution_bond)
-  disputer: Bytes<32>,        // participant_id that disputed; empty if undisputed
-  yes_votes: Uint<64>,        // arbiter votes for YES (only used once DISPUTED)
-  no_votes: Uint<64>,         // arbiter votes for NO
+  bond: Uint<64>, // size of each side's bond (snapshot of resolution_bond)
+  disputer: Bytes<32>, // participant_id that disputed; empty if undisputed
+  yes_votes: Uint<64>, // arbiter votes for YES (only used once DISPUTED)
+  no_votes: Uint<64>, // arbiter votes for NO
 }
 
 // ---- Platform configuration (all set once in the constructor) ----
@@ -93,26 +95,34 @@ export struct Resolution {
 // circuit, locking in the deploy-time values. The remaining fields are left unsealed
 // so owner-only setters could be added later — but NO setters exist today, so every
 // field below is effectively immutable after deployment.
-export sealed ledger owner: Bytes<32>;          // participant_id of the admin/owner
-export sealed ledger payment_token: Bytes<32>;  // token type used for all bets/payouts
-export ledger leader_commission_rate: Uint<64>; // Basis points: 1000 = 10%.
-export ledger platform_fee_rate: Uint<64>;      // Basis points: 200 = 2%.
-export ledger treasury: Uint<64>;               // accumulated platform fees (owner withdraws)
-export ledger market_count: Counter;            // total markets ever created
+export sealed ledger owner: Bytes<32>; // participant_id of the admin/owner
+
+export sealed ledger payment_token: Bytes<32>; // token type used for all bets/payouts
+
+export ledger platform_fee_rate: Uint<64>; // Basis points: 200 = 2%. Deploy-time DEFAULT;
+
+// each market snapshots its own rate at creation.
+export ledger treasury: Uint<64>; // accumulated platform fees (owner withdraws)
+
+export ledger market_count: Counter; // total markets ever created
 
 // ---- Core prediction-market state ----
-export ledger markets: Map<Bytes<32>, Market>;             // market_id -> Market
-export ledger positions: Map<Bytes<32>, Position>;         // position_id -> Position
-export ledger leader_rewards: Map<Bytes<32>, Uint<64>>;    // leader id -> withdrawable commission
+export ledger markets: Map<Bytes<32>, Market>; // market_id -> Market
+
+export ledger positions: Map<Bytes<32>, Position>; // position_id -> Position
 
 // ---- Optimistic-oracle configuration + state ----
-export ledger resolution_bond: Uint<64>;   // bond required to propose / dispute.
-export ledger challenge_window: Uint<64>;   // minimum seconds between close and finalize.
-export ledger arbiter_threshold: Uint<64>;  // votes needed to settle a dispute.
-export ledger arbiters: Map<Bytes<32>, Boolean>;          // participant_id -> authorized (DVM council).
-export ledger resolutions: Map<Bytes<32>, Resolution>;    // market_id -> proposal record.
-export ledger dispute_votes: Set<Bytes<32>>;              // vote_key(market_id, arbiter); membership == already voted.
-export ledger bond_credits: Map<Bytes<32>, Uint<64>>;     // participant_id -> withdrawable bond (pull payments).
+export ledger resolution_bond: Uint<64>; // bond required to propose / dispute.
+
+export ledger arbiter_threshold: Uint<64>; // votes needed to settle a dispute.
+
+export ledger arbiters: Map<Bytes<32>, Boolean>; // participant_id -> authorized (DVM council).
+
+export ledger resolutions: Map<Bytes<32>, Resolution>; // market_id -> proposal record.
+
+export ledger dispute_votes: Set<Bytes<32>>; // vote_key(market_id, arbiter); membership == already voted.
+
+export ledger bond_credits: Map<Bytes<32>, Uint<64>>; // participant_id -> withdrawable bond (pull payments).
 
 // Optional audit trail for privacy-preserving clients: position_id -> bet commitment.
 // Lets an off-chain client prove a bet's contents (side/amount/nonce) without the
@@ -141,8 +151,14 @@ circuit current_participant(): Bytes<32> {
 // Deterministic, unlinkable key for a Position. The `nonce` lets one bettor hold
 // several distinct positions in the same market, and keeps the id unguessable by
 // others (so positions can't be enumerated from a public address).
-export pure circuit position_id(market_id: Bytes<32>, bettor: Bytes<32>, nonce: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<4, Bytes<32>>>([pad(32, "dareu:position:"), market_id, bettor, nonce]);
+export pure circuit position_id(
+                      market_id: Bytes<32>,
+                      bettor: Bytes<32>,
+                      nonce: Bytes<32>
+                      ): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+           [pad(32, "dareu:position:"), market_id, bettor, nonce]
+           );
 }
 
 // Pre-image struct for the bet content hash below. Declared before its use.
@@ -163,45 +179,38 @@ export struct BetCommitment {
 // persistentCommit with a fresh secret salt and stop disclosing the matching Position
 // fields. (Renamed from `bet_commitment` to avoid implying a cryptographic commitment.)
 pure circuit bet_content_hash(
-  market_id: Bytes<32>,
-  bettor: Bytes<32>,
-  side: Outcome,
-  amount: Uint<64>,
-  nonce: Bytes<32>
-): Bytes<32> {
-  return persistentHash<BetCommitment>(BetCommitment {
-    market_id: market_id,
-    bettor: bettor,
-    side: side,
-    amount: amount,
-    nonce: nonce,
-  });
+               market_id: Bytes<32>,
+               bettor: Bytes<32>,
+               side: Outcome,
+               amount: Uint<64>,
+               nonce: Bytes<32>
+               ): Bytes<32> {
+  return persistentHash<BetCommitment>(
+           BetCommitment { market_id: market_id,
+                           bettor: bettor,
+                           side: side,
+                           amount: amount,
+                           nonce: nonce, }
+           );
 }
 
 // Runs once at deployment. The owner is identified by the participant_id of the
 // owner secret key (the deployer keeps that key off-chain and proves ownership the
 // same way bettors prove identity). Fee rates are basis points and must leave room
 // for the bettor (leader + platform <= 100%).
-constructor(
-  owner_secret_key: Bytes<32>,
-  token_type: Bytes<32>,
-  init_leader_rate: Uint<64>,
-  init_platform_rate: Uint<64>
-) {
-  assert(init_leader_rate + init_platform_rate <= 10000, "Fee rates cannot exceed 100%");
+constructor(owner_secret_key: Bytes<32>, token_type: Bytes<32>, init_platform_rate: Uint<64>) {
+  assert(init_platform_rate <= 10000, "Fee rate cannot exceed 100%");
 
   owner = disclose(participant_id(owner_secret_key));
   payment_token = disclose(token_type);
-  leader_commission_rate = disclose(init_leader_rate);
   platform_fee_rate = disclose(init_platform_rate);
   treasury = 0;
 
   // Optimistic-oracle defaults. NOTE: there are currently no setters for these, so
   // they are fixed at deployment. If setters are added later, cap them to avoid the
   // bond-doubling / deadline-addition overflows flagged in the audit.
-  resolution_bond = 1000000;  // token base units.
-  challenge_window = 7200;    // 2 hours.
-  arbiter_threshold = 1;      // majority-of-1 until the owner enrolls more arbiters.
+  resolution_bond = 1000000; // token base units.
+  arbiter_threshold = 1; // majority-of-1 until the owner enrolls more arbiters.
 }
 
 // Authorization guard: aborts unless the caller's private key hashes to `owner`.
@@ -218,11 +227,34 @@ pure circuit require_valid_side(side: Outcome): [] {
   assert(side == Outcome.YES || side == Outcome.NO, "Outcome must be YES or NO");
 }
 
-// The all-zero id, used as the "no participant" sentinel (e.g. no disputer yet,
-// no copy-trading leader). A real participant_id is a hash and never all-zero.
+// The all-zero id, used as the "no participant" sentinel (e.g. no disputer yet).
+// A real participant_id is a hash and never all-zero.
 pure circuit empty_participant(): Bytes<32> {
   return default<Bytes<32>>;
 }
+
+// ---- Per-market guardrails (deploy-time policy, enforced in create_market) ----
+// These bound the per-market values a creator may snapshot. They are language-level
+// constants (not ledger state) so they cannot be tampered with after deployment.
+pure circuit min_challenge_window(): Uint<64> {
+  return 60;
+} // >= settlement window
+
+pure circuit max_challenge_window(): Uint<64> {
+  return 604800;
+} // <= 7 days
+
+pure circuit max_platform_fee_rate(): Uint<64> {
+  return 500;
+} // <= 5% (basis points)
+
+pure circuit min_betting_cutoff(): Uint<64> {
+  return 60;
+} // >= 60s
+
+pure circuit max_betting_cutoff(): Uint<64> {
+  return 1800;
+} // <= 30 min
 
 // Fetch a market by id, asserting it exists. Centralizes the existence check so
 // every caller fails with the same clear error.
@@ -239,18 +271,6 @@ pure circuit winning_pool(market: Market): Uint<64> {
 // The pool that is distributed as profit to the winners (the losers' stakes).
 pure circuit losing_pool(market: Market): Uint<64> {
   return market.outcome == Outcome.YES ? market.no_pool : market.yes_pool;
-}
-
-// Add `amount` to a leader's withdrawable commission balance (pull-payment so the
-// claim transaction stays cheap). No-op for a zero amount or a market with no leader.
-circuit accrue_leader_reward(leader: Bytes<32>, amount: Uint<64>): [] {
-  const public_leader = disclose(leader);
-  const public_amount = disclose(amount);
-
-  if (public_amount > 0 && public_leader != empty_participant()) {
-    const current_reward = leader_rewards.member(public_leader) ? leader_rewards.lookup(public_leader) : 0;
-    leader_rewards.insert(public_leader, (current_reward + public_amount) as Uint<64>);
-  }
 }
 
 // Per-(market, arbiter) vote key to prevent an arbiter voting twice on a dispute.
@@ -273,17 +293,19 @@ circuit credit_bond(who: Bytes<32>, amount: Uint<64>): [] {
 // settle if the winning side has no stake (nobody to pay -> would strand the losing
 // pool); such markets must be CANCELLED and refunded instead.
 circuit settle_market(market_id: Bytes<32>, market: Market, result: Outcome): [] {
-  const resolved = Market {
-    creator: market.creator,
-    oracle: market.oracle,
-    metadata_hash: market.metadata_hash,
-    close_time: market.close_time,
-    status: MarketStatus.RESOLVED,
-    outcome: result,
-    yes_pool: market.yes_pool,
-    no_pool: market.no_pool,
-    total_pool: market.total_pool,
-  };
+  const resolved =
+          Market { creator: market.creator,
+                   oracle: market.oracle,
+                   metadata_hash: market.metadata_hash,
+                   close_time: market.close_time,
+                   status: MarketStatus.RESOLVED,
+                   outcome: result,
+                   yes_pool: market.yes_pool,
+                   no_pool: market.no_pool,
+                   total_pool: market.total_pool,
+                   challenge_window: market.challenge_window,
+                   platform_fee_rate: market.platform_fee_rate,
+                   betting_cutoff: market.betting_cutoff, };
   assert(winning_pool(resolved) > 0, "Cannot resolve with no winners");
   markets.insert(market_id, resolved);
 }
@@ -301,32 +323,54 @@ export circuit set_arbiter(arbiter: Bytes<32>, enabled: Boolean): [] {
 // `oracle` is the participant allowed (with the owner) to cancel. Pools start empty
 // and the market opens immediately, accepting bets until `close_time`.
 export circuit create_market(
-  market_id: Bytes<32>,
-  metadata_hash: Bytes<32>,
-  oracle: Bytes<32>,
-  close_time: Uint<64>
-): [] {
+                 market_id: Bytes<32>,
+                 metadata_hash: Bytes<32>,
+                 oracle: Bytes<32>,
+                 close_time: Uint<64>,
+                 challenge_window: Uint<64>,
+                 platform_fee_rate: Uint<64>,
+                 betting_cutoff: Uint<64>
+                 ): [] {
   const public_market_id = disclose(market_id);
   const public_metadata_hash = disclose(metadata_hash);
   const public_oracle = disclose(oracle);
   const public_close_time = disclose(close_time);
+  const public_challenge_window = disclose(challenge_window);
+  const public_platform_fee_rate = disclose(platform_fee_rate);
+  const public_betting_cutoff = disclose(betting_cutoff);
 
   const creator = require_owner();
   assert(!markets.member(public_market_id), "Market already exists");
   assert(public_oracle != empty_participant(), "Oracle cannot be empty");
   assert(kernel.blockTimeLessThan(public_close_time), "Close time must be in the future");
 
-  markets.insert(public_market_id, Market {
-    creator: disclose(creator),
-    oracle: public_oracle,
-    metadata_hash: public_metadata_hash,
-    close_time: public_close_time,
-    status: MarketStatus.OPEN,
-    outcome: Outcome.NONE,
-    yes_pool: 0,
-    no_pool: 0,
-    total_pool: 0,
-  });
+  // Per-market guardrails (decisions F/H/I).
+  assert(public_challenge_window >= min_challenge_window(), "Challenge window too small");
+  assert(public_challenge_window <= max_challenge_window(), "Challenge window too large");
+  assert(public_platform_fee_rate <= max_platform_fee_rate(), "Platform fee rate too high");
+  assert(public_betting_cutoff >= min_betting_cutoff(), "Betting cutoff too small");
+  assert(public_betting_cutoff <= max_betting_cutoff(), "Betting cutoff too large");
+  // The market must still be bettable at creation: betting_cutoff < close_time - now,
+  // i.e. now < close_time - betting_cutoff. Rejects markets born already closed to bets.
+  assert(kernel.blockTimeLessThan((public_close_time - public_betting_cutoff) as Uint<64>),
+         "betting already closed at creation"
+         );
+
+  markets.insert(
+    public_market_id,
+    Market { creator: disclose(creator),
+             oracle: public_oracle,
+             metadata_hash: public_metadata_hash,
+             close_time: public_close_time,
+             status: MarketStatus.OPEN,
+             outcome: Outcome.NONE,
+             yes_pool: 0,
+             no_pool: 0,
+             total_pool: 0,
+             challenge_window: public_challenge_window,
+             platform_fee_rate: public_platform_fee_rate,
+             betting_cutoff: public_betting_cutoff, }
+    );
 
   market_count.increment(1);
 }
@@ -336,23 +380,24 @@ export circuit create_market(
 // private position_id (returned to the caller so they can claim later). An optional
 // `leader` is the copy-trading account that earns a commission if this bet wins.
 export circuit place_bet(
-  market_id: Bytes<32>,
-  side: Outcome,
-  amount: Uint<64>,
-  leader: Bytes<32>,
-  nonce: Bytes<32>
-): Bytes<32> {
+                 market_id: Bytes<32>,
+                 side: Outcome,
+                 amount: Uint<64>,
+                 nonce: Bytes<32>
+                 ): Bytes<32> {
   // disclose(...) releases these witness-influenced values into public ledger
   // state. They have to be public so the pools and payouts are verifiable; only
   // the bettor's identity (derived below from the private key) stays unlinkable.
   const public_market_id = disclose(market_id);
   const public_side = disclose(side);
   const public_amount = disclose(amount);
-  const public_leader = disclose(leader);
 
   const market = get_market(public_market_id);
   assert(market.status == MarketStatus.OPEN, "Market is not open");
-  assert(kernel.blockTimeLessThan(market.close_time), "Market is closed");
+  // Betting stops at close_time - betting_cutoff (per-market snapshot, decision I).
+  assert(kernel.blockTimeLessThan((market.close_time - market.betting_cutoff) as Uint<64>),
+         "betting closed"
+         );
   require_valid_side(public_side);
   assert(public_amount > 0, "Bet amount must be positive");
 
@@ -363,32 +408,43 @@ export circuit place_bet(
   // Pull the stake into the contract's balance (escrow). Failing this aborts the bet.
   receiveUnshielded(payment_token, public_amount as Uint<128>);
 
-  const next_yes_pool = public_side == Outcome.YES ? (market.yes_pool + public_amount) as Uint<64> : market.yes_pool;
-  const next_no_pool = public_side == Outcome.NO ? (market.no_pool + public_amount) as Uint<64> : market.no_pool;
+  const next_yes_pool =
+          public_side == Outcome.YES
+            ? (market.yes_pool + public_amount) as Uint<64>
+            : market.yes_pool;
+  const next_no_pool =
+          public_side == Outcome.NO ? (market.no_pool + public_amount) as Uint<64> : market.no_pool;
 
-  markets.insert(public_market_id, Market {
-    creator: market.creator,
-    oracle: market.oracle,
-    metadata_hash: market.metadata_hash,
-    close_time: market.close_time,
-    status: market.status,
-    outcome: market.outcome,
-    yes_pool: next_yes_pool,
-    no_pool: next_no_pool,
-    total_pool: (market.total_pool + public_amount) as Uint<64>,
-  });
+  markets.insert(
+    public_market_id,
+    Market { creator: market.creator,
+             oracle: market.oracle,
+             metadata_hash: market.metadata_hash,
+             close_time: market.close_time,
+             status: market.status,
+             outcome: market.outcome,
+             yes_pool: next_yes_pool,
+             no_pool: next_no_pool,
+             total_pool: (market.total_pool + public_amount) as Uint<64>,
+             challenge_window: market.challenge_window,
+             platform_fee_rate: market.platform_fee_rate,
+             betting_cutoff: market.betting_cutoff, }
+    );
 
-  positions.insert(disclose(pos_id), Position {
-    market_id: public_market_id,
-    bettor: disclose(bettor),
-    outcome: public_side,
-    amount: public_amount,
-    leader: public_leader,
-    claimed: false,
-  });
+  positions.insert(
+    disclose(pos_id),
+    Position { market_id: public_market_id,
+               bettor: disclose(bettor),
+               outcome: public_side,
+               amount: public_amount,
+               claimed: false, }
+    );
 
   // Audit commitment: lets a client later prove this bet's contents off-chain.
-  commitments.insert(disclose(pos_id), disclose(bet_content_hash(public_market_id, bettor, public_side, public_amount, nonce)));
+  commitments.insert(
+    disclose(pos_id),
+    disclose(bet_content_hash(public_market_id, bettor, public_side, public_amount, nonce))
+    );
 
   // Return the position_id so the caller can store it and later claim/refund.
   return disclose(pos_id);
@@ -413,33 +469,40 @@ export circuit propose_resolution(market_id: Bytes<32>, result: Outcome, deadlin
   assert(market.status == MarketStatus.OPEN, "Market is not open for proposal");
   assert(kernel.blockTimeGreaterThan(market.close_time), "Market has not closed");
   require_valid_side(public_result);
-  assert(public_deadline >= (market.close_time + challenge_window) as Uint<64>, "Deadline before minimum challenge window");
+  assert(public_deadline >= (market.close_time + market.challenge_window) as Uint<64>,
+         "Deadline before minimum challenge window"
+         );
   assert(kernel.blockTimeLessThan(public_deadline), "Deadline must be in the future");
 
   const proposer = current_participant();
   receiveUnshielded(payment_token, resolution_bond as Uint<128>);
 
-  markets.insert(public_market_id, Market {
-    creator: market.creator,
-    oracle: market.oracle,
-    metadata_hash: market.metadata_hash,
-    close_time: market.close_time,
-    status: MarketStatus.PROPOSED,
-    outcome: market.outcome,
-    yes_pool: market.yes_pool,
-    no_pool: market.no_pool,
-    total_pool: market.total_pool,
-  });
+  markets.insert(
+    public_market_id,
+    Market { creator: market.creator,
+             oracle: market.oracle,
+             metadata_hash: market.metadata_hash,
+             close_time: market.close_time,
+             status: MarketStatus.PROPOSED,
+             outcome: market.outcome,
+             yes_pool: market.yes_pool,
+             no_pool: market.no_pool,
+             total_pool: market.total_pool,
+             challenge_window: market.challenge_window,
+             platform_fee_rate: market.platform_fee_rate,
+             betting_cutoff: market.betting_cutoff, }
+    );
 
-  resolutions.insert(public_market_id, Resolution {
-    proposer: disclose(proposer),
-    proposed_outcome: public_result,
-    propose_deadline: public_deadline,
-    bond: resolution_bond,
-    disputer: empty_participant(),
-    yes_votes: 0,
-    no_votes: 0,
-  });
+  resolutions.insert(
+    public_market_id,
+    Resolution { proposer: disclose(proposer),
+                 proposed_outcome: public_result,
+                 propose_deadline: public_deadline,
+                 bond: resolution_bond,
+                 disputer: empty_participant(),
+                 yes_votes: 0,
+                 no_votes: 0, }
+    );
 }
 
 // [CIRCUIT 4/ oracle] Dispute a pending proposal during its challenge window by
@@ -458,27 +521,32 @@ export circuit dispute_resolution(market_id: Bytes<32>): [] {
   assert(disputer != resolution.proposer, "Proposer cannot dispute their own resolution");
   receiveUnshielded(payment_token, resolution_bond as Uint<128>);
 
-  markets.insert(public_market_id, Market {
-    creator: market.creator,
-    oracle: market.oracle,
-    metadata_hash: market.metadata_hash,
-    close_time: market.close_time,
-    status: MarketStatus.DISPUTED,
-    outcome: market.outcome,
-    yes_pool: market.yes_pool,
-    no_pool: market.no_pool,
-    total_pool: market.total_pool,
-  });
+  markets.insert(
+    public_market_id,
+    Market { creator: market.creator,
+             oracle: market.oracle,
+             metadata_hash: market.metadata_hash,
+             close_time: market.close_time,
+             status: MarketStatus.DISPUTED,
+             outcome: market.outcome,
+             yes_pool: market.yes_pool,
+             no_pool: market.no_pool,
+             total_pool: market.total_pool,
+             challenge_window: market.challenge_window,
+             platform_fee_rate: market.platform_fee_rate,
+             betting_cutoff: market.betting_cutoff, }
+    );
 
-  resolutions.insert(public_market_id, Resolution {
-    proposer: resolution.proposer,
-    proposed_outcome: resolution.proposed_outcome,
-    propose_deadline: resolution.propose_deadline,
-    bond: resolution.bond,
-    disputer: disclose(disputer),
-    yes_votes: resolution.yes_votes,
-    no_votes: resolution.no_votes,
-  });
+  resolutions.insert(
+    public_market_id,
+    Resolution { proposer: resolution.proposer,
+                 proposed_outcome: resolution.proposed_outcome,
+                 propose_deadline: resolution.propose_deadline,
+                 bond: resolution.bond,
+                 disputer: disclose(disputer),
+                 yes_votes: resolution.yes_votes,
+                 no_votes: resolution.no_votes, }
+    );
 }
 
 // [CIRCUIT 5/ oracle] Finalize an undisputed proposal after its challenge window
@@ -521,53 +589,52 @@ export circuit vote_dispute(market_id: Bytes<32>, result: Outcome): [] {
 
   assert(resolutions.member(public_market_id), "Resolution record missing");
   const resolution = resolutions.lookup(public_market_id);
-  const next_yes = public_result == Outcome.YES ? (resolution.yes_votes + 1) as Uint<64> : resolution.yes_votes;
-  const next_no = public_result == Outcome.NO ? (resolution.no_votes + 1) as Uint<64> : resolution.no_votes;
+  const next_yes =
+          public_result == Outcome.YES
+            ? (resolution.yes_votes + 1) as Uint<64>
+            : resolution.yes_votes;
+  const next_no = public_result == Outcome.NO
+                    ? (resolution.no_votes + 1) as Uint<64>
+                    : resolution.no_votes;
 
-  resolutions.insert(public_market_id, Resolution {
-    proposer: resolution.proposer,
-    proposed_outcome: resolution.proposed_outcome,
-    propose_deadline: resolution.propose_deadline,
-    bond: resolution.bond,
-    disputer: resolution.disputer,
-    yes_votes: next_yes,
-    no_votes: next_no,
-  });
+  resolutions.insert(
+    public_market_id,
+    Resolution { proposer: resolution.proposer,
+                 proposed_outcome: resolution.proposed_outcome,
+                 propose_deadline: resolution.propose_deadline,
+                 bond: resolution.bond,
+                 disputer: resolution.disputer,
+                 yes_votes: next_yes,
+                 no_votes: next_no, }
+    );
 
   if (next_yes >= arbiter_threshold || next_no >= arbiter_threshold) {
     const winning = next_yes >= arbiter_threshold ? Outcome.YES : Outcome.NO;
     settle_market(public_market_id, market, winning);
     // Winner = the party whose claim matched the vote; they reclaim both bonds.
-    const winner = resolution.proposed_outcome == winning ? resolution.proposer : resolution.disputer;
+    const winner = resolution.proposed_outcome == winning
+                     ? resolution.proposer
+                     : resolution.disputer;
     credit_bond(winner, (resolution.bond + resolution.bond) as Uint<64>);
   }
 }
 
-// [CIRCUIT 7/ payouts] Withdraw a credited balance in one circuit (a pull payment):
-//   is_leader_reward=false -> resolution bond (from finalized proposals / won disputes)
-//   is_leader_reward=true  -> accumulated leader (copy-trading) commissions
-// Whichever balance is selected is zeroed and paid out to `payout_address`. Merged
-// from two separate withdraw circuits to keep the deployed circuit count at 12.
-export circuit withdraw_credit(is_leader_reward: Boolean, payout_address: UserAddress): [] {
+// [CIRCUIT 7/ payouts] Withdraw a credited resolution bond (a pull payment, from
+// finalized proposals / won disputes / cancelled-market refunds). The caller's bond
+// balance is zeroed and paid out to `payout_address`.
+export circuit withdraw_credit(payout_address: UserAddress): [] {
   const who = disclose(current_participant());
-  const want_reward = disclose(is_leader_reward);
 
-  const bond_amt = bond_credits.member(who) ? bond_credits.lookup(who) : 0;
-  const reward_amt = leader_rewards.member(who) ? leader_rewards.lookup(who) : 0;
-  const amount = want_reward ? reward_amt : bond_amt;
+  const amount = bond_credits.member(who) ? bond_credits.lookup(who) : 0;
   assert(amount > 0, "No credit to withdraw");
 
-  if (want_reward) {
-    leader_rewards.insert(who, 0);
-  } else {
-    bond_credits.insert(who, 0);
-  }
+  bond_credits.insert(who, 0);
 
   sendUnshielded(
     payment_token,
     disclose(amount) as Uint<128>,
     right<ContractAddress, UserAddress>(disclose(payout_address))
-  );
+    );
 }
 
 // [CIRCUIT 8/ markets] Cancel a market; bettors then reclaim their stakes via
@@ -591,17 +658,17 @@ export circuit cancel_market(market_id: Bytes<32>): [] {
   if (market.status == MarketStatus.OPEN) {
     assert(caller == owner || caller == market.oracle, "Only owner or oracle can cancel");
   } else {
-    assert(
-      market.status == MarketStatus.PROPOSED || market.status == MarketStatus.DISPUTED,
-      "Market cannot be cancelled in its current state"
-    );
+    assert(market.status == MarketStatus.PROPOSED || market.status == MarketStatus.DISPUTED,
+           "Market cannot be cancelled in its current state"
+           );
     assert(caller == owner, "Only owner can cancel a disputed market");
     assert(resolutions.member(public_market_id), "Resolution record missing");
     const resolution = resolutions.lookup(public_market_id);
-    assert(
-      kernel.blockTimeGreaterThan((resolution.propose_deadline + challenge_window) as Uint<64>),
-      "Grace period has not elapsed"
-    );
+    assert(kernel.blockTimeGreaterThan(
+             (resolution.propose_deadline + market.challenge_window) as Uint<64>
+             ),
+           "Grace period has not elapsed"
+           );
     // Refund the proposer's bond, and the disputer's too if a dispute was posted.
     credit_bond(resolution.proposer, resolution.bond);
     if (resolution.disputer != empty_participant()) {
@@ -609,22 +676,26 @@ export circuit cancel_market(market_id: Bytes<32>): [] {
     }
   }
 
-  markets.insert(public_market_id, Market {
-    creator: market.creator,
-    oracle: market.oracle,
-    metadata_hash: market.metadata_hash,
-    close_time: market.close_time,
-    status: MarketStatus.CANCELLED,
-    outcome: Outcome.NONE,
-    yes_pool: market.yes_pool,
-    no_pool: market.no_pool,
-    total_pool: market.total_pool,
-  });
+  markets.insert(
+    public_market_id,
+    Market { creator: market.creator,
+             oracle: market.oracle,
+             metadata_hash: market.metadata_hash,
+             close_time: market.close_time,
+             status: MarketStatus.CANCELLED,
+             outcome: Outcome.NONE,
+             yes_pool: market.yes_pool,
+             no_pool: market.no_pool,
+             total_pool: market.total_pool,
+             challenge_window: market.challenge_window,
+             platform_fee_rate: market.platform_fee_rate,
+             betting_cutoff: market.betting_cutoff, }
+    );
 }
 
 // [CIRCUIT 9/ payouts] A winning bettor claims their share of a RESOLVED market.
 //
-// THE MATH (and why the caller passes gross_profit / platform_fee / leader_fee in)
+// THE MATH (and why the caller passes gross_profit / platform_fee in)
 //   The exact values come from integer division, which Compact can't do directly,
 //   so the client computes them off-chain and the circuit RE-DERIVES the unique
 //   correct answer by bracketing each value between two integer inequalities. This
@@ -636,23 +707,20 @@ export circuit cancel_market(market_id: Bytes<32>): [] {
 //       proven by:  gross_profit*winners <= amount*losers < (gross_profit+1)*winners
 //       (winners/losers are the winning/losing pools; a winner's profit is their
 //        pro-rata slice of the losing pool. Total payout = stake + this profit.)
-//   platform_fee  = floor(gross_profit * platform_fee_rate / 10000)   [bps -> amount]
-//   leader_fee    = floor(gross_profit * leader_commission_rate / 10000), or exactly
-//                   0 when the position has no copy-trading leader.
+//   platform_fee  = floor(gross_profit * market.platform_fee_rate / 10000)  [bps -> amount]
+//       (read from the PER-MARKET snapshot taken at create_market, not a global.)
 //
-//   Final payout = stake + gross_profit - platform_fee - leader_fee. The platform
-//   fee goes to the treasury; the leader fee is accrued to the leader's pull balance.
+//   Final payout = stake + gross_profit - platform_fee. The platform fee goes to
+//   the treasury.
 export circuit claim_winnings(
-  bet_id: Bytes<32>,
-  payout_address: UserAddress,
-  gross_profit: Uint<64>,
-  platform_fee: Uint<64>,
-  leader_fee: Uint<64>
-): [] {
+                 bet_id: Bytes<32>,
+                 payout_address: UserAddress,
+                 gross_profit: Uint<64>,
+                 platform_fee: Uint<64>
+                 ): [] {
   const public_bet_id = disclose(bet_id);
   const public_gross_profit = disclose(gross_profit);
   const public_platform_fee = disclose(platform_fee);
-  const public_leader_fee = disclose(leader_fee);
 
   assert(positions.member(public_bet_id), "Position does not exist");
 
@@ -676,42 +744,37 @@ export circuit claim_winnings(
   assert(public_gross_profit * winners <= position.amount * losers, "Profit is too high");
   assert(position.amount * losers < (public_gross_profit + 1) * winners, "Profit is too low");
 
-  // Bracket platform_fee to exactly floor(gross_profit * platform_fee_rate / 10000).
-  assert(public_platform_fee * 10000 <= public_gross_profit * platform_fee_rate, "Platform fee is too high");
-  assert(public_gross_profit * platform_fee_rate < (public_platform_fee + 1) * 10000, "Platform fee is too low");
+  // Bracket platform_fee to exactly floor(gross_profit * market.platform_fee_rate / 10000),
+  // using the per-market snapshot taken at creation (not a mutable global).
+  assert(public_platform_fee * 10000 <= public_gross_profit * market.platform_fee_rate,
+         "Platform fee is too high"
+         );
+  assert(public_gross_profit * market.platform_fee_rate < (public_platform_fee + 1) * 10000,
+         "Platform fee is too low"
+         );
 
-  // Leader commission: must be exactly 0 if the bet named no leader; otherwise
-  // bracket it to floor(gross_profit * leader_commission_rate / 10000).
-  if (position.leader == empty_participant()) {
-    assert(public_leader_fee == 0, "Leader fee must be zero without a leader");
-  } else {
-    assert(public_leader_fee * 10000 <= public_gross_profit * leader_commission_rate, "Leader fee is too high");
-    assert(public_gross_profit * leader_commission_rate < (public_leader_fee + 1) * 10000, "Leader fee is too low");
-  }
-
-  // stake back + profit, minus the two fees. (Fees are bounded above by the rate
+  // stake back + profit, minus the platform fee. (The fee is bounded above by the rate
   // applied to gross_profit, so this subtraction can't underflow.)
-  const payout = position.amount + public_gross_profit - public_platform_fee - public_leader_fee;
+  const payout = position.amount + public_gross_profit - public_platform_fee;
 
   treasury = (treasury + public_platform_fee) as Uint<64>;
-  accrue_leader_reward(position.leader, public_leader_fee);
 
   // Mark claimed BEFORE paying out so the position can never be double-claimed.
-  positions.insert(public_bet_id, Position {
-    market_id: position.market_id,
-    bettor: position.bettor,
-    outcome: position.outcome,
-    amount: position.amount,
-    leader: position.leader,
-    claimed: true,
-  });
+  positions.insert(
+    public_bet_id,
+    Position { market_id: position.market_id,
+               bettor: position.bettor,
+               outcome: position.outcome,
+               amount: position.amount,
+               claimed: true, }
+    );
 
   // Push the winnings to the caller-supplied unshielded payout address.
   sendUnshielded(
     payment_token,
     disclose(payout) as Uint<128>,
     right<ContractAddress, UserAddress>(disclose(payout_address))
-  );
+    );
 }
 
 // [CIRCUIT 10/ payouts] Reclaim a stake from a CANCELLED market. No winners/losers,
@@ -729,20 +792,20 @@ export circuit refund_cancelled_position(bet_id: Bytes<32>, payout_address: User
   assert(market.status == MarketStatus.CANCELLED, "Market is not cancelled");
 
   // Mark claimed before refunding (prevents a second refund).
-  positions.insert(public_bet_id, Position {
-    market_id: position.market_id,
-    bettor: position.bettor,
-    outcome: position.outcome,
-    amount: position.amount,
-    leader: position.leader,
-    claimed: true,
-  });
+  positions.insert(
+    public_bet_id,
+    Position { market_id: position.market_id,
+               bettor: position.bettor,
+               outcome: position.outcome,
+               amount: position.amount,
+               claimed: true, }
+    );
 
   sendUnshielded(
     payment_token,
     disclose(position.amount) as Uint<128>,
     right<ContractAddress, UserAddress>(disclose(payout_address))
-  );
+    );
 }
 
 // [CIRCUIT 11/ admin] Owner withdraws accumulated platform fees from the treasury
@@ -761,5 +824,5 @@ export circuit withdraw_treasury(amount: Uint<64>, payout_address: UserAddress):
     payment_token,
     public_amount as Uint<128>,
     right<ContractAddress, UserAddress>(disclose(payout_address))
-  );
+    );
 }

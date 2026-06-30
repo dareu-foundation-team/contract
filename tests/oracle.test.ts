@@ -72,7 +72,7 @@ test('finalize: rejected before the challenge window elapses', () => {
 test('finalize: refuses to resolve to a side with no winners', () => {
   // Market with only NO bets; proposing YES then finalizing must fail.
   const { sim, marketId } = withMarket();
-  sim.placeBet(KEYS.bob, marketId, Outcome.NO, 400n, new Uint8Array(32), bytes32('nb'), TIME.bet);
+  sim.placeBet(KEYS.bob, marketId, Outcome.NO, 400n, bytes32('nb'), TIME.bet);
   sim.proposeResolution(KEYS.oracle, marketId, Outcome.YES, DEADLINE, TIME.afterClose);
   assert.throws(
     () => sim.finalizeProposal(KEYS.alice, marketId, TIME.afterDeadline),

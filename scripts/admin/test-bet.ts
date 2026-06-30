@@ -17,7 +17,7 @@ console.log('place_bet test on:', market.title, '| id', market.id.slice(0, 16))
 const { deployed } = await connectKeeper(resolveNetwork('preprod'))
 const marketId = Uint8Array.from(Buffer.from(market.id, 'hex'))
 try {
-  const result = await deployed.callTx.place_bet(marketId, Outcome.YES, 1n, new Uint8Array(32), new Uint8Array(randomBytes(32)))
+  const result = await deployed.callTx.place_bet(marketId, Outcome.YES, 1n, new Uint8Array(randomBytes(32)))
   console.log('RESULT_OK', result?.public?.txId ?? 'ok')
 } catch (e: any) {
   // 把整条 cause 链平铺打印,找节点的真实错误码/原因

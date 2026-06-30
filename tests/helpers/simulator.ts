@@ -86,7 +86,6 @@ export class DareuSim {
   static deploy(args: {
     ownerKey: Uint8Array;
     tokenType: Uint8Array;
-    leaderBps: bigint;
     platformBps: bigint;
   }): DareuSim {
     const ctor = createConstructorContext<PS>(PRIVATE_STATE, COIN_PK);
@@ -94,7 +93,6 @@ export class DareuSim {
       ctor,
       args.ownerKey,
       args.tokenType,
-      args.leaderBps,
       args.platformBps,
     );
     return new DareuSim(res.currentContractState.data);
@@ -138,9 +136,22 @@ export class DareuSim {
     oracleId: Uint8Array,
     closeTime: bigint,
     time: number,
+    opts?: { challengeWindow?: bigint; platformBps?: bigint; bettingCutoff?: bigint },
   ): void {
+    const challengeWindow = opts?.challengeWindow ?? 7200n;
+    const platformBps = opts?.platformBps ?? 200n;
+    const bettingCutoff = opts?.bettingCutoff ?? 300n;
     this.run(owner, time, (c, ctx) =>
-      c.impureCircuits.create_market(ctx, marketId, metadataHash, oracleId, closeTime),
+      c.impureCircuits.create_market(
+        ctx,
+        marketId,
+        metadataHash,
+        oracleId,
+        closeTime,
+        challengeWindow,
+        platformBps,
+        bettingCutoff,
+      ),
     );
   }
 
@@ -149,12 +160,11 @@ export class DareuSim {
     marketId: Uint8Array,
     side: Outcome,
     amount: bigint,
-    leaderId: Uint8Array,
     nonce: Uint8Array,
     time: number,
   ): Uint8Array {
     return this.run(bettor, time, (c, ctx) =>
-      c.impureCircuits.place_bet(ctx, marketId, side, amount, leaderId, nonce),
+      c.impureCircuits.place_bet(ctx, marketId, side, amount, nonce),
     );
   }
 
@@ -184,12 +194,11 @@ export class DareuSim {
 
   withdrawCredit(
     caller: Uint8Array,
-    isLeaderReward: boolean,
     payout: { bytes: Uint8Array },
     time: number,
   ): void {
     this.run(caller, time, (c, ctx) =>
-      c.impureCircuits.withdraw_credit(ctx, isLeaderReward, payout),
+      c.impureCircuits.withdraw_credit(ctx, payout),
     );
   }
 
@@ -205,11 +214,10 @@ export class DareuSim {
     payout: { bytes: Uint8Array },
     grossProfit: bigint,
     platformFee: bigint,
-    leaderFee: bigint,
     time: number,
   ): void {
     this.run(bettor, time, (c, ctx) =>
-      c.impureCircuits.claim_winnings(ctx, betId, payout, grossProfit, platformFee, leaderFee),
+      c.impureCircuits.claim_winnings(ctx, betId, payout, grossProfit, platformFee),
     );
   }
 
@@ -240,17 +248,14 @@ export function floorDiv(numerator: bigint, denominator: bigint): bigint {
   return numerator / denominator; // BigInt division truncates toward zero (== floor for non-negatives)
 }
 
-/** Compute the exact (grossProfit, platformFee, leaderFee) a winner must pass. */
+/** Compute the exact (grossProfit, platformFee) a winner must pass. */
 export function payoutBreakdown(args: {
   amount: bigint;
   winners: bigint;
   losers: bigint;
   platformBps: bigint;
-  leaderBps: bigint;
-  hasLeader: boolean;
-}): { grossProfit: bigint; platformFee: bigint; leaderFee: bigint } {
+}): { grossProfit: bigint; platformFee: bigint } {
   const grossProfit = floorDiv(args.amount * args.losers, args.winners);
   const platformFee = floorDiv(grossProfit * args.platformBps, 10000n);
-  const leaderFee = args.hasLeader ? floorDiv(grossProfit * args.leaderBps, 10000n) : 0n;
-  return { grossProfit, platformFee, leaderFee };
+  return { grossProfit, platformFee };
 }

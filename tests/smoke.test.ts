@@ -18,7 +18,7 @@ const aliceKey = bytes32('alice');
 const TOKEN = bytes32('token');
 
 function fresh() {
-  const sim = DareuSim.deploy({ ownerKey, tokenType: TOKEN, leaderBps: 1000n, platformBps: 200n });
+  const sim = DareuSim.deploy({ ownerKey, tokenType: TOKEN, platformBps: 200n });
   return sim;
 }
 
@@ -27,12 +27,10 @@ test('smoke: deploy initializes config', () => {
   const l = sim.ledger;
   assert.deepEqual(l.owner, participantId(ownerKey));
   assert.deepEqual(l.payment_token, TOKEN);
-  assert.equal(l.leader_commission_rate, 1000n);
   assert.equal(l.platform_fee_rate, 200n);
   assert.equal(l.treasury, 0n);
   assert.equal(l.market_count, 0n);
   assert.equal(l.resolution_bond, 1_000_000n);
-  assert.equal(l.challenge_window, 7200n);
   assert.equal(l.arbiter_threshold, 1n);
 });
 
@@ -44,8 +42,14 @@ test('smoke: create market + place a bet (exercises blockTime + receiveUnshielde
   assert.equal(sim.ledger.market_count, 1n);
   assert.ok(sim.ledger.markets.member(marketId));
 
+  // Per-market snapshots are recorded at creation (defaults from the harness).
+  const created = sim.ledger.markets.lookup(marketId);
+  assert.equal(created.challenge_window, 7200n);
+  assert.equal(created.platform_fee_rate, 200n);
+  assert.equal(created.betting_cutoff, 300n);
+
   const nonce = bytes32('n1');
-  const posId = sim.placeBet(aliceKey, marketId, Outcome.YES, 500n, new Uint8Array(32), nonce, NOW + 10);
+  const posId = sim.placeBet(aliceKey, marketId, Outcome.YES, 500n, nonce, NOW + 10);
 
   // place_bet returns the position_id, and it must match the pure-circuit derivation.
   assert.deepEqual(posId, positionId(marketId, participantId(aliceKey), nonce));

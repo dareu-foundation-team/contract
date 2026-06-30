@@ -24,8 +24,9 @@ export const IDS = {
 };
 
 export const TOKEN = bytes32('token');
-export const LEADER_BPS = 1000n; // 10%
 export const PLATFORM_BPS = 200n; // 2%
+export const CHALLENGE_WINDOW = 7200n; // per-market default used in tests (2 hours)
+export const BETTING_CUTOFF = 300n; // per-market default used in tests (5 minutes)
 
 // Canonical timeline (absolute unix seconds, year ~2030 with wide margins).
 export const T = {
@@ -33,6 +34,8 @@ export const T = {
   close: 1_900_000_000 + 86_400, // market closes 1 day out
 };
 export const CLOSE = BigInt(T.close);
+// betting stops at close - betting_cutoff.
+export const BETTING_CLOSE = Number(CLOSE - BETTING_CUTOFF);
 // propose deadline must be >= close + challenge_window (7200) and in the future.
 export const DEADLINE = CLOSE + 8_000n;
 
@@ -45,14 +48,13 @@ export const TIME = {
   voting: T.close + 300,
   afterDeadline: Number(DEADLINE) + 100, // finalize window
   // emergency cancel grace: blockTime > propose_deadline + challenge_window
-  afterGrace: Number(DEADLINE + 7200n) + 100,
+  afterGrace: Number(DEADLINE + CHALLENGE_WINDOW) + 100,
 };
 
 export function deploy(): DareuSim {
   return DareuSim.deploy({
     ownerKey: KEYS.owner,
     tokenType: TOKEN,
-    leaderBps: LEADER_BPS,
     platformBps: PLATFORM_BPS,
   });
 }
@@ -61,18 +63,21 @@ export function deploy(): DareuSim {
 export function withMarket(marketTag = 'm'): { sim: DareuSim; marketId: Uint8Array } {
   const sim = deploy();
   const marketId = bytes32(marketTag);
-  sim.createMarket(KEYS.owner, marketId, bytes32('meta'), IDS.oracle, CLOSE, TIME.create);
+  sim.createMarket(KEYS.owner, marketId, bytes32('meta'), IDS.oracle, CLOSE, TIME.create, {
+    challengeWindow: CHALLENGE_WINDOW,
+    platformBps: PLATFORM_BPS,
+    bettingCutoff: BETTING_CUTOFF,
+  });
   return { sim, marketId };
 }
 
 /**
  * Deploy + market + two opposing bets, returning the position ids.
- * Default: Alice YES 600, Bob NO 400 (no leader).
+ * Default: Alice YES 600, Bob NO 400.
  */
 export function withBets(opts?: {
   aliceAmount?: bigint;
   bobAmount?: bigint;
-  aliceLeader?: Uint8Array;
 }): {
   sim: DareuSim;
   marketId: Uint8Array;
@@ -81,14 +86,12 @@ export function withBets(opts?: {
 } {
   const aliceAmount = opts?.aliceAmount ?? 600n;
   const bobAmount = opts?.bobAmount ?? 400n;
-  const aliceLeader = opts?.aliceLeader ?? new Uint8Array(32);
   const { sim, marketId } = withMarket();
   const alicePos = sim.placeBet(
     KEYS.alice,
     marketId,
     Outcome.YES,
     aliceAmount,
-    aliceLeader,
     bytes32('na'),
     TIME.bet,
   );
@@ -97,7 +100,6 @@ export function withBets(opts?: {
     marketId,
     Outcome.NO,
     bobAmount,
-    new Uint8Array(32),
     bytes32('nb'),
     TIME.bet,
   );

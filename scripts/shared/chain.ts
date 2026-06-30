@@ -40,6 +40,31 @@ export async function pgExec(connectionString: string, text: string, params: unk
   }
 }
 
+// Run several statements atomically in one connection/transaction. Used where the
+// spec requires syncing PG status across markets + resolutions in a single tx
+// (propose / finalize / cancel). Rolls back on any error.
+export async function pgTx(
+  connectionString: string,
+  fn: (client: pg.Client) => Promise<void>,
+): Promise<void> {
+  const client = new pg.Client({ connectionString })
+  await client.connect()
+  try {
+    await client.query('BEGIN')
+    await fn(client)
+    await client.query('COMMIT')
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK')
+    } catch {
+      /* ignore rollback failure */
+    }
+    throw err
+  } finally {
+    await client.end()
+  }
+}
+
 export function loadEnvFiles() {
   for (const filename of envFiles) {
     const envPath = path.join(contractRoot, filename)
