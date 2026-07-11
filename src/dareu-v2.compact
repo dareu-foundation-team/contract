@@ -1,0 +1,1181 @@
+pragma language_version >= 0.23;
+
+// ============================================================================
+// DareU v2 — shielded Vault + prediction Market on Midnight (single contract).
+// ============================================================================
+//
+// WHY THIS REWRITE (see README-shielded-vault-market.zh-CN.md — the approved spec)
+//   v1 kept a bettor's identity as a ZK `participant_id` derived from a browser-
+//   held secret. In practice the browser derivation (signData) was
+//   non-deterministic, so switching devices DRIFTED the id and permanently
+//   stranded claims/refunds. v2 removes that failure mode STRUCTURALLY on the
+//   user path: a user's only credentials are things that live in their wallet
+//   seed — sNIGHT coins, a per-position claim ticket, and the pre-image of a
+//   payout commitment — all of which recover with the mnemonic. The only way to
+//   lose funds is to lose the wallet itself (same level as any crypto asset).
+//
+// TWO LOGICAL MODULES, ONE DEPLOYED CONTRACT
+//   Compact has no cross-contract calls yet, and a shielded token can only be
+//   minted by its issuing contract. So the Vault (which mints sNIGHT) and the
+//   Market (which must mint sNIGHT payouts) MUST live in one contract. Multi-
+//   asset support = deploy one instance per underlying asset (DareU-NIGHT, ...).
+//
+//   [Vault]  underlying (NIGHT, unshielded) <-> sNIGHT (shielded, issued here)
+//            deposit / withdraw
+//   [Market] everything denominated in sNIGHT, burn-and-mint; the contract
+//            NEVER custodies a shielded coin (each coin received is burned in
+//            the same circuit, sidestepping concurrent-coin contention).
+//
+// PRIVACY MODEL (on-chain exposure matrix, spec §7)
+//   place_bet   : public = market/side/amount/pos_id/payout COMMITMENT (a hash);
+//                 hidden = who paid (zswap), the payout_pk pre-image, wallet addr.
+//   claim_settled: public = pos_id, gross_profit, platform_fee, and the resulting
+//                 payout (= amount + gross_profit - platform_fee); hidden = who
+//                 triggered (ticket spend is a zswap input), the beneficiary pk.
+//                 NOTE: the beneficiary pk is a caller-supplied circuit ARGUMENT,
+//                 not a witness value, so the compiler does not force a disclose()
+//                 on it — but the mint output (recipient = payout_pk) is inherently
+//                 part of the public zswap transcript once claimed. See the
+//                 "payout_pk linkability" caveat below.
+//
+// PAYOUT_PK LINKABILITY CAVEAT (raised in review; see also spec §3/D1)
+//   payout_commitment = persistentHash("dareu:payee:", payout_pk) is UNSALTED per
+//   the approved design. Because payout_pk becomes public when ANY position funded
+//   to it is claimed (it is the mint recipient), an observer can recompute the hash
+//   and match it against every stored payout_commitment — linking all positions
+//   (even unclaimed ones) that share a payout wallet. This does NOT let anyone
+//   redirect funds (gate 3 always mints to the supplied pk), but it weakens
+//   beneficiary unlinkability across a reused payout wallet. Mitigation options:
+//   (a) UI rotates a fresh payout_pk per position, or (b) switch payee_commitment
+//   to persistentCommit with a wallet-derived per-position salt (changes the
+//   circuit signature + requires the webapp to recover the salt). Deferred to a
+//   design decision — flagged, not silently changed.
+//   withdraw    : public = recipient address + amount; hidden = who paid sNIGHT.
+//   deposit     : public = depositor unshielded addr + amount (inherent to an
+//                 unshielded transfer); recipient_pk goes into a zswap commitment.
+//   All oracle/admin circuits are fully public (platform-side operations).
+//
+// TICKET THREAT MODEL (spec §1 — the core of the ticket-gated claim design)
+//   Three credentials, each wallet-derived, split by ROLE:
+//     sNIGHT coin      -> payment authorization (spending a coin IS a key proof)
+//     ticket[pos_id]   -> the TRIGGER for claim ("who may pull") — one per
+//                         position, minted to the bettor at place_bet time
+//     payout_pk commit -> the BENEFICIARY binding ("who gets paid") — hashed at
+//                         bet time, pre-image proven at claim time
+//   A ticket is a bearer shielded coin (the protocol can't make it soulbound),
+//   but it is ONLY a trigger, not a beneficiary: a stolen/misrouted ticket can
+//   neither change the beneficiary (there is no such parameter) nor pass the
+//   payout_pk pre-image check (the pk is never on-chain, so a thief can't even
+//   construct the transaction). The sole consequence of a lost ticket is that
+//   the position's payout is PERMANENTLY unclaimable — there is deliberately no
+//   keeper fallback and no timeout opening (product decision D7). This shows up
+//   as a permanent surplus in the solvency invariant (spec §8), to be monitored.
+//
+// PLATFORM TRUST MODEL (nested authority — least privilege for the hot keeper)
+//   owner (COLD)  ⊃  operator (HOT)  ⊃  oracle (per-market)
+//     owner    — cold-storage admin key. Sole authority over the TREASURY
+//                (withdraw_treasury) and over ROLE administration (set_role:
+//                appoint/revoke arbiters and rotate the operator). Never needs to
+//                be online for routine operation.
+//     operator — hot keeper credential run by the always-online server. Least
+//                privilege: day-to-day market OPS only (create_market, and the
+//                operational rescue path of cancel_market). It CANNOT reach the
+//                treasury, CANNOT appoint arbiters, and CANNOT rotate itself or
+//                escalate — those are all owner-gated. An operator-key compromise
+//                therefore cannot move platform funds or alter the arbiter set; the
+//                blast radius is limited to market lifecycle churn.
+//     oracle   — per-market participant that (with owner/operator) may cancel an
+//                OPEN market. Narrowest scope.
+//   RECOVERY from an operator-key leak: owner calls set_role(OPERATOR, new_id, true)
+//   from cold storage, which overwrites `operator` and instantly de-authorizes the
+//   old hot key. No treasury exposure in the interim.
+//
+// EXACTLY 12 EXPORTED CIRCUITS (deploy budget — 13 exceeded the block limit in
+//   v1). See each `export circuit` below. Pure helpers `participant_id` /
+//   `position_id` are exported so the webapp can recompute ids client-side.
+//   NOTE: set_role replaces v1's set_arbiter (folding arbiter + operator admin into
+//   one owner-only circuit) precisely to keep the count at 12 after adding operator.
+// ============================================================================
+
+import CompactStandardLibrary;
+
+// Lifecycle a market moves through (same as v1). OPEN -> (PROPOSED -> [DISPUTED]
+// ->) RESOLVED is the happy path; CANCELLED is the terminal refund escape hatch.
+export enum MarketStatus {
+  OPEN,
+  PROPOSED,
+  DISPUTED,
+  RESOLVED,
+  CANCELLED
+}
+
+// Betting sides. NONE doubles as "outcome not decided" and "no position".
+export enum Outcome {
+  NONE,
+  YES,
+  NO
+}
+
+// Role selector for the owner-only set_role admin circuit. ARBITER manages the DVM
+// council (arbiters map); OPERATOR manages the single hot operator credential.
+export enum Role {
+  ARBITER,
+  OPERATOR
+}
+
+// A single binary market. All money fields are public Uint<64> base units of
+// sNIGHT (the contract's own shielded token). Structure matches v1 except the
+// creator field is dropped (unused for auth here — owner auth is the participant
+// id check, and cancel/oracle rights are the `oracle` field + `owner` ledger).
+export struct Market {
+  metadata_hash: Bytes<32>, // sha256 commitment to off-chain metadata
+  oracle: Bytes<32>, // participant_id allowed (with owner) to cancel OPEN
+  close_time: Uint<64>, // unix seconds; bets accepted only before this
+  status: MarketStatus,
+  outcome: Outcome, // final result once RESOLVED (NONE until then)
+  yes_pool: Uint<64>, // total sNIGHT staked on YES
+  no_pool: Uint<64>, // total sNIGHT staked on NO
+  total_pool: Uint<64>, // yes_pool + no_pool
+  challenge_window: Uint<64>, // per-market snapshot: min seconds close->finalize
+  platform_fee_rate: Uint<64>, // per-market snapshot: platform fee, basis points
+  betting_cutoff: Uint<64> // per-market snapshot: stop bets at close - this
+}
+
+// One bettor's stake in one market. The wallet is NOT stored: instead we keep a
+// HASH COMMITMENT to the payout public key. The pk pre-image is known only to the
+// beneficiary; at claim time it is proven and the payout is minted to that pk. A
+// per-position ticket (a shielded coin whose color == tokenType(pos_id, self))
+// is what actually gates the claim trigger (see ticket threat model above).
+export struct Position {
+  market_id: Bytes<32>,
+  side: Outcome,
+  amount: Uint<64>,
+  payout_commitment: Bytes<32>, // H("dareu:payee:", payout_pk.bytes) — beneficiary
+  claimed: Boolean
+}
+
+// Optimistic-oracle resolution record (one per market). Unlike v1, proposer and
+// disputer are stored as ZswapCoinPublicKey: bonds are refunded by MINTING sNIGHT
+// straight back to these keys (no pull-payment credits ledger). The keys are
+// platform-side operational values; storing them in the clear is acceptable
+// (spec §3 / D1 — only user beneficiaries get commitment protection). An all-zero
+// disputer_pk means "no dispute posted yet".
+export struct Resolution {
+  proposed_outcome: Outcome,
+  propose_deadline: Uint<64>, // challenge window ends at this unix time
+  bond: Uint<64>, // snapshot of resolution_bond, in sNIGHT
+  proposer_pk: ZswapCoinPublicKey, // bond refund target
+  disputer_pk: ZswapCoinPublicKey, // all-zero => no disputer yet
+  yes_votes: Uint<64>,
+  no_votes: Uint<64>
+}
+
+// ---- Platform configuration (set once in the constructor) ----
+// owner / underlying_token / token_domain are `sealed`: the compiler rejects any
+// reassignment, locking deploy-time values. There are no setters for them.
+export sealed ledger owner: Bytes<32>; // participant_id of the admin/owner (COLD key)
+
+export sealed ledger underlying_token: Bytes<32>; // underlying color; NIGHT = nativeToken()
+
+export sealed ledger token_domain: Bytes<32>; // sNIGHT domain separator, e.g. "dareu:snight:v1"
+
+// The OPERATOR is the hot keeper credential (least privilege): it can run day-to-day
+// market operations (create_market, cancel_market) but CANNOT touch the treasury, the
+// arbiter set, or role administration — those stay owner-only. Leak blast radius is
+// therefore "market ops only"; treasury and arbiters remain safe. Owner rotates it via
+// set_role(OPERATOR, new_id, ...). NOT sealed precisely because it must be rotatable.
+// The all-zero value is the "revoked / no operator" sentinel (see require_operator_or_owner,
+// which never treats the sentinel as a match because a real participant_id is a hash).
+export ledger operator: Bytes<32>; // participant_id of the operator (HOT key)
+
+export ledger market_count: Counter; // total markets ever created
+
+// Monotonic counter mixed into every bond-refund mint nonce (see refund_bond).
+// SECURITY: defeats coin-commitment precomputation griefing of bond refunds by
+// making the refund mint nonce depend on an on-chain value an attacker cannot
+// predict at deposit time. Starts at 0 (Counter default); only ever increments.
+export ledger refund_seq: Counter;
+
+// NOTE: cumulative in/out flow counters were deliberately NOT added. Solvency
+// monitoring lives fully off-chain: the contract's unshielded balance is publicly
+// queryable and an indexer aggregates deposit/withdraw events. On-chain Uint<64>
+// accumulators would make every deposit contend with every other deposit (and
+// withdraws likewise) on one shared read-modify-write cell, for zero information
+// gain over what the indexer already derives.
+
+// ---- Core prediction-market state ----
+export ledger markets: Map<Bytes<32>, Market>; // market_id -> Market
+
+export ledger positions: Map<Bytes<32>, Position>; // pos_id -> Position
+
+// ---- Optimistic-oracle configuration + state ----
+export ledger resolution_bond: Uint<64>; // sNIGHT bond required to propose / dispute
+
+export ledger arbiter_threshold: Uint<64>; // votes needed to settle a dispute
+
+export ledger arbiters: Map<Bytes<32>, Boolean>; // participant_id -> authorized (DVM council)
+
+export ledger resolutions: Map<Bytes<32>, Resolution>; // market_id -> proposal record
+
+export ledger dispute_votes: Set<Bytes<32>>; // vote_key(market_id, arbiter); membership == already voted
+
+// Per-market accumulated platform fees (spec §3 / D2). Replaces v1's single
+// global `treasury`: keeping fees per-market means concurrent claims on DIFFERENT
+// markets touch different cells and never contend. Fees are sourced from sNIGHT
+// that was burned at bet time but not re-minted at claim time, so paying them out
+// as underlying does not break the solvency invariant (spec §8).
+export ledger market_fees: Map<Bytes<32>, Uint<64>>; // market_id -> accrued fee (sNIGHT/underlying units)
+
+// The ONE private input to the contract, retained ONLY for platform-side auth
+// (owner / oracle / arbiter), exactly as in v1. Ordinary users NEVER touch this:
+// their credentials are their wallet's sNIGHT coins, tickets, and payout pk. The
+// key is supplied at proof time and never written to chain; only its hash (the
+// participant_id) is ever disclosed.
+witness local_secret_key(): Bytes<32>;
+
+// ---------------------------------------------------------------------------
+// Identity helpers (participant_id pattern, retained from v1 for platform auth)
+// ---------------------------------------------------------------------------
+
+// ZK identity for a secret key: a stable, non-reversible id. The domain tag
+// namespaces this hash so it cannot collide with position/vote/payee hashes.
+export pure circuit participant_id(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "dareu:participant:"), sk]);
+}
+
+// The id of whoever is calling right now (the privacy-preserving "msg.sender").
+// Used only on platform-side circuits; user circuits never call this.
+circuit current_participant(): Bytes<32> {
+  return participant_id(local_secret_key());
+}
+
+// ---------------------------------------------------------------------------
+// Pure id / commitment derivations (exported ones are recomputed by the webapp)
+// ---------------------------------------------------------------------------
+
+// Deterministic, unlinkable id for a Position. `pos_nonce` lets one wallet hold
+// several positions in one market and keeps the id unguessable by others. This id
+// is ALSO the domain separator of the position's claim ticket (see ticket_color),
+// which is why it must be domain-tagged (it already is, via the leading pad tag).
+export pure circuit position_id(market_id: Bytes<32>, pos_nonce: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "dareu:position:"), market_id, pos_nonce]);
+}
+
+// Beneficiary commitment: H("dareu:payee:", payout_pk.bytes). The pk itself never
+// touches the chain. At claim time the caller re-supplies the pk; we recompute
+// this hash and require it to equal the stored commitment, proving they are the
+// intended beneficiary. persistentHash gives no blinding, but the pk is a 32-byte
+// wallet key with high entropy, so the commitment is not brute-forceable in
+// practice, and — crucially — the payout is minted to the pk regardless, so even
+// a broken commitment cannot redirect funds away from the true beneficiary.
+pure circuit payee_commitment(payout_pk: ZswapCoinPublicKey): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "dareu:payee:"), payout_pk.bytes]);
+}
+
+// Per-(market, arbiter) vote key preventing an arbiter from voting twice.
+pure circuit vote_key(market_id: Bytes<32>, arbiter: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "dareu:vote:"), market_id, arbiter]);
+}
+
+// ---------------------------------------------------------------------------
+// sNIGHT / ticket color derivations (never stored — derived in-circuit)
+// ---------------------------------------------------------------------------
+
+// The color of sNIGHT, the shielded token this contract issues. Derived from the
+// deploy-time domain separator and this contract's own address.
+circuit snight_color(): Bytes<32> {
+  return tokenType(token_domain, kernel.self());
+}
+
+// The color of a position's claim ticket. The position id is itself a domain-
+// separated hash, so we use it DIRECTLY as the domain separator (spec §5.2 — this
+// saves the two SHA-256s an extra tag+hash would cost). Each position therefore
+// gets a globally unique one-off ticket color.
+// NOT pure and NOT exportable via pureCircuits: tokenType needs kernel.self(),
+// which reads the kernel ledger field. The webapp must derive a ticket color from
+// pos_id + the contract address off-chain (tokenType is deterministic) rather than
+// calling this circuit.
+circuit ticket_color(pos_id: Bytes<32>): Bytes<32> {
+  return tokenType(pos_id, kernel.self());
+}
+
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+
+// The owner is identified by the participant_id of the owner secret key (the
+// deployer keeps that key off-chain, in cold storage). `underlying` is the
+// underlying token color (NIGHT = nativeToken()); `domain` is the sNIGHT domain
+// separator. `operator_id` is a PUBLIC participant_id (no secret needed at deploy)
+// for the hot keeper; if it is the all-zero sentinel we default operator = owner
+// (single-key convenience for test deploys). Oracle bond defaults and arbiter
+// threshold mirror v1.
+constructor(owner_secret_key: Bytes<32>,
+            underlying: Bytes<32>,
+            domain: Bytes<32>,
+            init_bond: Uint<64>,
+            init_threshold: Uint<64>,
+            operator_id: Bytes<32>
+            ) {
+  assert(init_threshold > 0, "Arbiter threshold must be positive");
+  // Bond is doubled in vote_dispute (2x to the dispute winner). Bound it at half of
+  // Uint<64> range so that doubling can never fail the narrowing cast and deadlock a
+  // disputed market. There are no bond setters, so this deploy-time check is final.
+  assert(init_bond <= 9223372036854775807, "Bond too large (must fit doubling)");
+
+  const owner_id = disclose(participant_id(owner_secret_key));
+  owner = owner_id;
+  underlying_token = disclose(underlying);
+  token_domain = disclose(domain);
+
+  // Default a zero operator_id to the owner's id (single-key test deploys). Note
+  // this is the ONE place operator may legitimately equal owner; in production the
+  // deployer passes a distinct hot-key participant_id.
+  const public_operator_id = disclose(operator_id);
+  operator = public_operator_id == empty_participant() ? owner_id : public_operator_id;
+
+  resolution_bond = disclose(init_bond);
+  arbiter_threshold = disclose(init_threshold);
+}
+
+// ---------------------------------------------------------------------------
+// Shared guards / helpers
+// ---------------------------------------------------------------------------
+
+// Aborts unless the caller's private key hashes to `owner`; returns the caller's
+// participant_id so owner-only circuits can reuse it. Used for TREASURY and ROLE
+// administration — the cold-key-only authority tier.
+circuit require_owner(): Bytes<32> {
+  const caller = current_participant();
+  assert(owner == caller, "Only owner can call this circuit");
+  return caller;
+}
+
+// Aborts unless the caller is the owner OR the operator; returns the caller's
+// participant_id. Used for market OPS (create_market, cancel_market). Because a real
+// participant_id is a SHA-256 hash, it can never equal the all-zero revoked-operator
+// sentinel, so a revoked operator (operator == 0) never authorizes here.
+circuit require_operator_or_owner(): Bytes<32> {
+  const caller = disclose(current_participant());
+  assert(caller == owner || caller == operator, "Only owner or operator can call this circuit");
+  return caller;
+}
+
+// Reject NONE — bets and proposed/voted outcomes must pick a real side.
+pure circuit require_valid_side(side: Outcome): [] {
+  assert(side == Outcome.YES || side == Outcome.NO, "Outcome must be YES or NO");
+}
+
+// The all-zero participant id sentinel ("no participant"). A real id is a hash and
+// never all-zero.
+pure circuit empty_participant(): Bytes<32> {
+  return default<Bytes<32>>;
+}
+
+// The all-zero payout key sentinel ("no disputer yet"). A real wallet key is never
+// all-zero in practice.
+pure circuit empty_pk(): ZswapCoinPublicKey {
+  return default<ZswapCoinPublicKey>;
+}
+
+// ---- Per-market guardrails (deploy-time policy; language-level constants) ----
+pure circuit min_challenge_window(): Uint<64> {
+  return 60;
+} // >= settlement window
+
+pure circuit max_challenge_window(): Uint<64> {
+  return 604800;
+} // <= 7 days
+
+// The caller supplies propose_deadline because Compact exposes block time only via
+// comparison predicates, not as a readable Uint.  Treat
+// `deadline - challenge_window` as the caller's proposed block-time anchor and
+// require it to be no more than one hour ahead of the block that applies the
+// transaction.  This gives proving / mempool inclusion a bounded amount of skew
+// while ensuring the FULL challenge_window still starts at the actual proposal
+// block (a stale/late proof is rejected instead of silently shortening the window).
+pure circuit max_proposal_time_skew(): Uint<64> {
+  return 3600;
+} // < 1 hour ahead of the proposal block
+
+pure circuit max_uint64(): Uint<64> {
+  return 0xFFFFFFFFFFFFFFFF;
+}
+
+pure circuit max_platform_fee_rate(): Uint<64> {
+  return 500;
+} // <= 5% (basis points)
+
+pure circuit min_betting_cutoff(): Uint<64> {
+  return 60;
+} // >= 60s
+
+pure circuit max_betting_cutoff(): Uint<64> {
+  return 1800;
+} // <= 30 min
+
+// Fetch a market by id, asserting existence. `market_id` here is already-disclosed
+// (public) at every call site.
+circuit get_market(market_id: Bytes<32>): Market {
+  assert(markets.member(market_id), "Market does not exist");
+  return markets.lookup(market_id);
+}
+
+// The winners' pool (paid out) and losers' pool (distributed as profit).
+pure circuit winning_pool(market: Market): Uint<64> {
+  return market.outcome == Outcome.YES ? market.yes_pool : market.no_pool;
+}
+
+pure circuit losing_pool(market: Market): Uint<64> {
+  return market.outcome == Outcome.YES ? market.no_pool : market.yes_pool;
+}
+
+// Mark a market RESOLVED with a final outcome (shared by finalize + dispute vote).
+// Refuses to settle if the winning side has no stake (nobody to pay -> would
+// strand the losing pool); such markets must be CANCELLED and refunded instead.
+circuit settle_market(market_id: Bytes<32>, market: Market, result: Outcome): [] {
+  const resolved =
+          Market { metadata_hash: market.metadata_hash,
+                   oracle: market.oracle,
+                   close_time: market.close_time,
+                   status: MarketStatus.RESOLVED,
+                   outcome: result,
+                   yes_pool: market.yes_pool,
+                   no_pool: market.no_pool,
+                   total_pool: market.total_pool,
+                   challenge_window: market.challenge_window,
+                   platform_fee_rate: market.platform_fee_rate,
+                   betting_cutoff: market.betting_cutoff };
+  assert(winning_pool(resolved) > 0, "Cannot resolve with no winners");
+  markets.insert(market_id, resolved);
+}
+
+// Mint a bond refund of `amount` sNIGHT to `pk`. `nonce_base` is the caller's
+// per-(market, role) domain-separated hash. SECURITY (audit High — coin-commitment
+// precomputation griefing): every input to `nonce_base` is PUBLIC (market_id, a
+// literal role tag) and the recipient pk is stored in clear in the Resolution, so
+// an attacker could read them and call the permissionless `deposit(bond, pk,
+// derived_nonce)` to PRE-MINT the identical coin commitment; the later honest bond
+// refund would then mint a duplicate commitment and either revert the settlement or
+// produce a shared-nullifier unspendable coin, blocking the refund. To defeat this
+// we mix in `refund_seq`, a monotonic on-chain counter the pre-attacker cannot
+// predict. We increment it FIRST, then read it back within this same circuit — the
+// runtime reflects the increment for read-after-write in one circuit (verified), so
+// two refund_bond calls in one tx (stuck-cancel refunding proposer AND disputer) get
+// seq and seq+1, i.e. distinct commitments. Monotonicity keeps every mint's nonce
+// globally unique. (claim_settled is NOT routed here; its payout_pk is committed and
+// never in clear, so its mint nonce is not precomputable.)
+circuit refund_bond(pk: ZswapCoinPublicKey, amount: Uint<64>, nonce_base: Bytes<32>): [] {
+  refund_seq.increment(1);
+  const seq_bytes = (refund_seq.read() as Field) as Bytes<32>;
+  const nonce = persistentHash<Vector<2, Bytes<32>>>([nonce_base, seq_bytes]);
+  const c = mintShieldedToken(
+              token_domain,
+              disclose(amount),
+              nonce,
+              left<ZswapCoinPublicKey, ContractAddress>(pk)
+              );
+}
+
+// ===========================================================================
+// VAULT MODULE (2 circuits)
+// ===========================================================================
+
+// [CIRCUIT 1 / vault] deposit — wrap underlying (NIGHT) into contract-issued
+// sNIGHT. Anyone may deposit. The underlying is pulled in unshielded, and an equal
+// amount of sNIGHT is minted to `recipient_pk`'s wallet (shielded). The mint nonce
+// is caller-supplied random 32 bytes (collision negligible; reusing a nonce only
+// harms the caller's own coin — spec §6).
+//
+// EXPOSURE: depositor's unshielded address + amount are public (inherent to an
+// unshielded transfer). recipient_pk enters a zswap coin commitment; it is a
+// caller-supplied argument (not sourced from a witness), so the Witness Protection
+// Program does not tag it as private and no disclose() is compiler-mandated — we
+// disclose() it anyway at the call site for reviewer clarity.
+export circuit deposit(amount: Uint<64>,
+                       recipient_pk: ZswapCoinPublicKey,
+                       mint_nonce: Bytes<32>
+                       ): [] {
+  const public_amount = disclose(amount);
+  assert(public_amount > 0, "Deposit amount must be positive");
+
+  // Pull the underlying into the contract, then mint the equivalent sNIGHT out.
+  receiveUnshielded(underlying_token, public_amount as Uint<128>);
+  const minted = mintShieldedToken(
+                   token_domain,
+                   public_amount,
+                   disclose(mint_nonce),
+                   left<ZswapCoinPublicKey, ContractAddress>(disclose(recipient_pk))
+                   );
+}
+
+// [CIRCUIT 2 / vault] withdraw — unwrap sNIGHT back into underlying. No explicit
+// auth: holding the sNIGHT coin IS the authorization (spending it is a zswap proof
+// of the wallet key). The coin is received and immediately burned, then an equal
+// amount of underlying is sent to `payout_address`.
+//
+// EXPOSURE: recipient address + amount public; the sNIGHT payer is hidden (zswap).
+export circuit withdraw(coin: ShieldedCoinInfo, payout_address: UserAddress): [] {
+  const public_coin = disclose(coin);
+  assert(public_coin.color == snight_color(), "Coin is not sNIGHT");
+  assert(public_coin.value > 0, "Withdraw amount must be positive");
+
+  // Receive the sNIGHT and burn it (contract never custodies shielded coins).
+  receiveShielded(public_coin);
+  const burned = sendImmediateShielded(public_coin, shieldedBurnAddress(), public_coin.value);
+
+  // Pay out the underlying to the user (unshielded: user is the RIGHT variant).
+  sendUnshielded(
+    underlying_token,
+    public_coin.value,
+    right<ContractAddress, UserAddress>(disclose(payout_address))
+    );
+}
+
+// ===========================================================================
+// MARKET MODULE (10 circuits)
+// ===========================================================================
+
+// [CIRCUIT 3 / market] create_market — owner OR operator (a market OP, so the hot
+// keeper handles it). Validation identical to v1 (existence, guardrail ranges,
+// close_time in the future, still bettable at creation). Pools start empty; the
+// market opens immediately.
+export circuit create_market(
+                 market_id: Bytes<32>,
+                 metadata_hash: Bytes<32>,
+                 oracle: Bytes<32>,
+                 close_time: Uint<64>,
+                 challenge_window: Uint<64>,
+                 platform_fee_rate: Uint<64>,
+                 betting_cutoff: Uint<64>
+                 ): [] {
+  const public_market_id = disclose(market_id);
+  const public_metadata_hash = disclose(metadata_hash);
+  const public_oracle = disclose(oracle);
+  const public_close_time = disclose(close_time);
+  const public_challenge_window = disclose(challenge_window);
+  const public_platform_fee_rate = disclose(platform_fee_rate);
+  const public_betting_cutoff = disclose(betting_cutoff);
+
+  require_operator_or_owner();
+  assert(!markets.member(public_market_id), "Market already exists");
+  assert(public_oracle != empty_participant(), "Oracle cannot be empty");
+  assert(kernel.blockTimeLessThan(public_close_time), "Close time must be in the future");
+
+  // FIX 2 (audit Medium — deadline-arithmetic overflow): bound close_time well below
+  // Uint<64>::MAX so that later `close_time + challenge_window` (propose_resolution)
+  // and `propose_deadline + challenge_window` (cancel_market grace) can never
+  // overflow. 0xF000000000000000 (~1.73e19 unix seconds, ~5.4e11 years) is absurdly
+  // far past any real market horizon yet leaves >1.15e18 of headroom for the max
+  // challenge_window (604800) added twice over.
+  assert(public_close_time < (0xF000000000000000 as Uint<64>), "close_time unreasonable");
+
+  assert(public_challenge_window >= min_challenge_window(), "Challenge window too small");
+  assert(public_challenge_window <= max_challenge_window(), "Challenge window too large");
+  assert(public_platform_fee_rate <= max_platform_fee_rate(), "Platform fee rate too high");
+  assert(public_betting_cutoff >= min_betting_cutoff(), "Betting cutoff too small");
+  assert(public_betting_cutoff <= max_betting_cutoff(), "Betting cutoff too large");
+  // FIX 3 (audit Low — betting-cutoff underflow): close_time must strictly exceed
+  // betting_cutoff so the stored market's `(close_time - betting_cutoff)` in place_bet
+  // can never underflow (a Uint subtraction that would go negative aborts at runtime).
+  assert(public_close_time > public_betting_cutoff, "close_time must exceed betting_cutoff");
+  // Must still be bettable at creation: now < close_time - betting_cutoff.
+  assert(kernel.blockTimeLessThan((public_close_time - public_betting_cutoff) as Uint<64>),
+         "betting already closed at creation"
+         );
+
+  markets.insert(
+    public_market_id,
+    Market { metadata_hash: public_metadata_hash,
+             oracle: public_oracle,
+             close_time: public_close_time,
+             status: MarketStatus.OPEN,
+             outcome: Outcome.NONE,
+             yes_pool: 0,
+             no_pool: 0,
+             total_pool: 0,
+             challenge_window: public_challenge_window,
+             platform_fee_rate: public_platform_fee_rate,
+             betting_cutoff: public_betting_cutoff }
+    );
+
+  market_count.increment(1);
+}
+
+// [CIRCUIT 4 / market] place_bet — stake sNIGHT on YES or NO. No auth: holding
+// sNIGHT is authorization. The staked coin is received and immediately BURNED
+// (burn-and-mint: the contract never custodies coins, which avoids concurrent
+// coin contention). A per-position claim ticket is then minted to the bettor's
+// payout wallet, and a Position is recorded under `pos_id` with the payout
+// COMMITMENT (never the pk itself). Returns pos_id for the client's UI/DB.
+//
+// TICKET MINT (spec §5.2): domainSep = pos_id directly (pos_id is already a
+// domain-separated hash), nonce reuses pos_nonce (the ticket color is unique per
+// position, so no commitment collision). Value = 1 (a bare trigger).
+//
+// EXPOSURE: market/side/amount/pos_id/payout commitment are public; the payer,
+// the payout_pk pre-image, and any wallet address are hidden.
+export circuit place_bet(
+                 market_id: Bytes<32>,
+                 side: Outcome,
+                 amount: Uint<64>,
+                 coin: ShieldedCoinInfo,
+                 payout_pk: ZswapCoinPublicKey,
+                 pos_nonce: Bytes<32>
+                 ): Bytes<32> {
+  const public_market_id = disclose(market_id);
+  const public_side = disclose(side);
+  const public_amount = disclose(amount);
+  const public_coin = disclose(coin);
+  const public_pos_nonce = disclose(pos_nonce);
+  const public_payout_pk = disclose(payout_pk);
+
+  const market = get_market(public_market_id);
+  assert(market.status == MarketStatus.OPEN, "Market is not open");
+  assert(kernel.blockTimeLessThan((market.close_time - market.betting_cutoff) as Uint<64>),
+         "betting closed"
+         );
+  require_valid_side(public_side);
+  assert(public_amount > 0, "Bet amount must be positive");
+
+  // The staked coin must be sNIGHT and cover exactly the declared amount.
+  assert(public_coin.color == snight_color(), "Bet coin is not sNIGHT");
+  assert(public_coin.value == (public_amount as Uint<128>), "Coin value must equal amount");
+
+  // pos_id doubles as the ticket domain separator; must be fresh.
+  const pos_id = position_id(public_market_id, public_pos_nonce);
+  assert(!positions.member(pos_id), "Position already exists");
+
+  // Receive the stake and burn it immediately (no custody).
+  receiveShielded(public_coin);
+  const burned = sendImmediateShielded(public_coin, shieldedBurnAddress(), public_coin.value);
+
+  // Grow the chosen pool (parimutuel math, same as v1).
+  const next_yes_pool =
+          public_side == Outcome.YES
+            ? (market.yes_pool + public_amount) as Uint<64>
+            : market.yes_pool;
+  const next_no_pool =
+          public_side == Outcome.NO ? (market.no_pool + public_amount) as Uint<64> : market.no_pool;
+
+  markets.insert(
+    public_market_id,
+    Market { metadata_hash: market.metadata_hash,
+             oracle: market.oracle,
+             close_time: market.close_time,
+             status: market.status,
+             outcome: market.outcome,
+             yes_pool: next_yes_pool,
+             no_pool: next_no_pool,
+             total_pool: (market.total_pool + public_amount) as Uint<64>,
+             challenge_window: market.challenge_window,
+             platform_fee_rate: market.platform_fee_rate,
+             betting_cutoff: market.betting_cutoff }
+    );
+
+  positions.insert(
+    pos_id,
+    Position { market_id: public_market_id,
+               side: public_side,
+               amount: public_amount,
+               payout_commitment: payee_commitment(public_payout_pk),
+               claimed: false }
+    );
+
+  // Mint the claim ticket (value 1) to the bettor's payout wallet. domainSep =
+  // pos_id, nonce = pos_nonce (both reused deliberately; see spec §5.2 / §6).
+  const ticket = mintShieldedToken(
+                   pos_id,
+                   1,
+                   public_pos_nonce,
+                   left<ZswapCoinPublicKey, ContractAddress>(public_payout_pk)
+                   );
+
+  return pos_id;
+}
+
+// [CIRCUIT 5 / market] claim_settled — ticket-gated payout. Merges v1's
+// claim_winnings + refund_cancelled_position into one ticket-authorized circuit.
+//
+// THREE-GATE AUTHORIZATION (all wallet-derived — the whole point of v2):
+//   (1) ticket.color == ticket_color(bet_id) && ticket.value == 1, then the
+//       ticket is received and burned. Without the ticket the transaction cannot
+//       even be constructed (its zswap input is missing).
+//   (2) payee_commitment(payout_pk) == position.payout_commitment. Only the
+//       beneficiary knows the pk pre-image (it is never on-chain).
+//   (3) the payout is minted to payout_pk itself — so even if (1)/(2) were somehow
+//       bypassed, funds can only ever reach the true beneficiary.
+//
+// THE MATH (RESOLVED branch, floor-division brackets, identical to v1): the client
+// computes gross_profit / platform_fee off-chain; the circuit re-derives the
+// unique correct value by bracketing between two integer inequalities.
+//   gross_profit = floor(amount * losers / winners)
+//   platform_fee = floor(gross_profit * market.platform_fee_rate / 10000)  [bps]
+//   payout = amount + gross_profit - platform_fee; fee accrues to market_fees.
+// CANCELLED branch: gross_profit == 0 && platform_fee == 0; payout = amount.
+//
+// No timeout opening, no keeper (product decision D7): a lost ticket strands this
+// position's payout permanently.
+export circuit claim_settled(
+                 bet_id: Bytes<32>,
+                 payout_pk: ZswapCoinPublicKey,
+                 ticket: ShieldedCoinInfo,
+                 gross_profit: Uint<64>,
+                 platform_fee: Uint<64>
+                 ): [] {
+  const public_bet_id = disclose(bet_id);
+  const public_payout_pk = disclose(payout_pk);
+  const public_ticket = disclose(ticket);
+  const public_gross_profit = disclose(gross_profit);
+  const public_platform_fee = disclose(platform_fee);
+
+  // Gate (1): ticket color + value, then receive & burn the ticket.
+  assert(public_ticket.color == ticket_color(public_bet_id), "Ticket color mismatch");
+  assert(public_ticket.value == 1, "Ticket value must be 1");
+  receiveShielded(public_ticket);
+  const burned = sendImmediateShielded(public_ticket, shieldedBurnAddress(), public_ticket.value);
+
+  assert(positions.member(public_bet_id), "Position does not exist");
+  const position = positions.lookup(public_bet_id);
+
+  // Gate (2): beneficiary pre-image proof.
+  assert(payee_commitment(public_payout_pk) == position.payout_commitment,
+         "Payout key does not match beneficiary commitment"
+         );
+
+  assert(!position.claimed, "Position already claimed");
+  const market = get_market(position.market_id);
+
+  // Only a settled market (RESOLVED or CANCELLED) is claimable. Assert the
+  // exhaustiveness explicitly here rather than relying solely on claim_cancelled's
+  // internal status check, so the dispatch invariant is visible at the call site
+  // and survives future refactors of the helpers.
+  assert(market.status == MarketStatus.RESOLVED || market.status == MarketStatus.CANCELLED,
+         "Market is not settled"
+         );
+
+  // Branch by market status; compute payout. Only the selected branch's asserts
+  // execute (Compact ternary is single-branch — verified empirically), so the
+  // RESOLVED and CANCELLED validations never cross-fire.
+  const payout = market.status == MarketStatus.RESOLVED
+                   ? claim_resolved(position, market, public_gross_profit, public_platform_fee)
+                   : claim_cancelled(position, market, public_gross_profit, public_platform_fee);
+
+  // Mark claimed BEFORE minting so the position can never be double-claimed.
+  positions.insert(
+    public_bet_id,
+    Position { market_id: position.market_id,
+               side: position.side,
+               amount: position.amount,
+               payout_commitment: position.payout_commitment,
+               claimed: true }
+    );
+
+  // Gate (3): mint the payout to the beneficiary pk. Nonce = H(tag, bet_id): a
+  // position is claimed exactly once, so this nonce is globally unique and lets
+  // claims on different positions mint in parallel (spec §6).
+  const payout_coin =
+          mintShieldedToken(
+            token_domain,
+            disclose(payout),
+            persistentHash<Vector<2, Bytes<32>>>([pad(32, "dareu:claimmint:"), public_bet_id]),
+            left<ZswapCoinPublicKey, ContractAddress>(public_payout_pk)
+            );
+}
+
+// RESOLVED payout: only a winning position may claim; floor-division brackets
+// re-derive gross_profit and platform_fee; the fee accrues to market_fees. Runs as
+// a helper (not exported) so claim_settled stays a single circuit.
+circuit claim_resolved(
+          position: Position,
+          market: Market,
+          gross_profit: Uint<64>,
+          platform_fee: Uint<64>
+          ): Uint<64> {
+  assert(position.side == market.outcome, "Position is not a winner");
+
+  const winners = winning_pool(market);
+  const losers = losing_pool(market);
+  assert(winners > 0, "Winning pool is empty");
+
+  // gross_profit == floor(amount * losers / winners).
+  assert(gross_profit * winners <= position.amount * losers, "Profit is too high");
+  assert(position.amount * losers < (gross_profit + 1) * winners, "Profit is too low");
+
+  // platform_fee == floor(gross_profit * market.platform_fee_rate / 10000).
+  assert(platform_fee * 10000 <= gross_profit * market.platform_fee_rate,
+         "Platform fee is too high"
+         );
+  assert(gross_profit * market.platform_fee_rate < (platform_fee + 1) * 10000,
+         "Platform fee is too low"
+         );
+
+  // Accrue the fee to this market's bucket (per-market, spec §3 / D2). `position`
+  // is already in scope, so read its market_id once directly.
+  const mkt_id = position.market_id;
+  const prior = market_fees.member(mkt_id) ? market_fees.lookup(mkt_id) : 0;
+  market_fees.insert(mkt_id, (prior + platform_fee) as Uint<64>);
+
+  return (position.amount + gross_profit - platform_fee) as Uint<64>;
+}
+
+// CANCELLED payout: exact stake back, no profit, no fee. Defense-in-depth — the
+// caller (claim_settled) already asserts the market is RESOLVED-or-CANCELLED and
+// only routes here when it is not RESOLVED, so this re-checks CANCELLED explicitly.
+pure circuit claim_cancelled(
+               position: Position,
+               market: Market,
+               gross_profit: Uint<64>,
+               platform_fee: Uint<64>
+               ): Uint<64> {
+  assert(market.status == MarketStatus.CANCELLED, "Market is not cancelled");
+  assert(gross_profit == 0, "No profit on a cancelled market");
+  assert(platform_fee == 0, "No fee on a cancelled market");
+  return position.amount;
+}
+
+// [CIRCUIT 6 / oracle] propose_resolution — bond paid in sNIGHT. The proposer
+// posts a bond coin (received + burned) and records their refund pk. `deadline`
+// remains an argument for ABI compatibility, but it is tightly anchored to the
+// transaction's actual block time: the full challenge window must remain when the
+// transaction is applied, and at most max_proposal_time_skew() may be added for
+// proving/inclusion latency.
+export circuit propose_resolution(
+                 market_id: Bytes<32>,
+                 result: Outcome,
+                 deadline: Uint<64>,
+                 coin: ShieldedCoinInfo,
+                 refund_pk: ZswapCoinPublicKey
+                 ): [] {
+  const public_market_id = disclose(market_id);
+  const public_result = disclose(result);
+  const public_deadline = disclose(deadline);
+  const public_coin = disclose(coin);
+  const public_refund_pk = disclose(refund_pk);
+
+  const market = get_market(public_market_id);
+  assert(market.status == MarketStatus.OPEN, "Market is not open for proposal");
+  assert(kernel.blockTimeGreaterThan(market.close_time), "Market has not closed");
+  require_valid_side(public_result);
+
+  // `cancel_market` later adds challenge_window once more for its rescue grace
+  // period.  Reject the value here so that stored state can never make that
+  // addition overflow, even if a hostile caller submits Uint<64>::MAX.
+  assert(public_deadline <= (max_uint64() - market.challenge_window) as Uint<64>,
+         "Deadline would overflow grace period"
+         );
+  // Keep both subtractions below total: all production Unix timestamps are far
+  // above this structural floor, while malformed tiny values fail cleanly rather
+  // than underflowing during circuit evaluation.
+  assert(public_deadline >=
+           (market.challenge_window + max_proposal_time_skew()) as Uint<64>,
+         "Deadline timestamp unreasonable"
+         );
+  const deadline_anchor = (public_deadline - market.challenge_window) as Uint<64>;
+  // actual block time <= anchor means deadline - actual >= challenge_window.
+  assert(!kernel.blockTimeGreaterThan(deadline_anchor),
+         "Deadline leaves less than challenge window"
+         );
+  // actual block time > anchor-skew means anchor < actual+skew.  Together the two
+  // comparisons bind the caller-supplied anchor to the proposal block.
+  assert(kernel.blockTimeGreaterThan(
+           (deadline_anchor - max_proposal_time_skew()) as Uint<64>
+           ),
+         "Deadline too far from proposal time"
+         );
+
+  // All-zero is the on-chain "no disputer" sentinel and cannot receive a usable
+  // refund.  Reject it before burning the proposer's bond.
+  assert(public_refund_pk.bytes != empty_pk().bytes, "Refund pk cannot be empty");
+
+  // Bond must be sNIGHT of exactly resolution_bond; receive & burn it.
+  assert(public_coin.color == snight_color(), "Bond coin is not sNIGHT");
+  assert(public_coin.value == (resolution_bond as Uint<128>), "Bond value mismatch");
+  receiveShielded(public_coin);
+  const burned = sendImmediateShielded(public_coin, shieldedBurnAddress(), public_coin.value);
+
+  markets.insert(
+    public_market_id,
+    Market { metadata_hash: market.metadata_hash,
+             oracle: market.oracle,
+             close_time: market.close_time,
+             status: MarketStatus.PROPOSED,
+             outcome: market.outcome,
+             yes_pool: market.yes_pool,
+             no_pool: market.no_pool,
+             total_pool: market.total_pool,
+             challenge_window: market.challenge_window,
+             platform_fee_rate: market.platform_fee_rate,
+             betting_cutoff: market.betting_cutoff }
+    );
+
+  resolutions.insert(
+    public_market_id,
+    Resolution { proposed_outcome: public_result,
+                 propose_deadline: public_deadline,
+                 bond: resolution_bond,
+                 proposer_pk: public_refund_pk,
+                 disputer_pk: empty_pk(),
+                 yes_votes: 0,
+                 no_votes: 0 }
+    );
+}
+
+// [CIRCUIT 7 / oracle] dispute_resolution — v1 logic; counter-bond in sNIGHT
+// (received + burned), disputer_pk recorded. The disputer_pk != proposer_pk
+// assert is retained but is COSMETIC only (pk can be freely reminted — it does not
+// prevent sybil; self-dispute just costs a second bond + forces arbitration, which
+// is economically self-defeating; spec §5.5 / D6).
+export circuit dispute_resolution(
+                 market_id: Bytes<32>,
+                 coin: ShieldedCoinInfo,
+                 refund_pk: ZswapCoinPublicKey
+                 ): [] {
+  const public_market_id = disclose(market_id);
+  const public_coin = disclose(coin);
+  const public_refund_pk = disclose(refund_pk);
+
+  const market = get_market(public_market_id);
+  assert(market.status == MarketStatus.PROPOSED, "Market is not in proposed state");
+
+  assert(resolutions.member(public_market_id), "Resolution record missing");
+  const resolution = resolutions.lookup(public_market_id);
+  assert(kernel.blockTimeLessThan(resolution.propose_deadline), "Challenge window has closed");
+
+  // The disputer pk must be a real key: an all-zero pk is the "no disputer yet"
+  // sentinel, and storing it here would desync the sentinel check in cancel_market
+  // (which would then skip the disputer's bond refund even though a bond was burned).
+  assert(public_refund_pk.bytes != empty_pk().bytes, "Refund pk cannot be empty");
+  // Cosmetic guard (see header): can't equal the proposer's declared refund pk.
+  assert(public_refund_pk.bytes != resolution.proposer_pk.bytes, "Disputer pk equals proposer pk");
+
+  // Counter-bond must be sNIGHT of exactly resolution_bond; receive & burn it.
+  assert(public_coin.color == snight_color(), "Bond coin is not sNIGHT");
+  assert(public_coin.value == (resolution.bond as Uint<128>), "Bond value mismatch");
+  receiveShielded(public_coin);
+  const burned = sendImmediateShielded(public_coin, shieldedBurnAddress(), public_coin.value);
+
+  markets.insert(
+    public_market_id,
+    Market { metadata_hash: market.metadata_hash,
+             oracle: market.oracle,
+             close_time: market.close_time,
+             status: MarketStatus.DISPUTED,
+             outcome: market.outcome,
+             yes_pool: market.yes_pool,
+             no_pool: market.no_pool,
+             total_pool: market.total_pool,
+             challenge_window: market.challenge_window,
+             platform_fee_rate: market.platform_fee_rate,
+             betting_cutoff: market.betting_cutoff }
+    );
+
+  resolutions.insert(
+    public_market_id,
+    Resolution { proposed_outcome: resolution.proposed_outcome,
+                 propose_deadline: resolution.propose_deadline,
+                 bond: resolution.bond,
+                 proposer_pk: resolution.proposer_pk,
+                 disputer_pk: public_refund_pk,
+                 yes_votes: resolution.yes_votes,
+                 no_votes: resolution.no_votes }
+    );
+}
+
+// [CIRCUIT 8 / oracle] finalize_proposal — permissionless (v1 precedent; only ever
+// benefits the proposer, no fund discretion). After the challenge window, settle to
+// the proposed outcome and mint the bond back to proposer_pk. Bond refund nonce =
+// H(tag, market_id, "p") — unique per (market, role).
+export circuit finalize_proposal(market_id: Bytes<32>): [] {
+  const public_market_id = disclose(market_id);
+  const market = get_market(public_market_id);
+  assert(market.status == MarketStatus.PROPOSED, "Market is not awaiting finalization");
+
+  assert(resolutions.member(public_market_id), "Resolution record missing");
+  const resolution = resolutions.lookup(public_market_id);
+  assert(kernel.blockTimeGreaterThan(resolution.propose_deadline), "Challenge window still open");
+
+  settle_market(public_market_id, market, resolution.proposed_outcome);
+
+  refund_bond(
+    resolution.proposer_pk,
+    resolution.bond,
+    persistentHash<Vector<3, Bytes<32>>>([pad(32, "dareu:bond:"), public_market_id, pad(32, "p")])
+    );
+}
+
+// [CIRCUIT 9 / oracle] vote_dispute — arbiter (participant_id) votes on a disputed
+// market; each arbiter votes once (vote_key dedup, as v1). On reaching the
+// threshold, settle to the winning side and mint 2x bond to the winner's pk. Bond
+// nonce = H(tag, market_id, "w").
+export circuit vote_dispute(market_id: Bytes<32>, result: Outcome): [] {
+  const public_market_id = disclose(market_id);
+  const public_result = disclose(result);
+
+  const market = get_market(public_market_id);
+  assert(market.status == MarketStatus.DISPUTED, "Market is not disputed");
+  require_valid_side(public_result);
+
+  const arbiter = disclose(current_participant());
+  assert(arbiters.member(arbiter), "Not an authorized arbiter");
+  assert(arbiters.lookup(arbiter), "Arbiter is disabled");
+
+  const vkey = vote_key(public_market_id, arbiter);
+  assert(!dispute_votes.member(vkey), "Arbiter already voted");
+  dispute_votes.insert(vkey);
+
+  assert(resolutions.member(public_market_id), "Resolution record missing");
+  const resolution = resolutions.lookup(public_market_id);
+  const next_yes =
+          public_result == Outcome.YES
+            ? (resolution.yes_votes + 1) as Uint<64>
+            : resolution.yes_votes;
+  const next_no = public_result == Outcome.NO
+                    ? (resolution.no_votes + 1) as Uint<64>
+                    : resolution.no_votes;
+
+  resolutions.insert(
+    public_market_id,
+    Resolution { proposed_outcome: resolution.proposed_outcome,
+                 propose_deadline: resolution.propose_deadline,
+                 bond: resolution.bond,
+                 proposer_pk: resolution.proposer_pk,
+                 disputer_pk: resolution.disputer_pk,
+                 yes_votes: next_yes,
+                 no_votes: next_no }
+    );
+
+  if (next_yes >= arbiter_threshold || next_no >= arbiter_threshold) {
+    const winning = next_yes >= arbiter_threshold ? Outcome.YES : Outcome.NO;
+    settle_market(public_market_id, market, winning);
+    // Winner = whichever party's claim matched the vote; they take both bonds.
+    const winner_pk =
+            resolution.proposed_outcome == winning ? resolution.proposer_pk : resolution.disputer_pk;
+    refund_bond(
+      winner_pk,
+      (resolution.bond + resolution.bond) as Uint<64>,
+      persistentHash<Vector<3, Bytes<32>>>([pad(32, "dareu:bond:"), public_market_id, pad(32, "w")])
+      );
+  }
+}
+
+// [CIRCUIT 10 / market] cancel_market — dual-mode (both modes are market OPS, so
+// operator is admitted alongside owner):
+//   • OPEN: owner OR operator OR the market's oracle cancels immediately.
+//   • STUCK PROPOSED/DISPUTED: owner OR operator, after propose_deadline +
+//     challenge_window grace, so it can never front-run a still-possible
+//     finalize/vote. This is an operational RESCUE and cannot redirect funds — the
+//     bond refunds always mint to the pks stored in the Resolution (proposer_pk /
+//     disputer_pk), never to the caller. Both bonds are minted back with distinct
+//     nonce tags ("cp"/"cd") to avoid colliding with 8/9's bond nonces.
+export circuit cancel_market(market_id: Bytes<32>): [] {
+  const public_market_id = disclose(market_id);
+  const market = get_market(public_market_id);
+  const caller = disclose(current_participant());
+
+  if (market.status == MarketStatus.OPEN) {
+    assert(caller == owner || caller == operator || caller == market.oracle,
+           "Only owner, operator, or oracle can cancel"
+           );
+  } else {
+    assert(market.status == MarketStatus.PROPOSED || market.status == MarketStatus.DISPUTED,
+           "Market cannot be cancelled in its current state"
+           );
+    assert(caller == owner || caller == operator,
+           "Only owner or operator can cancel a stuck market"
+           );
+    assert(resolutions.member(public_market_id), "Resolution record missing");
+    const resolution = resolutions.lookup(public_market_id);
+    assert(kernel.blockTimeGreaterThan(
+             (resolution.propose_deadline + market.challenge_window) as Uint<64>
+             ),
+           "Grace period has not elapsed"
+           );
+    // Refund the proposer's bond, and the disputer's too if one was posted.
+    refund_bond(
+      resolution.proposer_pk,
+      resolution.bond,
+      persistentHash<Vector<3, Bytes<32>>>(
+        [pad(32, "dareu:bond:"), public_market_id, pad(32, "cp")]
+        )
+      );
+    if (resolution.disputer_pk.bytes != empty_pk().bytes) {
+      refund_bond(
+        resolution.disputer_pk,
+        resolution.bond,
+        persistentHash<Vector<3, Bytes<32>>>(
+          [pad(32, "dareu:bond:"), public_market_id, pad(32, "cd")]
+          )
+        );
+    }
+  }
+
+  markets.insert(
+    public_market_id,
+    Market { metadata_hash: market.metadata_hash,
+             oracle: market.oracle,
+             close_time: market.close_time,
+             status: MarketStatus.CANCELLED,
+             outcome: Outcome.NONE,
+             yes_pool: market.yes_pool,
+             no_pool: market.no_pool,
+             total_pool: market.total_pool,
+             challenge_window: market.challenge_window,
+             platform_fee_rate: market.platform_fee_rate,
+             betting_cutoff: market.betting_cutoff }
+    );
+}
+
+// [CIRCUIT 11 / admin] set_role — OWNER-ONLY role administration. Folds arbiter
+// management and operator rotation into one circuit to keep the deploy budget at 12.
+// Deliberately owner-gated (NOT require_operator_or_owner): the operator must never
+// be able to appoint arbiters, rotate itself, or otherwise escalate its own
+// privileges — that separation is the whole point of the cold/hot split.
+//
+//   ARBITER : insert `participant` -> `enabled` into the arbiters map (same
+//             semantics as v1's set_arbiter). `participant` must be non-empty.
+//   OPERATOR: `enabled` ? set operator = `participant` (must be non-empty)
+//                       : REVOKE — set operator = empty sentinel. On revoke the
+//             `participant` argument is IGNORED (a real participant_id can never
+//             equal the sentinel anyway, so require_operator_or_owner will reject
+//             the revoked key regardless of what was passed).
+export circuit set_role(role: Role, participant: Bytes<32>, enabled: Boolean): [] {
+  require_owner();
+  const public_role = disclose(role);
+  const public_participant = disclose(participant);
+  const public_enabled = disclose(enabled);
+
+  if (public_role == Role.ARBITER) {
+    assert(public_participant != empty_participant(), "Arbiter cannot be empty");
+    arbiters.insert(public_participant, public_enabled);
+  } else {
+    // Role.OPERATOR
+    if (public_enabled) {
+      assert(public_participant != empty_participant(), "Operator cannot be empty");
+      operator = public_participant;
+    } else {
+      // Revoke: clear to the sentinel. `participant` is ignored on revoke.
+      operator = empty_participant();
+    }
+  }
+}
+
+// [CIRCUIT 12 / admin] withdraw_treasury — owner-only. Sweep a single market's
+// accrued platform fees to an unshielded address, then zero that bucket. The fees
+// correspond to sNIGHT burned-but-not-re-minted, so paying out the underlying does
+// not break solvency (spec §8 / §5.10).
+export circuit withdraw_treasury(market_id: Bytes<32>, payout_address: UserAddress): [] {
+  const public_market_id = disclose(market_id);
+  require_owner();
+
+  const amount = market_fees.member(public_market_id) ? market_fees.lookup(public_market_id) : 0;
+  assert(amount > 0, "No fees to withdraw for this market");
+
+  market_fees.insert(public_market_id, 0);
+
+  sendUnshielded(
+    underlying_token,
+    amount as Uint<128>,
+    right<ContractAddress, UserAddress>(disclose(payout_address))
+    );
+}

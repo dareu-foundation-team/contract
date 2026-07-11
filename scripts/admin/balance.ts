@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { unshieldedToken } from '@midnight-ntwrk/ledger-v8';
+import { unshieldedToken } from '@midnight-ntwrk/midnight-js-protocol/ledger';
 import WebSocket from 'ws';
 
 import { resolveNetwork, resolveNetworkConfig } from '../shared/network.js';

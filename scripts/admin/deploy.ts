@@ -3,7 +3,7 @@ import * as path from 'node:path';
 
 import { deployContract } from '@midnight-ntwrk/midnight-js-contracts';
 import { fromHex, toHex } from '@midnight-ntwrk/midnight-js-utils';
-import { unshieldedToken } from '@midnight-ntwrk/ledger-v8';
+import { unshieldedToken } from '@midnight-ntwrk/midnight-js-protocol/ledger';
 
 import {
   configureNetwork,

@@ -22,7 +22,7 @@ import {
   UnshieldedWallet,
 } from '@midnight-ntwrk/wallet-sdk-unshielded-wallet';
 import { NoOpTransactionHistoryStorage, TransactionHistoryStorage } from '@midnight-ntwrk/wallet-sdk-abstractions';
-import * as ledger from '@midnight-ntwrk/ledger-v8';
+import * as ledger from '@midnight-ntwrk/midnight-js-protocol/ledger';
 import * as Rx from 'rxjs';
 import WebSocket from 'ws';
 
@@ -120,6 +120,31 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 
 export function syncAllowedGap() {
   return bigintEnv('MIDNIGHT_WALLET_SYNC_ALLOWED_GAP', 50n);
+}
+
+/**
+ * Unwrap an error's message, walking `.cause` chains (including Effect-style
+ * causes) up to depth 4. Shared so every admin script formats failures the same
+ * way instead of each keeping its own copy.
+ */
+export function errorMessage(error: unknown, depth = 0): string {
+  if (depth > 4) return '';
+
+  if (error instanceof Error) {
+    const cause = (error as Error & { cause?: unknown }).cause;
+    const causeMessage = cause ? errorMessage(cause, depth + 1) : '';
+    return causeMessage ? `${error.message}: ${causeMessage}` : error.message;
+  }
+
+  if (typeof error === 'object' && error !== null) {
+    const maybeMessage = (error as { message?: unknown }).message;
+    const maybeCause = (error as { cause?: unknown }).cause;
+    const message = typeof maybeMessage === 'string' ? maybeMessage : JSON.stringify(error);
+    const causeMessage = maybeCause ? errorMessage(maybeCause, depth + 1) : '';
+    return causeMessage ? `${message}: ${causeMessage}` : message;
+  }
+
+  return String(error);
 }
 
 function progressValue(progress: unknown, key: string) {
@@ -359,6 +384,7 @@ export async function createWallet(seedHex: string, network: SupportedNetwork, c
   console.log('Starting Midnight wallet services...');
   await withTimeout(
     Promise.all([
+      wallet.shielded.start(shieldedSecretKeys),
       wallet.unshielded.start(),
       wallet.dust.start(dustSecretKey),
       wallet.pendingTransactionsService.start(),
@@ -366,7 +392,7 @@ export async function createWallet(seedHex: string, network: SupportedNetwork, c
     timeoutMs('MIDNIGHT_WALLET_START_TIMEOUT_MS', 300_000),
     'Timed out while starting Midnight wallet services. Check Preprod RPC/Indexer connectivity and try again.',
   );
-  console.log('Midnight wallet services started (unshielded + DUST).');
+  console.log('Midnight wallet services started (shielded + unshielded + DUST).');
 
   // Persist the synced state to disk (atomic write) so the next run resumes
   // incrementally. Best-effort: a serialize/write failure never aborts the run.
@@ -498,6 +524,78 @@ export async function waitForDustSyncedState(wallet: WalletFacade) {
   }
 }
 
+/**
+ * Register any unregistered tNight UTXOs for DUST generation, then BLOCK until the
+ * DUST wallet is synced (`isCompleteWithin(syncAllowedGap())`) AND has a positive
+ * balance. This is the sync barrier that prevents building a DUST spend proof
+ * against a stale/pruned Merkle root — skipping it produces node error
+ * `1010 Custom error: 170 = InvalidDustSpendProof` on submission. Extracted from
+ * deploy-v2.ts (where it already worked) so every script that submits a
+ * DUST-funded contract transaction (deploy-v2, deploy-registry, register-asset,
+ * market-v2, …) shares one implementation instead of each needing its own copy —
+ * see contract/docs/README.md for the incident this fixed.
+ *
+ * Every caller MUST run this (or `waitForDustSyncedState`, which only waits for
+ * sync without registering new UTXOs / requiring balance > 0) AFTER funding checks
+ * and BEFORE submitting any transaction that spends DUST — i.e. before
+ * `walletCtx.saveState()` and before `deployContract`/`callTx.*`.
+ */
+export async function ensureDust(walletCtx: WalletContext, config: NetworkConfig) {
+  await waitForUnshieldedSyncedState(walletCtx.wallet);
+
+  let state = await currentWalletState(walletCtx.wallet);
+  const nightUtxos = state.unshielded.availableCoins.filter((coin: any) => !coin.meta?.registeredForDustGeneration);
+
+  if (nightUtxos.length > 0) {
+    console.log(`Registering ${nightUtxos.length} available tNight UTXO(s) for DUST generation...`);
+    const recipe = await walletCtx.wallet.registerNightUtxosForDustGeneration(
+      nightUtxos,
+      walletCtx.unshieldedKeystore.getPublicKey(),
+      (payload) => walletCtx.unshieldedKeystore.signData(payload),
+    );
+    const finalizedRegistrationTx = await walletCtx.wallet.finalizeRecipe(recipe);
+    try {
+      const txHash = await submitTransactionOnce(finalizedRegistrationTx, config);
+      console.log(`DUST registration transaction submitted: ${txHash}`);
+    } catch (error) {
+      await walletCtx.wallet.revert(finalizedRegistrationTx);
+      throw new Error(`DUST registration transaction submission failed: ${errorMessage(error)}`);
+    }
+  } else {
+    console.log('No unregistered tNight UTXOs found. Checking existing DUST generation state...');
+  }
+
+  console.log('Waiting for DUST generation...');
+  state = await RxFirstDust(walletCtx);
+  const dust = state.dust.balance(new Date());
+  console.log(`DUST balance: ${dust.toString()}`);
+
+  return dust;
+}
+
+async function RxFirstDust(walletCtx: WalletContext) {
+  const timeoutMs_ = Number(process.env.MIDNIGHT_DUST_GENERATION_TIMEOUT_MS ?? 60 * 60 * 1000);
+
+  return Rx.firstValueFrom(
+    walletCtx.wallet.state().pipe(
+      Rx.auditTime(5000),
+      Rx.filter((state) => state.dust.state.progress.isCompleteWithin(syncAllowedGap())),
+      Rx.filter((state) => state.dust.balance(new Date()) > 0n),
+      Rx.timeout({
+        first: timeoutMs_,
+        with: () =>
+          Rx.throwError(
+            () =>
+              new Error(
+                `Timed out while waiting for DUST generation after ${timeoutMs_}ms. ` +
+                  'If dust is still 0, keep the wallet funded and rerun deploy later.',
+              ),
+          ),
+      }),
+    ),
+  );
+}
+
 export async function waitForSyncedState(wallet: WalletFacade) {
   const allowedGap = syncAllowedGap();
   const progressSubscription = wallet.state().pipe(Rx.auditTime(5_000)).subscribe({
@@ -535,15 +633,60 @@ export async function waitForSyncedState(wallet: WalletFacade) {
   }
 }
 
+export type CreateProvidersOptions = {
+  /** Compiled-contract asset dir (defaults to the v1 `managed/dareu`). Threading it
+   *  here (instead of overwriting `providers.zkConfigProvider` after the fact, as
+   *  deploy-v2/market-v2 historically did) also points the proofProvider at the
+   *  right prover keys, since it is constructed from this same zkConfigProvider. */
+  zkConfigPath?: string;
+  /** Circuit assets that this workflow will use. The upstream HTTP proof provider
+   *  deliberately treats ZK-provider read failures as "no key material", which can
+   *  turn a missing/wrong asset directory into an opaque proof-server `bad input`.
+   *  Loading these circuits here makes that configuration error fail locally. */
+  expectedCircuitIds?: readonly string[];
+  /** Which token kinds balanceTx may spend. v1 circuits only ever need
+   *  ['unshielded','dust']; v2 circuits that take a ShieldedCoinInfo argument
+   *  (propose/dispute bond, place_bet) need 'shielded' balancing too — pass 'all'. */
+  tokenKindsToBalance?: 'all' | Array<'unshielded' | 'dust' | 'shielded'>;
+};
+
+export async function preflightZkConfigAssets(
+  directory: string,
+  expectedCircuitIds: readonly string[],
+) {
+  const zkConfigProvider = new NodeZkConfigProvider<string>(directory);
+
+  for (const circuitId of new Set(expectedCircuitIds)) {
+    try {
+      await zkConfigProvider.get(circuitId);
+    } catch (error) {
+      throw new Error(
+        `ZK asset preflight failed for circuit "${circuitId}" in ${directory}. ` +
+          'Expected readable keys/<circuit>.prover, keys/<circuit>.verifier, and ' +
+          `zkir/<circuit>.bzkir files. Recompile the matching contract before retrying: ${errorMessage(error)}`,
+        { cause: error },
+      );
+    }
+  }
+
+  return zkConfigProvider;
+}
+
 export async function createProviders(
   walletCtx: WalletContext,
   config: NetworkConfig,
   privateStoragePassword: string,
+  opts?: CreateProvidersOptions,
 ) {
+  const resolvedZkConfigPath = opts?.zkConfigPath ?? zkConfigPath;
+  const zkConfigProvider = await preflightZkConfigAssets(
+    resolvedZkConfigPath,
+    opts?.expectedCircuitIds ?? [],
+  );
+
   const state = await currentWalletState(walletCtx.wallet);
   const accountId = String(walletCtx.unshieldedKeystore.getBech32Address());
-  const zkConfigProvider = new NodeZkConfigProvider(zkConfigPath);
-  const tokenKindsToBalance: ['unshielded', 'dust'] = ['unshielded', 'dust'];
+  const tokenKindsToBalance = opts?.tokenKindsToBalance ?? (['unshielded', 'dust'] as Array<'unshielded' | 'dust' | 'shielded'>);
 
   const walletProvider = {
     getCoinPublicKey: () => state.shielded.coinPublicKey.toHexString(),

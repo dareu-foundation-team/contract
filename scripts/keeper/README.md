@@ -3,14 +3,85 @@
 Long-running service that bridges the off-chain draft markets (Postgres) and the on-chain
 contract, and drives the optimistic-oracle resolution loops.
 
-Run: `npm run keeper:run -- preprod` (see `contract/contract-keeper-run.sh`).
+The production path is V2-only. Run `npm run keeper:run -- preprod` (the explicit alias
+`npm run keeper:v2:run -- preprod` is equivalent; see `contract-keeper-run.sh`). There
+is no V1 fallback and old V1 market rows are never submitted to the V2 lifecycle loops.
+
+Run `npm run keeper:v2:preflight -- preprod` first for a read-only Registry/address/
+ledger check. It does not open a wallet, submit a transaction, or write Postgres.
+
+At startup the V2 keeper resolves native NIGHT from the on-chain Registry (address from
+`DAREU_REGISTRY_ADDRESS` or `deployments/<network>-registry.json`) and validates that:
+
+- the asset exists and is enabled;
+- its market address and sNIGHT color match `deployments/<network>-v2.json`;
+- its decimals are read from the Registry rather than assumed.
+
+Set `DAREU_KEEPER_ASSET_UNDERLYING_HEX` to run a keeper for a non-NIGHT instance.
+All-zero/unset selects native NIGHT.
 
 ---
 
+## V2-only Keeper update (2026-07-11)
+
+### Wallet and sNIGHT bond fix
+
+The Keeper now starts and synchronizes all wallet services:
+
+- shielded (sNIGHT and position/bond coins);
+- unshielded;
+- DUST;
+- pending transactions.
+
+Waiting only for DUST is insufficient for V2. It can make a successful `deposit`
+transaction appear to have minted no sNIGHT and eventually fail with:
+
+```text
+Deposit submitted but the minted sNIGHT bond coin did not appear ... within 600000ms
+```
+
+`connectKeeperV2` therefore waits for the complete wallet state before selecting an
+sNIGHT bond coin. The wallet cache remains in `.wallet-cache/<network>.json`, so later
+runs resume incrementally. A successful deposit must not be repeated merely because an
+older run timed out; run the read-only wallet diagnostic first:
+
+```bash
+npm run keeper:v2:wallet -- preprod
+```
+
+It prints the resolved Registry asset, sNIGHT color, available matching coins, values,
+and nonces without submitting a transaction.
+
+### V1/V2 database isolation
+
+Every on-chain market mirror is now namespaced by:
+
+- `markets.onchain_contract_version` — currently `v2`;
+- `markets.onchain_contract_address` — the exact Registry-resolved V2 instance.
+
+The schema files add both nullable columns. Keeper also applies
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for an existing database. The database role
+must therefore have permission to add these columns during the first upgraded run (or
+the migration must be applied beforehand).
+
+Publish may republish still-future legacy/draft rows into the current V2 instance and
+then stamps both namespace fields. Propose, finalize, requested-cancel, and stuck-cancel
+select only rows matching both `v2` and the current contract address. This prevents old
+V1 rows from producing repeated `Market does not exist` failures after a V2 redeploy.
+
+Read-only namespace report:
+
+```bash
+npm run keeper:v2:db -- preprod
+```
+
+The report separates legacy rows, rows belonging to the current V2 instance, future
+rows eligible for V2 publication, and current V2 cancel requests.
+
 ## Cycle
 
-`run.ts` executes one **full cycle every `KEEPER_CYCLE_SEC` (default 300s = 5min)**, in
-order:
+`run-v2.ts` executes one **full cycle every `KEEPER_CYCLE_SEC` (default 300s = 5min)**,
+in order:
 
 ```
 sync → publishDrafts → autoPropose → finalize → cancelRequested → cancelStuck → sleep
@@ -20,14 +91,14 @@ The 300s is the pause **after** a cycle finishes, not a timeout — a cycle runs
 completion (a large publish batch can take much longer than 5 min).
 
 ### Loops
-- **`sync.ts`** — mirrors on-chain status / pools (`onchain_status`,
+- **`sync-v2.ts`** — mirrors on-chain status / pools (`onchain_status`,
   `onchain_yes_pool/no_pool`, `onchain_outcome`) back into Postgres. Runs first so the
-  other loops see fresh state.
-- **`publish.ts`** — reads markets the dataprovider drafted (`status IN ('draft','open')`,
-  `onchain_tx_id IS NULL`, params non-null, `close_time > now()`, oracle not all-zero,
-  ordered `close_time ASC`), calls `create_market` on-chain, then flips them to
-  `status='open'` + sets `onchain_tx_id`. This is what the webapp gates the live feed on.
-- **`autopropose.ts`** — `ready_to_propose → propose_resolution`; `proposed →
+  other loops see fresh state and stamps the current V2 namespace.
+- **`publish-v2.ts`** — reads future draft/open rows not yet owned by the current V2
+  instance, validates their immutable parameters, calls `create_market`, then sets
+  `status='open'`, `onchain_tx_id`, version, address, and initial mirror values. This is
+  what the Webapp gates the live feed on.
+- **`autopropose-v2.ts`** — `ready_to_propose → propose_resolution`; `proposed →
   finalize_proposal` after the challenge window; `cancel_requested → cancel_market`;
   stuck `proposed/disputed → cancel_market`.
 
@@ -51,8 +122,19 @@ completion (a large publish batch can take much longer than 5 min).
 ### Operational rules
 - **Run only ONE keeper instance.** All loops share one wallet; two instances collide on
   the wallet nonce.
-- The publish/refund/claim flows pass **`UserAddress` structs** on-chain — see the
-  contract README.
+- Use Compact **0.31.1** artifacts and proof-server **8.1.0**. `MIDNIGHT_PROOF_SERVER`
+  must point at the 8.1.0 server used by this Keeper.
+- V2 proposal/dispute bonds are shielded sNIGHT coins; user payout/refund claims are
+  ticket-gated browser transactions and are not submitted by Keeper.
 - Wallet sync uses `.wallet-cache/<network>.json`; keep it (a full resync is expensive).
 - `DATABASE_URL` may stay on the session-mode pooler (`:5432`) — a single long-lived
   process uses few connections. See `../../../database/README.md`.
+
+### Preprod verification from this cutover
+
+- The previously deposited `1,000,000` sNIGHT bond coin was recovered after shielded
+  sync; no second deposit was needed.
+- The legacy dataset remained intact while its rows were excluded from V2 cancellation.
+- The V2 cancel-request report returned zero before restart.
+- The restarted Keeper completed full shielded sync and began publishing V2 markets
+  consecutively without the earlier bond-timeout or `Market does not exist` storm.

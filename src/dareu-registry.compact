@@ -1,0 +1,172 @@
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// =============================================================================
+// DareU Asset Registry — standalone contract (its OWN deployment / address)
+// =============================================================================
+//
+// PURPOSE
+//   DareU v2 runs one market-contract instance PER underlying asset (NIGHT, USDT,
+//   USDC, BTC, ETH — a separate dareu-v2 deployment each, because Compact has no
+//   cross-contract calls and shielded-mint authority is per-contract). This
+//   registry is the single on-chain source of truth mapping each asset to its
+//   deployed market instance. Frontends / keeper / indexer / monitoring read ONE
+//   registry address and discover every instance — no hardcoded per-asset
+//   addresses.
+//
+//   It is READ OFF-CHAIN via the indexer, NOT called by other contracts
+//   (cross-contract calls do not exist). So it is a plain owner-maintained map:
+//   tamper-evident (owner-gated writes) and permissionlessly discoverable
+//   (all state is public on-chain).
+//
+// AUTH — reuses the proven dareu-v2 pattern (SAME domain tag "dareu:participant:")
+//   so the same owner key controls both contracts if the deployer chooses to reuse
+//   it. Owner is the participant_id (a SHA-256 hash) of an owner secret key; only a
+//   caller whose local_secret_key() hashes to `owner` may mutate the registry.
+//
+// KEY CHOICE — the map is keyed by `underlying_color` (see the `assets` ledger
+//   declaration below for the full rationale).
+// =============================================================================
+
+// ---- Registry record: everything the off-chain readers need per asset ----
+export struct AssetInfo {
+  symbol: Bytes<32>, // short display symbol, ascii zero-padded (e.g. pad(32,"USDT")); display-only
+  underlying_color: Bytes<32>, // unshielded wrapped-token color the market's Vault accepts (nativeToken()=zeros for NIGHT)
+  market_address: Bytes<32>, // the deployed DareU-v2 market instance address for this asset
+  snight_color: Bytes<32>, // the wrapped shielded color = tokenType(domain, market_address)
+  decimals: Uint<64>, // wrapped-token decimals (6 for USDT/USDC, 8 for BTC, e.g. 8 for reduced-precision ETH — records ACTUAL deployed precision, since the Uint<64> amount ceiling forces 18-dec ETH to be bridged at reduced precision).
+                      // TYPE NOTE: widened from Uint<8> to Uint<64> to avoid the Compact 0.31.0 ZKIR Uint-downcast rework, which the proof-server 8.0.3 /check deserializer rejects ("bad input"). Value range (0-18) is unaffected. Revert to Uint<8> once a proof-server release parses the 0.31 ZKIR.
+  enabled: Boolean, // platform pause flag; disable an asset without deleting its record
+}
+
+// The registry map. KEY = underlying_color.
+//
+//   WHY underlying_color rather than a separate asset-id hash:
+//     * Uniqueness — each dareu-v2 market wraps exactly ONE underlying color, so
+//       the color is a natural unique id for the asset it represents.
+//     * Derivability — off-chain readers already know an asset's underlying color
+//       (it is nativeToken() for NIGHT, or the bridged unshielded color otherwise);
+//       they can look up the record directly with no id-derivation step and no
+//       separate id->color lookup table.
+//     * Simplicity — one fewer hash/derivation to keep consistent between the
+//       contract, the indexer, and the frontend.
+//   A separate persistentHash("dareu:asset:", symbol) id would add indirection and
+//   a symbol-uniqueness assumption without buying anything the color does not.
+//
+//   NIGHT's underlying_color is the all-zero nativeToken() color. That is a
+//   LEGITIMATE key here — unlike the "revoked operator" / "empty participant"
+//   sentinels in dareu-v2, this map assigns NO special meaning to the zero value.
+//   Presence is tested explicitly with `.member(key)` (see register_asset), so a
+//   record inserted under the zero key is truthfully reported present, and the
+//   `first insert -> increment` logic below is correct for it.
+export ledger assets: Map<Bytes<32>, AssetInfo>;
+
+// Total number of DISTINCT assets ever registered (increments only on first insert
+// of a given underlying_color; never on an update). Lets readers page/enumerate.
+export ledger asset_count: Counter;
+
+// ---- Platform owner (COLD key). sealed: set once in the constructor, immutable. ----
+// Stored as the participant_id (hash) of the owner secret key — the raw key is never
+// disclosed. Same derivation and domain tag as dareu-v2's `owner`.
+export sealed ledger owner: Bytes<32>;
+
+// ---- Off-chain data provider: the caller's private admin key (never disclosed) ----
+witness local_secret_key(): Bytes<32>;
+
+// -----------------------------------------------------------------------------
+// Identity helpers (participant_id pattern, identical to dareu-v2)
+// -----------------------------------------------------------------------------
+
+// participant_id = persistentHash(["dareu:participant:" padded to 32 bytes, sk]).
+// pure + exported: hashes only its argument, no ledger/witness access, so it is
+// safely exportable via pureCircuits for off-chain recomputation. SAME domain tag
+// as dareu-v2 so one owner key can govern both contracts.
+export pure circuit participant_id(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "dareu:participant:"), sk]);
+}
+
+// The calling prover's own participant_id, derived from their local secret key.
+circuit current_participant(): Bytes<32> {
+  return participant_id(local_secret_key());
+}
+
+// Aborts unless the caller's private key hashes to `owner`. Returns nothing —
+// callers only need the assert. Mirrors dareu-v2's require_owner.
+circuit require_owner(): [] {
+  const caller = disclose(current_participant());
+  assert(owner == caller, "Only owner can call this circuit");
+}
+
+// -----------------------------------------------------------------------------
+// Constructor — set the owner and nothing else. Assets are registered later, as
+// each dareu-v2 market instance is deployed.
+// -----------------------------------------------------------------------------
+constructor(owner_secret_key: Bytes<32>) {
+  // participant_id of a witness-derived key is a private value; disclosing its HASH
+  // (not the key) is required to store it in the public `owner` ledger field.
+  owner = disclose(participant_id(owner_secret_key));
+}
+
+// -----------------------------------------------------------------------------
+// register_asset — owner-only insert-or-update of an AssetInfo at key=underlying_color.
+//   Increments asset_count ONLY on first insert (membership check). On re-register
+//   of an existing color it overwrites the record and leaves the count unchanged.
+//   DISCLOSURE NOTE: the params are public inputs, but require_owner() first reads
+//   local_secret_key() (a witness), so the compiler's taint analysis treats every
+//   subsequent ledger write on this control path as a potential witness disclosure.
+//   Each stored field is therefore wrapped in disclose() — this publishes only the
+//   already-public registry data, never the owner key. (The zero-value they'd leak
+//   is the boolean "this circuit ran, so the caller is the owner", which is public.)
+// -----------------------------------------------------------------------------
+export circuit register_asset(
+                 symbol: Bytes<32>,
+                 underlying_color: Bytes<32>,
+                 market_address: Bytes<32>,
+                 snight_color: Bytes<32>,
+                 decimals: Uint<64>,
+                 enabled: Boolean
+                 ): [] {
+  require_owner();
+
+  const key = disclose(underlying_color);
+  const is_new = !assets.member(key);
+
+  assets.insert(
+    key,
+    AssetInfo { symbol: disclose(symbol),
+                underlying_color: key,
+                market_address: disclose(market_address),
+                snight_color: disclose(snight_color),
+                decimals: disclose(decimals),
+                enabled: disclose(enabled) }
+    );
+
+  if (is_new) {
+    asset_count.increment(1);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// set_asset_enabled — owner-only. Flip ONLY the enabled flag on an existing record,
+//   preserving every other field. Lets the platform pause/unpause an asset without
+//   deleting or re-supplying its full record. disclose() on key/enabled is required
+//   for the same reason as register_asset (owner-key witness taint on this path).
+// -----------------------------------------------------------------------------
+export circuit set_asset_enabled(underlying_color: Bytes<32>, enabled: Boolean): [] {
+  require_owner();
+
+  const key = disclose(underlying_color);
+  assert(assets.member(key), "Asset does not exist");
+
+  const current = assets.lookup(key);
+  assets.insert(
+    key,
+    AssetInfo { symbol: current.symbol,
+                underlying_color: current.underlying_color,
+                market_address: current.market_address,
+                snight_color: current.snight_color,
+                decimals: current.decimals,
+                enabled: disclose(enabled) }
+    );
+}
