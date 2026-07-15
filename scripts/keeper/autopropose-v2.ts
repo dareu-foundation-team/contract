@@ -15,7 +15,6 @@
 import { Outcome } from '../../src/managed/dareu-v2/contract/index.js'
 import {
   loadEnvFiles,
-  optionalEnv,
   parseHexBytes,
   pgExec,
   pgTx,
@@ -31,6 +30,14 @@ import {
   resolveDeploymentV2,
   type KeeperV2Context,
 } from '../shared/chain-v2.js'
+import {
+  abortBatchIfContextBroken,
+  errorMessage,
+  keeperBatchLimit,
+  keeperTimeoutMs,
+  stopWalletSafely,
+  withKeeperTransactionTimeout,
+} from './reliability.js'
 
 // The contract accepts an anchor less than one hour ahead of the applying block.
 // Fifteen minutes leaves room for proof generation / submission without letting a
@@ -43,7 +50,7 @@ const PROPOSAL_DEADLINE_BUFFER_SEC = 15n * 60n
 // sync three places (markets.status, onchain_status, upsert resolutions).
 export async function autoProposeResolutionsV2(network: ReturnType<typeof resolveNetwork>) {
   const dbUrl = requiredEnv('DATABASE_URL')
-  const limit = Number(optionalEnv('RESOLVE_LIMIT') ?? 20)
+  const limit = keeperBatchLimit('RESOLVE_LIMIT')
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
 
@@ -92,7 +99,11 @@ export async function autoProposeResolutionsV2(network: ReturnType<typeof resolv
         const outcome = row.outcome === 'yes' ? Outcome.YES : Outcome.NO
 
         // Bond first: if we can't fund it, fail THIS market before any tx.
-        const bondCoin = await ensureSnightBondCoin(ctx, bond, usedNonces)
+        const bondCoin = await withKeeperTransactionTimeout(
+          `prepare sNIGHT bond ${row.id.slice(0, 12)}`,
+          () => ensureSnightBondCoin(ctx, bond, usedNonces),
+          keeperTimeoutMs('KEEPER_BOND_PREP_TIMEOUT_MS', 15 * 60 * 1000),
+        )
 
         // Bond preparation may itself submit/sync wallet transactions.  Computing
         // this before ensureSnightBondCoin can consume most or all of the challenge
@@ -102,12 +113,15 @@ export async function autoProposeResolutionsV2(network: ReturnType<typeof resolv
         const deadline = proposalNowSec + challengeSec + PROPOSAL_DEADLINE_BUFFER_SEC
 
         // keeper does NOT recompute outcome — trusts markets.outcome from runResolve.
-        await ctx.deployed.callTx.propose_resolution(
-          parseHexBytes(row.id, 32, 'market_id'),
-          outcome,
-          deadline,
-          bondCoin,
-          refundPk,
+        await withKeeperTransactionTimeout(
+          `propose_resolution ${row.id.slice(0, 12)}`,
+          () => ctx.deployed.callTx.propose_resolution(
+            parseHexBytes(row.id, 32, 'market_id'),
+            outcome,
+            deadline,
+            bondCoin,
+            refundPk,
+          ),
         )
 
         const deadlineIso = new Date(Number(deadline) * 1000).toISOString()
@@ -133,11 +147,12 @@ export async function autoProposeResolutionsV2(network: ReturnType<typeof resolv
         })
         console.log(`  ✓ ${row.id.slice(0, 12)}… proposed ${row.outcome.toUpperCase()} (deadline ${deadlineIso})`)
       } catch (err) {
-        console.error(`  ✗ ${row.id.slice(0, 12)}… propose failed: ${err instanceof Error ? err.message : err}`)
+        console.error(`  ✗ ${row.id.slice(0, 12)}… propose failed: ${errorMessage(err)}`)
+        abortBatchIfContextBroken(`propose-v2 ${row.id.slice(0, 12)}`, err)
       }
     }
   } finally {
-    await ctx.walletCtx.wallet.stop()
+    await stopWalletSafely(ctx.walletCtx.wallet, 'propose-v2')
   }
 }
 
@@ -147,7 +162,7 @@ export async function autoProposeResolutionsV2(network: ReturnType<typeof resolv
 // markets/resolutions='resolved' + onchain_status.
 export async function finalizeProposalsV2(network: ReturnType<typeof resolveNetwork>) {
   const dbUrl = requiredEnv('DATABASE_URL')
-  const limit = Number(optionalEnv('FINALIZE_LIMIT') ?? 20)
+  const limit = keeperBatchLimit('FINALIZE_LIMIT')
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
 
@@ -178,7 +193,10 @@ export async function finalizeProposalsV2(network: ReturnType<typeof resolveNetw
   try {
     for (const row of rows as Array<{ id: string }>) {
       try {
-        await deployed.callTx.finalize_proposal(parseHexBytes(row.id, 32, 'market_id'))
+        await withKeeperTransactionTimeout(
+          `finalize_proposal ${row.id.slice(0, 12)}`,
+          () => deployed.callTx.finalize_proposal(parseHexBytes(row.id, 32, 'market_id')),
+        )
         await pgTx(dbUrl, async (c) => {
           await c.query(
             `UPDATE markets SET status='resolved', onchain_status='resolved', updated_at=now()
@@ -193,11 +211,12 @@ export async function finalizeProposalsV2(network: ReturnType<typeof resolveNetw
         })
         console.log(`  ✓ ${row.id.slice(0, 12)}… finalized → resolved`)
       } catch (err) {
-        console.error(`  ✗ ${row.id.slice(0, 12)}… finalize failed: ${err instanceof Error ? err.message : err}`)
+        console.error(`  ✗ ${row.id.slice(0, 12)}… finalize failed: ${errorMessage(err)}`)
+        abortBatchIfContextBroken(`finalize-v2 ${row.id.slice(0, 12)}`, err)
       }
     }
   } finally {
-    await walletCtx.wallet.stop()
+    await stopWalletSafely(walletCtx.wallet, 'finalize-v2')
   }
 }
 
@@ -206,7 +225,7 @@ export async function finalizeProposalsV2(network: ReturnType<typeof resolveNetw
 // authorized for OPEN cancels) → cancelled.
 export async function cancelRequestedV2(network: ReturnType<typeof resolveNetwork>) {
   const dbUrl = requiredEnv('DATABASE_URL')
-  const limit = Number(optionalEnv('CANCEL_LIMIT') ?? 20)
+  const limit = keeperBatchLimit('CANCEL_LIMIT')
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
 
@@ -234,7 +253,10 @@ export async function cancelRequestedV2(network: ReturnType<typeof resolveNetwor
   try {
     for (const row of rows as Array<{ id: string }>) {
       try {
-        await deployed.callTx.cancel_market(parseHexBytes(row.id, 32, 'market_id'))
+        await withKeeperTransactionTimeout(
+          `cancel_market ${row.id.slice(0, 12)}`,
+          () => deployed.callTx.cancel_market(parseHexBytes(row.id, 32, 'market_id')),
+        )
         await pgExec(
           dbUrl,
           `UPDATE markets SET status='cancelled', onchain_status='cancelled', updated_at=now()
@@ -243,11 +265,12 @@ export async function cancelRequestedV2(network: ReturnType<typeof resolveNetwor
         )
         console.log(`  ✓ ${row.id.slice(0, 12)}… cancelled`)
       } catch (err) {
-        console.error(`  ✗ ${row.id.slice(0, 12)}… cancel failed: ${err instanceof Error ? err.message : err}`)
+        console.error(`  ✗ ${row.id.slice(0, 12)}… cancel failed: ${errorMessage(err)}`)
+        abortBatchIfContextBroken(`cancel-v2 ${row.id.slice(0, 12)}`, err)
       }
     }
   } finally {
-    await walletCtx.wallet.stop()
+    await stopWalletSafely(walletCtx.wallet, 'cancel-v2')
   }
 }
 
@@ -257,7 +280,7 @@ export async function cancelRequestedV2(network: ReturnType<typeof resolveNetwor
 // re-mints the proposer's (and any disputer's) bond back to their refund pks.
 export async function cancelStuckV2(network: ReturnType<typeof resolveNetwork>) {
   const dbUrl = requiredEnv('DATABASE_URL')
-  const limit = Number(optionalEnv('STUCK_CANCEL_LIMIT') ?? 20)
+  const limit = keeperBatchLimit('STUCK_CANCEL_LIMIT')
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
 
@@ -289,7 +312,10 @@ export async function cancelStuckV2(network: ReturnType<typeof resolveNetwork>) 
   try {
     for (const row of rows as Array<{ id: string }>) {
       try {
-        await deployed.callTx.cancel_market(parseHexBytes(row.id, 32, 'market_id'))
+        await withKeeperTransactionTimeout(
+          `stuck cancel_market ${row.id.slice(0, 12)}`,
+          () => deployed.callTx.cancel_market(parseHexBytes(row.id, 32, 'market_id')),
+        )
         await pgTx(dbUrl, async (c) => {
           await c.query(
             `UPDATE markets SET status='cancelled', onchain_status='cancelled', updated_at=now()
@@ -304,11 +330,12 @@ export async function cancelStuckV2(network: ReturnType<typeof resolveNetwork>) 
         })
         console.log(`  ✓ ${row.id.slice(0, 12)}… stuck → cancelled`)
       } catch (err) {
-        console.error(`  ✗ ${row.id.slice(0, 12)}… stuck-cancel failed: ${err instanceof Error ? err.message : err}`)
+        console.error(`  ✗ ${row.id.slice(0, 12)}… stuck-cancel failed: ${errorMessage(err)}`)
+        abortBatchIfContextBroken(`stuck-cancel-v2 ${row.id.slice(0, 12)}`, err)
       }
     }
   } finally {
-    await walletCtx.wallet.stop()
+    await stopWalletSafely(walletCtx.wallet, 'stuck-cancel-v2')
   }
 }
 

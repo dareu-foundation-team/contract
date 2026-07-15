@@ -36,8 +36,8 @@ function twoSidedClosed() {
   const sim = DareuV2Sim.deploy({ ownerKey });
   const m = bytes32('m1');
   sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW, { challengeWindow: CHALLENGE });
-  sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.snightCoin(100n, 'a'), zswapPk('alice'), bytes32('pn-a'), NOW);
-  sim.placeBet(bobKey, m, Outcome.NO, 100n, sim.snightCoin(100n, 'b'), zswapPk('bob'), bytes32('pn-b'), NOW);
+  sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.betCoin(m, 100n, 'a'), zswapPk('alice'), bytes32('pn-a'), NOW);
+  sim.placeBet(bobKey, m, Outcome.NO, 100n, sim.betCoin(m, 100n, 'b'), zswapPk('bob'), bytes32('pn-b'), NOW);
   return { sim, m };
 }
 
@@ -295,7 +295,7 @@ test('settle guard: "no winners" market cannot be RESOLVED via finalize', () => 
   const sim = DareuV2Sim.deploy({ ownerKey });
   const m = bytes32('m-nowin');
   sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW, { challengeWindow: CHALLENGE });
-  sim.placeBet(bobKey, m, Outcome.NO, 100n, sim.snightCoin(100n, 'b'), zswapPk('bob'), bytes32('pn-b'), NOW);
+  sim.placeBet(bobKey, m, Outcome.NO, 100n, sim.betCoin(m, 100n, 'b'), zswapPk('bob'), bytes32('pn-b'), NOW);
   const deadline = BigInt(AFTER_CLOSE) + CHALLENGE;
   sim.proposeResolution(proposerKey, m, Outcome.YES, deadline, sim.snightCoin(BOND, 'p'), zswapPk('proposer'), AFTER_CLOSE);
   expectRevert(

@@ -20,6 +20,14 @@ At startup the V2 keeper resolves native NIGHT from the on-chain Registry (addre
 Set `DAREU_KEEPER_ASSET_UNDERLYING_HEX` to run a keeper for a non-NIGHT instance.
 All-zero/unset selects native NIGHT.
 
+### Stake-fee model (2026-07-13)
+
+Keeper still publishes each immutable `platform_fee_rate` (normally 100 bps). The V2
+contract now interprets it as a fee on every accepted stake, escrowed until resolution
+and refunded on cancellation. Keeper does not collect or refund user fees itself.
+Because the user-circuit ABI changed, deploy/register the new V2 artifact before running
+Keeper against markets intended for this model; the current preprod address is older.
+
 ---
 
 ## V2-only Keeper update (2026-07-11)
@@ -78,6 +86,45 @@ npm run keeper:v2:db -- preprod
 The report separates legacy rows, rows belonging to the current V2 instance, future
 rows eligible for V2 publication, and current V2 cancel requests.
 
+### Connection recovery and process supervision
+
+Every V2 `callTx` now has a bounded `KEEPER_TX_TIMEOUT_MS`. A rejected transport error
+(`ECONNRESET`, wallet/indexer websocket failure, or node custom error 170) aborts the
+current batch immediately, closes the wallet, and retries the full cycle after
+`KEEPER_ERROR_RETRY_SEC`. It does not continue submitting the remaining rows with a
+stale DUST/UTXO view.
+
+A timed-out SDK Promise cannot be cancelled safely inside the same Node process. The
+Keeper therefore exits on that specific condition, and `keeper:service` starts a clean
+process after `KEEPER_RESTART_DELAY_SEC`. This prevents a timed-out submission from
+overlapping a replacement wallet in the same process.
+
+Publishing uses two different limits:
+
+- `PUBLISH_LIMIT=500` — total markets selected for one cycle, so a large backlog is
+  drained continuously without a five-minute sleep every 20 transactions;
+- `PUBLISH_SESSION_SIZE=20` — transactions handled by one wallet/WebSocket context.
+  After each group the Keeper saves wallet state, closes all wallet services, reconnects,
+  performs a short incremental sync, and immediately continues the same 500-market sweep.
+
+`KEEPER_MAX_PUBLISH_LIMIT` caps total cycle work (default 1000), while
+`KEEPER_MAX_BATCH_SIZE` caps a single wallet session and the lifecycle loops (default
+50). `PUBLISH_MIN_LEAD_SEC` also excludes markets that are too close to
+`close_time - betting_cutoff`; the lead is checked again immediately before proving.
+
+Run the standalone supervisor directly; `contract-keeper-run.sh` is a personal manual
+command notebook and is not the service controller:
+
+```bash
+nohup bash scripts/keeper/supervise-v2.sh preprod >> logs/keeper.log 2>&1 &
+echo $! > logs/keeper-supervisor.pid
+tail -f logs/keeper.log
+```
+
+Run `npm run keeper:v2:preflight -- preprod` before starting and verify with
+`pgrep -fl "scripts/keeper/run-v2.ts preprod"` that no previous instance exists. The
+supervisor restarts only after the previous Node process exits.
+
 ## Cycle
 
 `run-v2.ts` executes one **full cycle every `KEEPER_CYCLE_SEC` (default 300s = 5min)**,
@@ -107,11 +154,11 @@ completion (a large publish batch can take much longer than 5 min).
 ## Upgrade Notes (odds-v2)
 
 - **`PUBLISH_LIMIT` sweep.** Each `create_market` is a separate on-chain transaction with
-  its own ZK proof, submitted sequentially by a single wallet. `PUBLISH_LIMIT` (default
-  20) caps how many are published per cycle. **DUST cost is per-transaction**, so
-  publishing 500 at once costs the same total as dribbling 20/cycle — set
-  `PUBLISH_LIMIT` high (e.g. **500**) to sweep the entire backlog each cycle. The first
-  cycle drains the backlog; steady-state cycles only carry the hour's new drafts.
+  its own ZK proof. `PUBLISH_LIMIT=500` keeps the backlog sweep continuous, but those
+  rows are split into `PUBLISH_SESSION_SIZE=20` wallet sessions. This preserves the
+  throughput benefit of a large cycle without keeping one wallet websocket alive for
+  hundreds of proofs. **DUST cost remains per transaction**; session rotation changes
+  connection lifetime, not proof count or fees.
 - **Throughput reality.** Publishing is proof-bound: the local proof server
   (`MIDNIGHT_PROOF_SERVER`, default `127.0.0.1:6300`) generates one zk-SNARK per market,
   sequentially. Observed ≈ 10–20 markets/cycle. To scale: faster/remote proof server, or

@@ -49,8 +49,8 @@ function resolvedTwoSided(opts?: {
   });
   const aliceNonce = bytes32('pn-alice');
   const bobNonce = bytes32('pn-bob');
-  const alicePos = sim.placeBet(aliceKey, m, Outcome.YES, yesAmount, sim.snightCoin(yesAmount, 'a'), zswapPk('alice'), aliceNonce, NOW);
-  const bobPos = sim.placeBet(bobKey, m, Outcome.NO, noAmount, sim.snightCoin(noAmount, 'b'), zswapPk('bob'), bobNonce, NOW);
+  const alicePos = sim.placeBet(aliceKey, m, Outcome.YES, yesAmount, sim.betCoin(m, yesAmount, 'a'), zswapPk('alice'), aliceNonce, NOW);
+  const bobPos = sim.placeBet(bobKey, m, Outcome.NO, noAmount, sim.betCoin(m, noAmount, 'b'), zswapPk('bob'), bobNonce, NOW);
 
   // Resolve via optimistic oracle: propose `outcome`, finalize after deadline.
   const deadline = BigInt(AFTER_CLOSE) + CHALLENGE;
@@ -98,7 +98,7 @@ test('claim gate2: wrong payout_pk pre-image rejected', () => {
 
 // ---- Happy path + double-claim ----------------------------------------------------
 
-test('claim happy path: correct ticket+pk pays exactly amount+gross-fee to the committed pk; fee accrues', () => {
+test('claim happy path: correct ticket+pk pays stake+gross; all stake fees already accrued at bet time', () => {
   const { sim, m, alicePos, yesAmount, noAmount, platformBps } = resolvedTwoSided();
   const b = payoutBreakdown({ amount: yesAmount, winners: yesAmount, losers: noAmount, platformBps });
   sim.claimSettled(aliceKey, alicePos, zswapPk('alice'), sim.ticketFor(alicePos), b.grossProfit, b.platformFee, NOW);
@@ -107,9 +107,13 @@ test('claim happy path: correct ticket+pk pays exactly amount+gross-fee to the c
   // which is a receive+spend, not a mint). The only mint this call is the payout.
   const mints = [...sim.lastEffects.shieldedMints.values()];
   assert.ok(mints.includes(b.payout), `payout mint ${b.payout} present in ${mints}`);
-  // Position marked claimed; fee accrued to this market's bucket.
+  // Position marked claimed; both bettors' up-front fees remain in escrow and
+  // become earned platform revenue when the market resolves.
   assert.equal(sim.ledger.positions.lookup(alicePos).claimed, true);
-  assert.equal(sim.ledger.market_fees.lookup(m), b.platformFee);
+  assert.equal(
+    sim.ledger.market_fees.lookup(m),
+    sim.stakeFee(m, yesAmount) + sim.stakeFee(m, noAmount),
+  );
 });
 
 test('claim double-claim: second claim on the same position rejected (claimed flag)', () => {
@@ -124,10 +128,10 @@ test('claim double-claim: second claim on the same position rejected (claimed fl
 });
 
 test('claim losing side: the loser (bob/NO on a YES-resolved market) cannot claim', () => {
-  const { sim, m, bobPos } = resolvedTwoSided({ outcome: Outcome.YES });
+  const { sim, m, bobPos, noAmount } = resolvedTwoSided({ outcome: Outcome.YES });
   // Bob backed NO; even with a valid ticket+pk his side lost.
   expectRevert(
-    () => sim.claimSettled(bobKey, bobPos, zswapPk('bob'), sim.ticketFor(bobPos), 0n, 0n, NOW),
+    () => sim.claimSettled(bobKey, bobPos, zswapPk('bob'), sim.ticketFor(bobPos), 0n, sim.stakeFee(m, noAmount), NOW),
     'Position is not a winner',
   );
 });
@@ -136,7 +140,7 @@ test('claim unresolved market: claim before settlement rejected', () => {
   const sim = DareuV2Sim.deploy({ ownerKey });
   const m = bytes32('m-open');
   sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW);
-  const pos = sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.snightCoin(100n, 'a'), zswapPk('alice'), bytes32('pn'), NOW);
+  const pos = sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.betCoin(m, 100n, 'a'), zswapPk('alice'), bytes32('pn'), NOW);
   // Market is still OPEN — neither RESOLVED nor CANCELLED.
   expectRevert(
     () => sim.claimSettled(aliceKey, pos, zswapPk('alice'), sim.ticketFor(pos), 0n, 0n, NOW),
@@ -146,26 +150,28 @@ test('claim unresolved market: claim before settlement rejected', () => {
 
 // ---- CANCELLED branch -------------------------------------------------------------
 
-test('claim CANCELLED branch: refunds exact stake; nonzero gross/fee rejected', () => {
+test('claim CANCELLED branch: refunds exact stake plus the up-front fee', () => {
   const sim = DareuV2Sim.deploy({ ownerKey });
   const m = bytes32('m-cancel');
   sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW);
-  const pos = sim.placeBet(aliceKey, m, Outcome.YES, 250n, sim.snightCoin(250n, 'a'), zswapPk('alice'), bytes32('pn'), NOW);
+  const pos = sim.placeBet(aliceKey, m, Outcome.YES, 250n, sim.betCoin(m, 250n, 'a'), zswapPk('alice'), bytes32('pn'), NOW);
+  const stakeFee = sim.stakeFee(m, 250n);
   sim.cancelMarket(ownerKey, m, NOW); // OPEN -> CANCELLED (owner)
 
   // Nonzero gross_profit rejected on a cancelled market.
   expectRevert(
-    () => sim.claimSettled(aliceKey, pos, zswapPk('alice'), sim.ticketFor(pos), 1n, 0n, NOW),
+    () => sim.claimSettled(aliceKey, pos, zswapPk('alice'), sim.ticketFor(pos), 1n, stakeFee, NOW),
     'No profit on a cancelled market',
   );
-  // Nonzero fee rejected.
+  // An incorrect refund fee is rejected by the same floor bracket used at bet time.
   expectRevert(
-    () => sim.claimSettled(aliceKey, pos, zswapPk('alice'), sim.ticketFor(pos, 'x'), 0n, 1n, NOW),
-    'No fee on a cancelled market',
+    () => sim.claimSettled(aliceKey, pos, zswapPk('alice'), sim.ticketFor(pos, 'x'), 0n, stakeFee + 1n, NOW),
+    'Stake fee is too high',
   );
-  // Exact-stake refund succeeds and mints exactly 250.
-  sim.claimSettled(aliceKey, pos, zswapPk('alice'), sim.ticketFor(pos, 'ok'), 0n, 0n, NOW);
-  assert.ok([...sim.lastEffects.shieldedMints.values()].includes(250n), 'refund mint == stake');
+  // Cancellation returns the exact original total payment and clears fee escrow.
+  sim.claimSettled(aliceKey, pos, zswapPk('alice'), sim.ticketFor(pos, 'ok'), 0n, stakeFee, NOW);
+  assert.ok([...sim.lastEffects.shieldedMints.values()].includes(250n + stakeFee), 'refund mint == stake + fee');
+  assert.equal(sim.ledger.market_fees.lookup(m), 0n);
   assert.equal(sim.ledger.positions.lookup(pos).claimed, true);
 });
 
@@ -195,19 +201,19 @@ test('floor-bracket: off-by-one low gross_profit rejected', () => {
   );
 });
 
-test('floor-bracket: platform_fee off-by-one high and low both rejected', () => {
-  // Choose amounts so platform_fee floor is non-trivial: gross=155, fee=floor(155*200/10000)=3.
+test('floor-bracket: stake_fee off-by-one high and low both rejected', () => {
+  // The fee is based on stake, not profit: floor(100*200/10000)=2.
   const { sim, alicePos, yesAmount, noAmount, platformBps } = resolvedTwoSided({ yesAmount: 100n, noAmount: 155n });
   const b = payoutBreakdown({ amount: yesAmount, winners: yesAmount, losers: noAmount, platformBps });
   assert.equal(b.grossProfit, 155n);
-  assert.equal(b.platformFee, 3n);
+  assert.equal(b.platformFee, 2n);
   expectRevert(
     () => sim.claimSettled(aliceKey, alicePos, zswapPk('alice'), sim.ticketFor(alicePos, 'fhi'), b.grossProfit, b.platformFee + 1n, NOW),
-    'Platform fee is too high',
+    'Stake fee is too high',
   );
   expectRevert(
     () => sim.claimSettled(aliceKey, alicePos, zswapPk('alice'), sim.ticketFor(alicePos, 'flo'), b.grossProfit, b.platformFee - 1n, NOW),
-    'Platform fee is too low',
+    'Stake fee is too low',
   );
 });
 
@@ -216,16 +222,15 @@ test('floor-bracket: one-sided market (no losers) yields zero profit', () => {
   const sim = DareuV2Sim.deploy({ ownerKey });
   const m = bytes32('m-oneside');
   sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW, { challengeWindow: CHALLENGE });
-  const pos = sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.snightCoin(100n, 'a'), zswapPk('alice'), bytes32('pn'), NOW);
+  const pos = sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.betCoin(m, 100n, 'a'), zswapPk('alice'), bytes32('pn'), NOW);
   const deadline = BigInt(AFTER_CLOSE) + CHALLENGE;
   sim.proposeResolution(proposerKey, m, Outcome.YES, deadline, sim.snightCoin(1_000_000n, 'bond'), zswapPk('proposer'), AFTER_CLOSE);
   sim.finalizeProposal(ownerKey, m, Number(deadline) + 1);
-  // gross_profit must be exactly 0; a nonzero value is rejected as "too high".
-  sim.claimSettled(aliceKey, pos, zswapPk('alice'), sim.ticketFor(pos), 0n, 0n, NOW);
-  // Payout == stake (100), no fee. The contract still writes a market_fees bucket
-  // for the resolved market, but its accrued value is 0 (and withdraw_treasury's
-  // amount>0 guard makes a 0 bucket unwithdrawable — see treasury.test.ts).
+  // gross_profit is 0 but the up-front stake fee remains earned after resolution.
+  const stakeFee = sim.stakeFee(m, 100n);
+  sim.claimSettled(aliceKey, pos, zswapPk('alice'), sim.ticketFor(pos), 0n, stakeFee, NOW);
+  // Payout == stake; the separate fee was already paid at place_bet.
   assert.ok([...sim.lastEffects.shieldedMints.values()].includes(100n));
   const feeBucket = sim.ledger.market_fees.member(m) ? sim.ledger.market_fees.lookup(m) : 0n;
-  assert.equal(feeBucket, 0n, 'zero fee accrued for a one-sided market');
+  assert.equal(feeBucket, stakeFee, 'stake fee remains earned for a resolved market');
 });

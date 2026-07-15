@@ -22,6 +22,11 @@ Current preprod addresses are recorded in `deployments/preprod-v2.json` and
 `deployments/preprod-registry.json`. Keeper V2 resolves NIGHT through the registry and
 refuses to start on a disabled asset or registry/deployment drift.
 
+> **Fee-model deployment note (2026-07-13):** the source and generated artifacts now
+> implement a 1% fee on every accepted stake, refundable with the stake when a market is
+> cancelled. This ABI change is tested locally but is **not yet deployed to preprod**;
+> the preprod address above still uses the previous V2 artifact.
+
 ## V2-only cutover (2026-07-11)
 
 Preprod now runs the Compact V2 contract exclusively. V1 remains documented only as
@@ -93,32 +98,33 @@ per-market economics with the design in [`../README-odds.md`](../README-odds.md)
   no AMM and no protocol counterparty.
 - **Real odds = pool ratio.** Odds/payout are derived purely from `yes_pool/no_pool`
   (50/50 when empty). Participant count / reputation never affect odds or payouts.
-- **Bettor identity is a ZK `participant_id`** = `persistentHash("dareu:participant:", sk)`,
-  where `sk` is the caller's secret supplied by the `local_secret_key()` witness. Only
-  the hash is ever disclosed; the same identity is required to `claim_winnings` /
-  `refund_cancelled_position` (see webapp identity notes).
+- **Bettor authorization is wallet-native** — `place_bet` spends an sNIGHT coin and
+  mints a value-1 claim ticket. `claim_settled` burns that ticket and proves the
+  committed payout-key preimage; no browser-derived participant identity is used.
 - **Per-market parameters** are set at `create_market` and enforced on-chain:
   `close_time`, `challenge_window`, `betting_cutoff`, `platform_fee_rate`.
 - **Betting cutoff** — `place_bet` reverts with `betting closed` once
   `blockTime >= close_time − betting_cutoff` (default 300s / 5min).
-- **Platform fee** — charged on **winnings only** (from the loser pool), never on the
-  stake. **Default 100 bps (1%).**
+- **Platform fee** — charged on **every accepted stake** at `place_bet`. The wallet pays
+  `stake + floor(stake × fee_bps / 10000)`; only the stake enters the parimutuel pool.
+  The fee is escrow until resolution, becomes withdrawable revenue only after
+  `RESOLVED`, and is refunded with the stake after `CANCELLED`. Default: 100 bps (1%).
 - **Single-sided / empty pools must be cancelled** — a market with money on only one
-  side (or none) cannot pay out, so it is `cancel_market`-ed and stakes become
-  refundable (`refund_cancelled_position`, pull payment). This is why unbet / one-sided
+  side (or none) cannot pay out, so it is `cancel_market`-ed and stake plus fee become
+  refundable (`claim_settled`, pull payment). This is why unbet / one-sided
   markets end up `cancelled` rather than `resolved`.
 
 ### Lifecycle
 ```
-create_market → place_bet (until close − betting_cutoff)
+create_market → place_bet(stake + fee; fee escrowed) (until close − betting_cutoff)
   → propose_resolution → [challenge window] → dispute_resolution / vote_dispute
-  → finalize_proposal ⟶ RESOLVED → claim_winnings (pull)
-  or cancel_market  ⟶ CANCELLED → refund_cancelled_position (pull)
+  → finalize_proposal ⟶ RESOLVED → claim_settled(stake + gross profit) (pull)
+  or cancel_market  ⟶ CANCELLED → claim_settled(stake + original fee) (pull)
 ```
 
 ### Addresses (important for clients)
-`claim_winnings`, `refund_cancelled_position`, and `withdraw_*` take a **`UserAddress`
-struct `{ bytes: Bytes<32> }`**, not a bech32m string. Clients must decode the wallet's
+`withdraw` and `withdraw_treasury` take a **`UserAddress` struct `{ bytes: Bytes<32> }`**,
+not a bech32m string. Clients must decode the wallet's
 `mn_addr_<network>1…` address into 32 bytes (see
 `webapp/src/lib/midnight/place-bet.ts` using `@midnight-ntwrk/wallet-sdk-address-format`).
 

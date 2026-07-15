@@ -55,7 +55,7 @@ class Book {
   underlyingIn = 0n; // Σ deposits
   underlyingOut = 0n; // Σ withdraw + treasury payouts
   snightMinted = 0n; // Σ sNIGHT minted to users (deposit, payout, bond refund)
-  snightBurned = 0n; // Σ sNIGHT burned back (withdraw, bet stake, bond post)
+  snightBurned = 0n; // Σ sNIGHT burned back (withdraw, bet stake+fee, bond post)
 
   get underlyingHeld() {
     return this.underlyingIn - this.underlyingOut;
@@ -134,14 +134,17 @@ test('§8 lifecycle solvency: resolve + cancel + dispute + lost-ticket branches'
   // ============ MARKET A: resolve YES; alice (winner) claims; bob loses ============
   const mA = bytes32('A');
   sim.createMarket(ownerKey, mA, participantId(oracleKey), CLOSE, NOW, { challengeWindow: CHALLENGE, platformBps });
-  const aPosAlice = sim.placeBet(bytes32('alice'), mA, Outcome.YES, 1_000n, sim.snightCoin(1_000n, 'A-alice'), zswapPk('alice'), bytes32('A-pa'), NOW);
-  book.betBurn(1_000n);
+  const aPosAlice = sim.placeBet(bytes32('alice'), mA, Outcome.YES, 1_000n, sim.betCoin(mA, 1_000n, 'A-alice'), zswapPk('alice'), bytes32('A-pa'), NOW);
+  const feeA = sim.stakeFee(mA, 1_000n);
+  book.betBurn(1_000n + feeA);
   unsettledPools += 1_000n;
+  unsweptFees += feeA;
   assertSolvent(book, { unsettledPools, postedBonds, unsweptFees }, 'A alice bet');
 
-  sim.placeBet(bytes32('bob'), mA, Outcome.NO, 1_000n, sim.snightCoin(1_000n, 'A-bob'), zswapPk('bob'), bytes32('A-pb'), NOW);
-  book.betBurn(1_000n);
+  sim.placeBet(bytes32('bob'), mA, Outcome.NO, 1_000n, sim.betCoin(mA, 1_000n, 'A-bob'), zswapPk('bob'), bytes32('A-pb'), NOW);
+  book.betBurn(1_000n + feeA);
   unsettledPools += 1_000n;
+  unsweptFees += feeA;
   assertSolvent(book, { unsettledPools, postedBonds, unsweptFees }, 'A bob bet');
 
   // Propose YES (bond posted+burned), finalize after window.
@@ -158,40 +161,45 @@ test('§8 lifecycle solvency: resolve + cancel + dispute + lost-ticket branches'
   assertSolvent(book, { unsettledPools, postedBonds, unsweptFees }, 'A finalize');
 
   // Alice (YES) claims. Once claimed, market A's pool obligation is settled: the
-  // pool value (2000) converts to a payout (198... wait compute) minted to alice +
-  // a fee accrued. Model it precisely.
+  // pool value (2000) converts to a payout minted to alice. Both users' fees
+  // were already collected at place_bet and are now earned because A resolved.
   const bA = payoutBreakdown({ amount: 1_000n, winners: 1_000n, losers: 1_000n, platformBps });
   sim.claimSettled(bytes32('alice'), aPosAlice, zswapPk('alice'), sim.ticketFor(aPosAlice), bA.grossProfit, bA.platformFee, NOW);
   book.payoutMint(bA.payout);
-  // Market A settled: remove its full pool from unsettled, add its fee to unswept.
+  // Market A settled: remove its full pool from unsettled; fee escrow was already tracked.
   unsettledPools -= 2_000n;
-  unsweptFees += bA.platformFee;
   assertSolvent(book, { unsettledPools, postedBonds, unsweptFees }, 'A alice claim');
 
   // ============ MARKET B: CANCELLED; bettor refunds exact stake ============
   const mB = bytes32('B');
   sim.createMarket(ownerKey, mB, participantId(oracleKey), CLOSE, NOW);
-  const bPosCarol = sim.placeBet(bytes32('carol'), mB, Outcome.YES, 500n, sim.snightCoin(500n, 'B-carol'), zswapPk('carol'), bytes32('B-pc'), NOW);
-  book.betBurn(500n);
+  const bPosCarol = sim.placeBet(bytes32('carol'), mB, Outcome.YES, 500n, sim.betCoin(mB, 500n, 'B-carol'), zswapPk('carol'), bytes32('B-pc'), NOW);
+  const feeB = sim.stakeFee(mB, 500n);
+  book.betBurn(500n + feeB);
   unsettledPools += 500n;
+  unsweptFees += feeB;
   assertSolvent(book, { unsettledPools, postedBonds, unsweptFees }, 'B carol bet');
 
   sim.cancelMarket(ownerKey, mB, NOW); // OPEN -> CANCELLED
-  // Carol refunds exact stake.
-  sim.claimSettled(bytes32('carol'), bPosCarol, zswapPk('carol'), sim.ticketFor(bPosCarol), 0n, 0n, NOW);
-  book.payoutMint(500n);
+  // Carol refunds the exact stake plus the escrowed fee.
+  sim.claimSettled(bytes32('carol'), bPosCarol, zswapPk('carol'), sim.ticketFor(bPosCarol), 0n, feeB, NOW);
+  book.payoutMint(500n + feeB);
   unsettledPools -= 500n;
+  unsweptFees -= feeB;
   assertSolvent(book, { unsettledPools, postedBonds, unsweptFees }, 'B carol refund');
 
   // ============ MARKET C: DISPUTED -> arbiter vote; winner takes 2x bond ============
   const mC = bytes32('C');
   sim.createMarket(ownerKey, mC, participantId(oracleKey), CLOSE, NOW, { challengeWindow: CHALLENGE, platformBps });
-  const cPosDave = sim.placeBet(bytes32('dave'), mC, Outcome.YES, 1_000n, sim.snightCoin(1_000n, 'C-dave'), zswapPk('dave'), bytes32('C-pd'), NOW);
-  book.betBurn(1_000n);
+  const cPosDave = sim.placeBet(bytes32('dave'), mC, Outcome.YES, 1_000n, sim.betCoin(mC, 1_000n, 'C-dave'), zswapPk('dave'), bytes32('C-pd'), NOW);
+  const feeC = sim.stakeFee(mC, 1_000n);
+  book.betBurn(1_000n + feeC);
   unsettledPools += 1_000n;
-  sim.placeBet(bytes32('erin'), mC, Outcome.NO, 1_000n, sim.snightCoin(1_000n, 'C-erin'), zswapPk('erin'), bytes32('C-pe'), NOW);
-  book.betBurn(1_000n);
+  unsweptFees += feeC;
+  sim.placeBet(bytes32('erin'), mC, Outcome.NO, 1_000n, sim.betCoin(mC, 1_000n, 'C-erin'), zswapPk('erin'), bytes32('C-pe'), NOW);
+  book.betBurn(1_000n + feeC);
   unsettledPools += 1_000n;
+  unsweptFees += feeC;
   assertSolvent(book, { unsettledPools, postedBonds, unsweptFees }, 'C bets');
 
   const dlC = BigInt(AFTER_CLOSE) + CHALLENGE;
@@ -216,9 +224,10 @@ test('§8 lifecycle solvency: resolve + cancel + dispute + lost-ticket branches'
   // (dave's payout would be bC.payout; deliberately NOT claimed.)
 
   // ============ Treasury sweep of market A's fee ============
+  const earnedFeeA = feeA * 2n;
   sim.withdrawTreasury(ownerKey, mA, userAddress('treasury'), NOW);
-  book.treasurySweep(bA.platformFee);
-  unsweptFees -= bA.platformFee;
+  book.treasurySweep(earnedFeeA);
+  unsweptFees -= earnedFeeA;
   assertSolvent(book, { unsettledPools, postedBonds, unsweptFees }, 'A treasury sweep');
 
   // ============ Final invariants ============

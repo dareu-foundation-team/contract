@@ -58,6 +58,14 @@ test('FIX 3: close_time must strictly exceed betting_cutoff', () => {
   );
 });
 
+test('create_market: zero platform fee is rejected so every accepted bet pays a fee', () => {
+  const sim = DareuV2Sim.deploy({ ownerKey });
+  expectRevert(
+    () => sim.createMarket(ownerKey, bytes32('m-zero-fee'), participantId(oracleKey), BigInt(NOW + 86_400), NOW, { platformBps: 0n }),
+    'Platform fee rate must be positive',
+  );
+});
+
 test('FIX 3: place_bet subtraction never underflows for a stored market', () => {
   // A market that passed create_market has close_time > betting_cutoff by FIX 3, so
   // place_bet's (close_time - betting_cutoff) is safe. Sanity: a valid bet works.
@@ -66,7 +74,7 @@ test('FIX 3: place_bet subtraction never underflows for a stored market', () => 
   const close = BigInt(NOW + 86_400);
   sim.createMarket(ownerKey, m, participantId(oracleKey), close, NOW, { bettingCutoff: 300n });
   // Bet succeeds (no underflow in the betting-window check).
-  const pos = sim.placeBet(bytes32('alice'), m, Outcome.YES, 100n, sim.snightCoin(100n, 'a'),
+  const pos = sim.placeBet(bytes32('alice'), m, Outcome.YES, 100n, sim.betCoin(m, 100n, 'a'),
     zswapPk('alice'), bytes32('pn'), NOW);
   assert.equal(pos.length, 32);
 });

@@ -29,8 +29,9 @@ pragma language_version >= 0.23;
 // PRIVACY MODEL (on-chain exposure matrix, spec §7)
 //   place_bet   : public = market/side/amount/pos_id/payout COMMITMENT (a hash);
 //                 hidden = who paid (zswap), the payout_pk pre-image, wallet addr.
-//   claim_settled: public = pos_id, gross_profit, platform_fee, and the resulting
-//                 payout (= amount + gross_profit - platform_fee); hidden = who
+//   claim_settled: public = pos_id, gross_profit, stake_fee, and the resulting
+//                 payout (RESOLVED = amount + gross_profit; CANCELLED = amount +
+//                 stake_fee); hidden = who
 //                 triggered (ticket spend is a zswap input), the beneficiary pk.
 //                 NOTE: the beneficiary pk is a caller-supplied circuit ARGUMENT,
 //                 not a witness value, so the compiler does not force a disclose()
@@ -406,6 +407,17 @@ pure circuit max_platform_fee_rate(): Uint<64> {
   return 500;
 } // <= 5% (basis points)
 
+// The client supplies integer fee math because Compact has no division. Verify
+// the unique floor(amount * rate / 10000) using the same two-inequality bracket
+// used for parimutuel profit. The fee is charged at place_bet, independent of the
+// eventual outcome; claim_settled receives it again only to validate/refund a
+// CANCELLED position without adding a field to the Position ledger schema.
+pure circuit validate_stake_fee(amount: Uint<64>, rate: Uint<64>, fee: Uint<64>): [] {
+  assert(fee * 10000 <= amount * rate, "Stake fee is too high");
+  assert(amount * rate < (fee + 1) * 10000, "Stake fee is too low");
+  assert(fee > 0, "Bet amount is too small for a nonzero fee");
+}
+
 pure circuit min_betting_cutoff(): Uint<64> {
   return 60;
 } // >= 60s
@@ -572,6 +584,7 @@ export circuit create_market(
 
   assert(public_challenge_window >= min_challenge_window(), "Challenge window too small");
   assert(public_challenge_window <= max_challenge_window(), "Challenge window too large");
+  assert(public_platform_fee_rate > 0, "Platform fee rate must be positive");
   assert(public_platform_fee_rate <= max_platform_fee_rate(), "Platform fee rate too high");
   assert(public_betting_cutoff >= min_betting_cutoff(), "Betting cutoff too small");
   assert(public_betting_cutoff <= max_betting_cutoff(), "Betting cutoff too large");
@@ -619,6 +632,7 @@ export circuit place_bet(
                  market_id: Bytes<32>,
                  side: Outcome,
                  amount: Uint<64>,
+                 stake_fee: Uint<64>,
                  coin: ShieldedCoinInfo,
                  payout_pk: ZswapCoinPublicKey,
                  pos_nonce: Bytes<32>
@@ -626,6 +640,7 @@ export circuit place_bet(
   const public_market_id = disclose(market_id);
   const public_side = disclose(side);
   const public_amount = disclose(amount);
+  const public_stake_fee = disclose(stake_fee);
   const public_coin = disclose(coin);
   const public_pos_nonce = disclose(pos_nonce);
   const public_payout_pk = disclose(payout_pk);
@@ -638,9 +653,15 @@ export circuit place_bet(
   require_valid_side(public_side);
   assert(public_amount > 0, "Bet amount must be positive");
 
-  // The staked coin must be sNIGHT and cover exactly the declared amount.
+  // Charge the per-market fee when the bet is accepted. `amount` is the stake
+  // that enters the parimutuel pool; the wallet pays amount + fee on top.
+  validate_stake_fee(public_amount, market.platform_fee_rate, public_stake_fee);
+  assert(public_amount <= (max_uint64() - public_stake_fee) as Uint<64>, "Bet total overflow");
+  const total_payment = (public_amount + public_stake_fee) as Uint<64>;
+
+  // The payment coin must be sNIGHT and cover stake + fee exactly.
   assert(public_coin.color == snight_color(), "Bet coin is not sNIGHT");
-  assert(public_coin.value == (public_amount as Uint<128>), "Coin value must equal amount");
+  assert(public_coin.value == (total_payment as Uint<128>), "Coin value must equal stake plus fee");
 
   // pos_id doubles as the ticket domain separator; must be fresh.
   const pos_id = position_id(public_market_id, public_pos_nonce);
@@ -649,6 +670,13 @@ export circuit place_bet(
   // Receive the stake and burn it immediately (no custody).
   receiveShielded(public_coin);
   const burned = sendImmediateShielded(public_coin, shieldedBurnAddress(), public_coin.value);
+
+  // Fees remain escrowed in the per-market bucket while OPEN/PROPOSED/DISPUTED.
+  // RESOLVED makes the bucket owner-withdrawable; CANCELLED claims decrement it
+  // and return each bettor's fee together with their stake.
+  const prior_fee = market_fees.member(public_market_id) ? market_fees.lookup(public_market_id) : 0;
+  assert(prior_fee <= (max_uint64() - public_stake_fee) as Uint<64>, "Market fee escrow overflow");
+  market_fees.insert(public_market_id, (prior_fee + public_stake_fee) as Uint<64>);
 
   // Grow the chosen pool (parimutuel math, same as v1).
   const next_yes_pool =
@@ -706,13 +734,13 @@ export circuit place_bet(
 //   (3) the payout is minted to payout_pk itself — so even if (1)/(2) were somehow
 //       bypassed, funds can only ever reach the true beneficiary.
 //
-// THE MATH (RESOLVED branch, floor-division brackets, identical to v1): the client
-// computes gross_profit / platform_fee off-chain; the circuit re-derives the
-// unique correct value by bracketing between two integer inequalities.
+// THE MATH: the client computes gross_profit / stake_fee off-chain; the circuit
+// re-derives each unique floor value by bracketing between two inequalities.
 //   gross_profit = floor(amount * losers / winners)
-//   platform_fee = floor(gross_profit * market.platform_fee_rate / 10000)  [bps]
-//   payout = amount + gross_profit - platform_fee; fee accrues to market_fees.
-// CANCELLED branch: gross_profit == 0 && platform_fee == 0; payout = amount.
+//   stake_fee = floor(amount * market.platform_fee_rate / 10000)  [bps]
+//   RESOLVED payout = amount + gross_profit (fee was already paid at bet time).
+//   CANCELLED payout = amount + stake_fee; the escrowed fee is removed from
+//   market_fees, so platform revenue is zero for a cancelled position.
 //
 // No timeout opening, no keeper (product decision D7): a lost ticket strands this
 // position's payout permanently.
@@ -721,13 +749,13 @@ export circuit claim_settled(
                  payout_pk: ZswapCoinPublicKey,
                  ticket: ShieldedCoinInfo,
                  gross_profit: Uint<64>,
-                 platform_fee: Uint<64>
+                 stake_fee: Uint<64>
                  ): [] {
   const public_bet_id = disclose(bet_id);
   const public_payout_pk = disclose(payout_pk);
   const public_ticket = disclose(ticket);
   const public_gross_profit = disclose(gross_profit);
-  const public_platform_fee = disclose(platform_fee);
+  const public_stake_fee = disclose(stake_fee);
 
   // Gate (1): ticket color + value, then receive & burn the ticket.
   assert(public_ticket.color == ticket_color(public_bet_id), "Ticket color mismatch");
@@ -753,13 +781,14 @@ export circuit claim_settled(
   assert(market.status == MarketStatus.RESOLVED || market.status == MarketStatus.CANCELLED,
          "Market is not settled"
          );
+  validate_stake_fee(position.amount, market.platform_fee_rate, public_stake_fee);
 
   // Branch by market status; compute payout. Only the selected branch's asserts
   // execute (Compact ternary is single-branch — verified empirically), so the
   // RESOLVED and CANCELLED validations never cross-fire.
   const payout = market.status == MarketStatus.RESOLVED
-                   ? claim_resolved(position, market, public_gross_profit, public_platform_fee)
-                   : claim_cancelled(position, market, public_gross_profit, public_platform_fee);
+                   ? claim_resolved(position, market, public_gross_profit)
+                   : claim_cancelled(position, market, public_gross_profit, public_stake_fee);
 
   // Mark claimed BEFORE minting so the position can never be double-claimed.
   positions.insert(
@@ -783,14 +812,13 @@ export circuit claim_settled(
             );
 }
 
-// RESOLVED payout: only a winning position may claim; floor-division brackets
-// re-derive gross_profit and platform_fee; the fee accrues to market_fees. Runs as
-// a helper (not exported) so claim_settled stays a single circuit.
+// RESOLVED payout: only a winning position may claim. The stake fee was paid and
+// accrued at place_bet, so settlement re-derives only gross_profit and does not
+// charge either side again.
 circuit claim_resolved(
           position: Position,
           market: Market,
-          gross_profit: Uint<64>,
-          platform_fee: Uint<64>
+          gross_profit: Uint<64>
           ): Uint<64> {
   assert(position.side == market.outcome, "Position is not a winner");
 
@@ -802,36 +830,25 @@ circuit claim_resolved(
   assert(gross_profit * winners <= position.amount * losers, "Profit is too high");
   assert(position.amount * losers < (gross_profit + 1) * winners, "Profit is too low");
 
-  // platform_fee == floor(gross_profit * market.platform_fee_rate / 10000).
-  assert(platform_fee * 10000 <= gross_profit * market.platform_fee_rate,
-         "Platform fee is too high"
-         );
-  assert(gross_profit * market.platform_fee_rate < (platform_fee + 1) * 10000,
-         "Platform fee is too low"
-         );
-
-  // Accrue the fee to this market's bucket (per-market, spec §3 / D2). `position`
-  // is already in scope, so read its market_id once directly.
-  const mkt_id = position.market_id;
-  const prior = market_fees.member(mkt_id) ? market_fees.lookup(mkt_id) : 0;
-  market_fees.insert(mkt_id, (prior + platform_fee) as Uint<64>);
-
-  return (position.amount + gross_profit - platform_fee) as Uint<64>;
+  return (position.amount + gross_profit) as Uint<64>;
 }
 
-// CANCELLED payout: exact stake back, no profit, no fee. Defense-in-depth — the
-// caller (claim_settled) already asserts the market is RESOLVED-or-CANCELLED and
-// only routes here when it is not RESOLVED, so this re-checks CANCELLED explicitly.
-pure circuit claim_cancelled(
+// CANCELLED payout: refund both stake and the fee collected at place_bet. The
+// corresponding fee escrow is released position-by-position. A lost ticket keeps
+// both amounts locked, but the owner can never withdraw a CANCELLED fee bucket.
+circuit claim_cancelled(
                position: Position,
                market: Market,
                gross_profit: Uint<64>,
-               platform_fee: Uint<64>
+               stake_fee: Uint<64>
                ): Uint<64> {
   assert(market.status == MarketStatus.CANCELLED, "Market is not cancelled");
   assert(gross_profit == 0, "No profit on a cancelled market");
-  assert(platform_fee == 0, "No fee on a cancelled market");
-  return position.amount;
+  const mkt_id = position.market_id;
+  const escrowed = market_fees.member(mkt_id) ? market_fees.lookup(mkt_id) : 0;
+  assert(escrowed >= stake_fee, "Cancelled fee escrow is insufficient");
+  market_fees.insert(mkt_id, (escrowed - stake_fee) as Uint<64>);
+  return (position.amount + stake_fee) as Uint<64>;
 }
 
 // [CIRCUIT 6 / oracle] propose_resolution — bond paid in sNIGHT. The proposer
@@ -1167,6 +1184,13 @@ export circuit set_role(role: Role, participant: Bytes<32>, enabled: Boolean): [
 export circuit withdraw_treasury(market_id: Bytes<32>, payout_address: UserAddress): [] {
   const public_market_id = disclose(market_id);
   require_owner();
+
+  // Before resolution the bucket is refundable fee escrow. A CANCELLED bucket
+  // must remain available for ticket holders forever; only a RESOLVED market
+  // converts its escrow into earned platform revenue.
+  assert(markets.member(public_market_id), "Market does not exist");
+  const market = markets.lookup(public_market_id);
+  assert(market.status == MarketStatus.RESOLVED, "Fees are not withdrawable before resolution");
 
   const amount = market_fees.member(public_market_id) ? market_fees.lookup(public_market_id) : 0;
   assert(amount > 0, "No fees to withdraw for this market");

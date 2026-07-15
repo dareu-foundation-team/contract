@@ -61,19 +61,48 @@ test('withdraw: wrong-color coin rejected', () => {
   expectRevert(() => sim.withdraw(aliceKey, wrong, userAddress('alice'), NOW), 'Coin is not sNIGHT');
 });
 
-test('place_bet: wrong-color coin rejected; value != amount rejected', () => {
+test('place_bet: wrong-color coin rejected; value must equal stake plus fee', () => {
   const sim = DareuV2Sim.deploy({ ownerKey });
   const m = bytes32('m1');
   sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW);
   // Wrong color.
   expectRevert(
-    () => sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.coinOfColor(bytes32('x'), 100n, 'w'), zswapPk('alice'), bytes32('pn'), NOW),
+    () => sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.coinOfColor(bytes32('x'), 102n, 'w'), zswapPk('alice'), bytes32('pn'), NOW),
     'Bet coin is not sNIGHT',
   );
-  // Right color but value != amount.
+  // Right color but value != stake + fee.
   expectRevert(
     () => sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.snightCoin(99n, 'v'), zswapPk('alice'), bytes32('pn2'), NOW),
-    'Coin value must equal amount',
+    'Coin value must equal stake plus fee',
+  );
+});
+
+test('place_bet: fee is the exact floor of stake times the market rate', () => {
+  const sim = DareuV2Sim.deploy({ ownerKey });
+  const m = bytes32('m-fee-bracket');
+  sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW, { platformBps: 100n });
+  const amount = 10_000n;
+  const exactFee = 100n;
+  expectRevert(
+    () => sim.placeBet(aliceKey, m, Outcome.YES, amount, sim.snightCoin(amount + exactFee - 1n, 'low'), zswapPk('alice'), bytes32('low'), NOW, exactFee - 1n),
+    'Stake fee is too low',
+  );
+  expectRevert(
+    () => sim.placeBet(aliceKey, m, Outcome.YES, amount, sim.snightCoin(amount + exactFee + 1n, 'high'), zswapPk('alice'), bytes32('high'), NOW, exactFee + 1n),
+    'Stake fee is too high',
+  );
+  sim.placeBet(aliceKey, m, Outcome.YES, amount, sim.snightCoin(amount + exactFee, 'exact'), zswapPk('alice'), bytes32('exact'), NOW, exactFee);
+  assert.equal(sim.ledger.market_fees.lookup(m), exactFee);
+  assert.equal(sim.ledger.markets.lookup(m).total_pool, amount, 'only stake enters the pool');
+});
+
+test('place_bet: amounts whose rounded-down fee is zero are rejected', () => {
+  const sim = DareuV2Sim.deploy({ ownerKey });
+  const m = bytes32('m-tiny');
+  sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW, { platformBps: 100n });
+  expectRevert(
+    () => sim.placeBet(aliceKey, m, Outcome.YES, 99n, sim.snightCoin(99n, 'tiny'), zswapPk('alice'), bytes32('tiny'), NOW, 0n),
+    'Bet amount is too small for a nonzero fee',
   );
 });
 
@@ -82,9 +111,9 @@ test('place_bet: duplicate pos_nonce rejected (position already exists)', () => 
   const m = bytes32('m1');
   sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW);
   const nonce = bytes32('dup');
-  sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.snightCoin(100n, 'a'), zswapPk('alice'), nonce, NOW);
+  sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.betCoin(m, 100n, 'a'), zswapPk('alice'), nonce, NOW);
   expectRevert(
-    () => sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.snightCoin(100n, 'a2'), zswapPk('alice'), nonce, NOW),
+    () => sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.betCoin(m, 100n, 'a2'), zswapPk('alice'), nonce, NOW),
     'Position already exists',
   );
 });
@@ -93,8 +122,8 @@ test('bond payment: wrong-color bond coin rejected in propose and dispute', () =
   const sim = DareuV2Sim.deploy({ ownerKey });
   const m = bytes32('m1');
   sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW, { challengeWindow: CHALLENGE });
-  sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.snightCoin(100n, 'a'), zswapPk('alice'), bytes32('pa'), NOW);
-  sim.placeBet(bytes32('bob'), m, Outcome.NO, 100n, sim.snightCoin(100n, 'b'), zswapPk('bob'), bytes32('pb'), NOW);
+  sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.betCoin(m, 100n, 'a'), zswapPk('alice'), bytes32('pa'), NOW);
+  sim.placeBet(bytes32('bob'), m, Outcome.NO, 100n, sim.betCoin(m, 100n, 'b'), zswapPk('bob'), bytes32('pb'), NOW);
   const deadline = BigInt(AFTER_CLOSE) + CHALLENGE;
   // propose with wrong-color bond.
   expectRevert(

@@ -17,11 +17,16 @@ import {
 } from './autopropose-v2.js'
 import { syncOnceV2 } from './sync-v2.js'
 import { resolveDeploymentV2 } from '../shared/chain-v2.js'
+import {
+  errorMessage,
+  isKeeperTransactionTimeout,
+} from './reliability.js'
 
 async function main() {
   loadEnvFiles()
   const network = resolveNetwork(process.argv[2])
   const cycleSec = Number(optionalEnv('KEEPER_CYCLE_SEC') ?? '300')
+  const errorRetrySec = Number(optionalEnv('KEEPER_ERROR_RETRY_SEC') ?? '20')
   const deployment = await resolveDeploymentV2(network)
   console.log(
     `[keeper-v2] registry ${deployment.registryAddress} → ${deployment.symbol} ` +
@@ -30,6 +35,7 @@ async function main() {
   console.log(`[keeper-v2] up — full cycle (sync+publish+propose+finalize+cancel+stuck-cancel) every ${cycleSec}s`)
 
   for (;;) {
+    let cycleFailed = false
     try {
       // sync FIRST: mirror chain state so the loops below see fresh onchain_status.
       await syncOnceV2(network)
@@ -39,9 +45,18 @@ async function main() {
       await cancelRequestedV2(network)
       await cancelStuckV2(network)
     } catch (err) {
-      console.error('[keeper-v2] cycle error:', err instanceof Error ? err.message : err)
+      console.error('[keeper-v2] cycle error:', errorMessage(err))
+      if (isKeeperTransactionTimeout(err)) {
+        // Promise.race cannot cancel an in-flight SDK call. Exit the whole process
+        // so the supervisor can guarantee that no zombie submission overlaps the
+        // replacement wallet.
+        throw err
+      }
+      cycleFailed = true
     }
-    await new Promise((r) => setTimeout(r, cycleSec * 1000))
+    const waitSec = cycleFailed ? errorRetrySec : cycleSec
+    console.log(`[keeper-v2] next cycle in ${waitSec}s${cycleFailed ? ' (recovery retry)' : ''}.`)
+    await new Promise((r) => setTimeout(r, waitSec * 1000))
   }
 }
 

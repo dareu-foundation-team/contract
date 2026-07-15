@@ -23,6 +23,7 @@
     "market:create": "NODE_OPTIONS=--max-old-space-size=8192 tsx scripts/admin/market-v2.ts create",
     "market:cancel": "NODE_OPTIONS=--max-old-space-size=8192 tsx scripts/admin/market-v2.ts cancel",
     "keeper:run": "NODE_OPTIONS=--max-old-space-size=8192 tsx scripts/keeper/run-v2.ts",
+    "keeper:service": "bash scripts/keeper/supervise-v2.sh",
     "keeper:publish": "NODE_OPTIONS=--max-old-space-size=8192 tsx scripts/keeper/publish-v2.ts",
     "keeper:sync": "NODE_OPTIONS=--max-old-space-size=8192 tsx scripts/keeper/sync-v2.ts",
     "keeper:autopropose": "NODE_OPTIONS=--max-old-space-size=8192 tsx scripts/keeper/autopropose-v2.ts",

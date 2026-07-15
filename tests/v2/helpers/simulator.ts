@@ -213,6 +213,21 @@ export class DareuV2Sim {
     return { nonce: bytes32(`coin:${nonceTag}`), color: this.snightColor, value };
   }
 
+  /** Exact fee escrow charged on top of a stake for this market. */
+  stakeFee(marketId: Uint8Array, amount: bigint): bigint {
+    const market = this.ledger.markets.lookup(marketId);
+    return floorDiv(amount * market.platform_fee_rate, 10000n);
+  }
+
+  /** Build the exact stake+fee payment coin accepted by place_bet. */
+  betCoin(marketId: Uint8Array, amount: bigint, nonceTag: string | number): {
+    nonce: Uint8Array;
+    color: Uint8Array;
+    value: bigint;
+  } {
+    return this.snightCoin(amount + this.stakeFee(marketId, amount), nonceTag);
+  }
+
   /** Build a coin of an arbitrary (wrong) color for negative tests. */
   coinOfColor(color: Uint8Array, value: bigint, nonceTag: string | number): {
     nonce: Uint8Array;
@@ -313,9 +328,11 @@ export class DareuV2Sim {
     payoutPk: { bytes: Uint8Array },
     posNonce: Uint8Array,
     time: number,
+    stakeFeeOverride?: bigint,
   ): Uint8Array {
+    const stakeFee = stakeFeeOverride ?? this.stakeFee(marketId, amount);
     return this.run(bettor, time, (c, ctx) =>
-      c.impureCircuits.place_bet(ctx, marketId, side, amount, coin, payoutPk, posNonce),
+      c.impureCircuits.place_bet(ctx, marketId, side, amount, stakeFee, coin, payoutPk, posNonce),
     );
   }
 
@@ -420,7 +437,7 @@ export function floorDiv(numerator: bigint, denominator: bigint): bigint {
   return numerator / denominator; // BigInt division truncates == floor for non-negatives
 }
 
-/** Compute the exact (grossProfit, platformFee) a RESOLVED winner must pass. */
+/** Compute the stake fee paid up-front plus the no-further-fee winner payout. */
 export function payoutBreakdown(args: {
   amount: bigint;
   winners: bigint;
@@ -428,7 +445,7 @@ export function payoutBreakdown(args: {
   platformBps: bigint;
 }): { grossProfit: bigint; platformFee: bigint; payout: bigint } {
   const grossProfit = floorDiv(args.amount * args.losers, args.winners);
-  const platformFee = floorDiv(grossProfit * args.platformBps, 10000n);
-  const payout = args.amount + grossProfit - platformFee;
+  const platformFee = floorDiv(args.amount * args.platformBps, 10000n);
+  const payout = args.amount + grossProfit;
   return { grossProfit, platformFee, payout };
 }

@@ -16,9 +16,15 @@
 > sNIGHT color:
 > `e4383670761aacc9387b14b7056b1bd1fbeac4154979e93d4551c03878a15a06`
 >
-> The V2 test suite currently passes **124/124** tests. Midnight.js is 4.1.x; do not
+> The full contract test suite currently passes **133/133** tests (including **56/56**
+> V2-specific tests). Midnight.js is 4.1.x; do not
 > directly pin `ledger-v8`, because the ledger implementation is packaged through
 > `@midnight-ntwrk/midnight-js-protocol/ledger`.
+>
+> **Local fee-model update (2026-07-13, not yet deployed):** `place_bet` now charges
+> the per-market fee on stake. It remains refundable escrow until resolution;
+> `claim_settled` refunds stake + fee on cancellation, and treasury withdrawal is
+> permitted only for a RESOLVED market. A fresh preprod V2 deployment is required.
 >
 > Full design rationale (Chinese, with all decision records D1–D8):
 > [`../../README-shielded-vault-market.zh-CN.md`](../../README-shielded-vault-market.zh-CN.md)
@@ -75,7 +81,7 @@ Users never touch `local_secret_key` — it remains only for platform roles.
 | `claim_winnings` + `refund_cancelled_position`, identity-gated | **`claim_settled`** (merged), **ticket-gated**: burn the position's ticket + prove `payout_commitment` preimage → payout **minted to the committed pk** | Kills the lost-identity failure class; wallet-seed recoverable; no keeper fallback (product decision D7) |
 | `bettor` id stored in Position | `payout_commitment` hash (pk never on-chain until claim mint) | Unlinkability across positions |
 | `bond_credits` pull-payments | Bonds minted straight back to `proposer_pk`/`disputer_pk` | Push is safe when minting to a shielded pk |
-| Global `treasury` cell | `market_fees[market_id]` + `withdraw_treasury(market_id, addr)` | Removes cross-market claim contention |
+| Global `treasury` cell | `market_fees[market_id]` escrow + resolved-only `withdraw_treasury(market_id, addr)` | Removes cross-market contention and protects cancellation refunds |
 | `set_arbiter` | **`set_role(Role, participant, enabled)`** (ARBITER \| OPERATOR) | Operator/owner split within the 12-circuit budget |
 | `commitments` audit map | removed | Self-documented as adding no secrecy |
 | — | `operator` ledger field | Least-privilege hot key for the keeper |
@@ -87,15 +93,15 @@ Users never touch `local_secret_key` — it remains only for platform roles.
 | 1 | `deposit(amount, recipient_pk, mint_nonce)` | none | NIGHT in → mint sNIGHT to pk |
 | 2 | `withdraw(coin, payout_address)` | holding sNIGHT | burn sNIGHT → NIGHT out |
 | 3 | `create_market(…)` | owner **or operator** | — |
-| 4 | `place_bet(market, side, amount, coin, payout_pk, pos_nonce)` | holding sNIGHT | burn stake; **mint 1 ticket** (color = `tokenType(pos_id, self)`) to pk |
-| 5 | `claim_settled(bet_id, payout_pk, ticket, gross_profit, platform_fee)` | **ticket holder only** | burn ticket → mint payout to committed pk (RESOLVED: v1 floor-bracket math; CANCELLED: stake back) |
+| 4 | `place_bet(market, side, amount, stake_fee, coin, payout_pk, pos_nonce)` | holding sNIGHT | burn stake + fee; pool gets stake; escrow fee; **mint 1 ticket** |
+| 5 | `claim_settled(bet_id, payout_pk, ticket, gross_profit, stake_fee)` | **ticket holder only** | burn ticket → mint payout (RESOLVED: stake + gross profit; CANCELLED: stake + original fee) |
 | 6 | `propose_resolution(market, result, deadline, coin, refund_pk)` | bond in sNIGHT | burn bond |
 | 7 | `dispute_resolution(market, coin, refund_pk)` | counter-bond | burn bond |
 | 8 | `finalize_proposal(market)` | permissionless | mint bond → proposer_pk |
 | 9 | `vote_dispute(market, result)` | arbiter | on threshold: mint 2×bond → winner pk |
 | 10 | `cancel_market(market)` | owner/operator (+oracle when OPEN) | stuck-cancel mints bonds back |
 | 11 | `set_role(role, participant, enabled)` | **owner only** | — |
-| 12 | `withdraw_treasury(market_id, payout_address)` | **owner only** | NIGHT out (≤ accrued fees) |
+| 12 | `withdraw_treasury(market_id, payout_address)` | **owner only, RESOLVED market** | withdraw earned fee; unresolved/cancelled escrow is protected |
 
 Pure exports for clients: `participant_id`, `position_id`. Ticket color must be derived
 client-side as `tokenType(pos_id, contractAddress)` (it reads `kernel.self()`, so it
@@ -117,7 +123,7 @@ monitor — track it separately).
 
 ```
 NIGHT held by contract ≥ circulating sNIGHT
-                        + Σ unresolved pools + Σ posted bonds + Σ unswept market_fees
+                        + Σ unresolved pools + Σ posted bonds + Σ refundable/unswept market_fees
 ```
 
 On-chain `total_in/out` counters were deliberately **removed** — the contract's balance
@@ -129,7 +135,7 @@ accumulators would have serialized all deposits/withdraws on one cell.
 Deterministic per-event nonces instead of a shared evolving-nonce cell: claim mint =
 `H(tag, bet_id)`, ticket = `pos_nonce`, bond refunds = `H(tag, market_id, role)`,
 deposit = caller-random. deposits/withdraws touch **no shared ledger cell**; only
-same-market bets (pool) and same-market claims (`market_fees`) serialize.
+same-market bets (pool + fee escrow) and cancellation claims (`market_fees`) serialize.
 
 ## Build & deploy
 
