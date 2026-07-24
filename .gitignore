@@ -10,6 +10,7 @@ src/managed/
 # env — keep .env.example committed, ignore the real values
 .env
 .env.local*
+.env.keeper.*.local
 
 # Cached synced wallet state (contains wallet state — keep private)
 .wallet-cache/

@@ -3,11 +3,11 @@
 Long-running service that bridges the off-chain draft markets (Postgres) and the on-chain
 contract, and drives the optimistic-oracle resolution loops.
 
-The production path is V2-only. Run `npm run keeper:run -- preprod` (the explicit alias
-`npm run keeper:v2:run -- preprod` is equivalent; see `contract-keeper-run.sh`). There
-is no V1 fallback and old V1 market rows are never submitted to the V2 lifecycle loops.
+The production path is V2-only and category-sharded: one process and one Midnight
+wallet each for `crypto`, `stocks`, and `sports`. There is no V1 fallback and old V1
+market rows are never submitted to the V2 lifecycle loops.
 
-Run `npm run keeper:v2:preflight -- preprod` first for a read-only Registry/address/
+Run `npm run keeper:v2:preflight -- preprod crypto` first for a read-only Registry/address/
 ledger check. It does not open a wallet, submit a transaction, or write Postgres.
 
 At startup the V2 keeper resolves native NIGHT from the on-chain Registry (address from
@@ -27,6 +27,68 @@ contract now interprets it as a fee on every accepted stake, escrowed until reso
 and refunded on cancellation. Keeper does not collect or refund user fees itself.
 Because the user-circuit ABI changed, deploy/register the new V2 artifact before running
 Keeper against markets intended for this model; the current preprod address is older.
+
+## Category-sharded Keepers
+
+`markets.category` is the strict off-chain work partition. Every publish, propose,
+finalize, requested-cancel, stuck-cancel, and mirror update is limited to exactly one
+of `crypto`, `stocks`, or `sports`. An unscoped Keeper is rejected at startup, so two
+wallets cannot select the same market. Category is not a separate on-chain field; its
+integrity still comes from the committed metadata hash and the trusted DataProvider/
+Postgres pipeline.
+
+Create the three private wallet files (all `*.local` files are ignored by Git):
+
+```bash
+cp .env.keeper.crypto.example .env.keeper.crypto.local
+cp .env.keeper.stocks.example .env.keeper.stocks.local
+cp .env.keeper.sports.example .env.keeper.sports.local
+```
+
+Put one wallet mnemonic or seed in each file. Common settings remain in `.env.local`:
+`DATABASE_URL`, network endpoints, `MIDNIGHT_PRIVATE_STATE_PASSWORD`, and the single
+`DAREU_OPERATOR_SECRET_KEY` authorized by the deployed contract. The three Midnight
+wallets are independent transaction/bond accounts, but the current Compact contract
+has one operator role, so all three processes intentionally use that same operator
+witness. Each wallet must be separately funded with NIGHT/DUST; proposal workflows also
+need enough NIGHT to mint their own sNIGHT bond coin.
+
+Manage all three services together:
+
+```bash
+npm run keeper:multi -- start preprod
+npm run keeper:multi -- status preprod
+npm run keeper:multi -- restart preprod
+npm run keeper:multi -- stop preprod
+```
+
+Runtime files are isolated:
+
+```text
+logs/keeper-crypto.log              .wallet-cache/preprod-crypto.json
+logs/keeper-stocks.log              .wallet-cache/preprod-stocks.json
+logs/keeper-sports.log              .wallet-cache/preprod-sports.json
+.midnight-state/level-db-crypto     (and stocks/sports)
+```
+
+Individual diagnostics use the same category argument and wallet file:
+
+```bash
+npm run keeper:v2:wallet -- preprod crypto
+npm run keeper:v2:db -- preprod crypto
+tail -f logs/keeper-crypto.log
+```
+
+After funding each address with Preprod NIGHT, initialize its DUST generation once:
+
+```bash
+npm run keeper:v2:prepare-wallet -- preprod crypto
+npm run keeper:v2:prepare-wallet -- preprod stocks
+npm run keeper:v2:prepare-wallet -- preprod sports
+```
+
+This preparation command may submit a NIGHT UTXO registration transaction. The ordinary
+`keeper:v2:wallet` diagnostic remains read-only.
 
 ---
 
@@ -49,12 +111,12 @@ Deposit submitted but the minted sNIGHT bond coin did not appear ... within 6000
 ```
 
 `connectKeeperV2` therefore waits for the complete wallet state before selecting an
-sNIGHT bond coin. The wallet cache remains in `.wallet-cache/<network>.json`, so later
+sNIGHT bond coin. The wallet cache remains in `.wallet-cache/<network>-<category>.json`, so later
 runs resume incrementally. A successful deposit must not be repeated merely because an
 older run timed out; run the read-only wallet diagnostic first:
 
 ```bash
-npm run keeper:v2:wallet -- preprod
+npm run keeper:v2:wallet -- preprod crypto
 ```
 
 It prints the resolved Registry asset, sNIGHT color, available matching coins, values,
@@ -80,7 +142,7 @@ V1 rows from producing repeated `Market does not exist` failures after a V2 rede
 Read-only namespace report:
 
 ```bash
-npm run keeper:v2:db -- preprod
+npm run keeper:v2:db -- preprod crypto
 ```
 
 The report separates legacy rows, rows belonging to the current V2 instance, future
@@ -112,18 +174,17 @@ Publishing uses two different limits:
 50). `PUBLISH_MIN_LEAD_SEC` also excludes markets that are too close to
 `close_time - betting_cutoff`; the lead is checked again immediately before proving.
 
-Run the standalone supervisor directly; `contract-keeper-run.sh` is a personal manual
-command notebook and is not the service controller:
+`contract-keeper-run.sh` is a personal manual command notebook and is not the service
+controller. To start only one category during maintenance, run its supervisor directly:
 
 ```bash
-nohup bash scripts/keeper/supervise-v2.sh preprod >> logs/keeper.log 2>&1 &
-echo $! > logs/keeper-supervisor.pid
-tail -f logs/keeper.log
+nohup bash scripts/keeper/supervise-v2.sh preprod crypto >> logs/keeper-crypto.log 2>&1 &
+echo $! > logs/keeper-crypto-supervisor.pid
+tail -f logs/keeper-crypto.log
 ```
 
-Run `npm run keeper:v2:preflight -- preprod` before starting and verify with
-`pgrep -fl "scripts/keeper/run-v2.ts preprod"` that no previous instance exists. The
-supervisor restarts only after the previous Node process exits.
+Run `npm run keeper:v2:preflight -- preprod crypto` before starting. The supervisor
+terminates the complete npm/tsx/node child tree and restarts only after it exits.
 
 ## Cycle
 
@@ -141,7 +202,7 @@ completion (a large publish batch can take much longer than 5 min).
 - **`sync-v2.ts`** — mirrors on-chain status / pools (`onchain_status`,
   `onchain_yes_pool/no_pool`, `onchain_outcome`) back into Postgres. Runs first so the
   other loops see fresh state and stamps the current V2 namespace.
-- **`publish-v2.ts`** — reads future draft/open rows not yet owned by the current V2
+- **`publish-v2.ts`** — reads future draft/open rows for its assigned category that are not yet owned by the current V2
   instance, validates their immutable parameters, calls `create_market`, then sets
   `status='open'`, `onchain_tx_id`, version, address, and initial mirror values. This is
   what the Webapp gates the live feed on.
@@ -167,13 +228,14 @@ completion (a large publish batch can take much longer than 5 min).
   `betting_cutoff`, `platform_fee_rate`) — avoids env drift.
 
 ### Operational rules
-- **Run only ONE keeper instance.** All loops share one wallet; two instances collide on
-  the wallet nonce.
+- Run exactly **one instance per category**. The three instances have disjoint DB work,
+  wallet secrets, cache files, logs, PID files, and private-state LevelDB directories.
+  Never start a second instance for the same category/wallet.
 - Use Compact **0.31.1** artifacts and proof-server **8.1.0**. `MIDNIGHT_PROOF_SERVER`
   must point at the 8.1.0 server used by this Keeper.
 - V2 proposal/dispute bonds are shielded sNIGHT coins; user payout/refund claims are
   ticket-gated browser transactions and are not submitted by Keeper.
-- Wallet sync uses `.wallet-cache/<network>.json`; keep it (a full resync is expensive).
+- Wallet sync uses `.wallet-cache/<network>-<category>.json`; keep it (a full resync is expensive).
 - `DATABASE_URL` may stay on the session-mode pooler (`:5432`) — a single long-lived
   process uses few connections. See `../../../database/README.md`.
 

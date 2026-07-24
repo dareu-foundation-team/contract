@@ -6,7 +6,7 @@
 // tx (avoids duplicate on-chain submission). Holds the OPERATOR hot key (owner
 // key stays cold — D8) + needs the proof server.
 //
-//   npm run keeper:v2:run -- preprod
+//   npm run keeper:v2:run -- preprod crypto
 import { loadEnvFiles, optionalEnv, resolveNetwork } from '../shared/chain.js'
 import { publishDraftsV2 } from './publish-v2.js'
 import {
@@ -21,8 +21,10 @@ import {
   errorMessage,
   isKeeperTransactionTimeout,
 } from './reliability.js'
+import { configureKeeperCategory } from './scope-v2.js'
 
 async function main() {
+  const category = configureKeeperCategory(process.argv[3])
   loadEnvFiles()
   const network = resolveNetwork(process.argv[2])
   const cycleSec = Number(optionalEnv('KEEPER_CYCLE_SEC') ?? '300')
@@ -32,7 +34,7 @@ async function main() {
     `[keeper-v2] registry ${deployment.registryAddress} → ${deployment.symbol} ` +
       `${deployment.contractAddress} (${deployment.decimals} decimals, enabled)`,
   )
-  console.log(`[keeper-v2] up — full cycle (sync+publish+propose+finalize+cancel+stuck-cancel) every ${cycleSec}s`)
+  console.log(`[keeper-v2:${category}] up — full cycle (sync+publish+propose+finalize+cancel+stuck-cancel) every ${cycleSec}s`)
 
   for (;;) {
     let cycleFailed = false
@@ -45,7 +47,7 @@ async function main() {
       await cancelRequestedV2(network)
       await cancelStuckV2(network)
     } catch (err) {
-      console.error('[keeper-v2] cycle error:', errorMessage(err))
+      console.error(`[keeper-v2:${category}] cycle error:`, errorMessage(err))
       if (isKeeperTransactionTimeout(err)) {
         // Promise.race cannot cancel an in-flight SDK call. Exit the whole process
         // so the supervisor can guarantee that no zombie submission overlaps the
@@ -55,7 +57,7 @@ async function main() {
       cycleFailed = true
     }
     const waitSec = cycleFailed ? errorRetrySec : cycleSec
-    console.log(`[keeper-v2] next cycle in ${waitSec}s${cycleFailed ? ' (recovery retry)' : ''}.`)
+    console.log(`[keeper-v2:${category}] next cycle in ${waitSec}s${cycleFailed ? ' (recovery retry)' : ''}.`)
     await new Promise((r) => setTimeout(r, waitSec * 1000))
   }
 }

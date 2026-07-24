@@ -5,7 +5,7 @@
 // dareu-v2 assets + the hot OPERATOR key (create_market authorizes owner OR
 // operator — D8 keeps the owner key off the keeper server).
 //
-//   npm run keeper:v2:publish -- preprod
+//   npm run keeper:v2:publish -- preprod crypto
 import {
   loadEnvFiles,
   parseHexBytes,
@@ -21,9 +21,11 @@ import {
   stopWalletSafely,
   withKeeperTransactionTimeout,
 } from './reliability.js'
+import { configureKeeperCategory, requiredKeeperCategory } from './scope-v2.js'
 
 export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>) {
   const dbUrl = requiredEnv('DATABASE_URL')
+  const category = requiredKeeperCategory()
   // Total work per keeper cycle is intentionally large so a backlog drains
   // continuously. The wallet is rotated every `sessionSize` transactions below,
   // which avoids one websocket/UTXO context living for hundreds of proofs.
@@ -50,17 +52,18 @@ export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>
         AND platform_fee_rate IS NOT NULL
         AND close_time > now() + (betting_cutoff + $3::bigint) * interval '1 second'
         AND oracle_participant_id !~* '^(0x)?0+$'
+        AND category = $4
       ORDER BY close_time ASC
       LIMIT $1
       FOR UPDATE SKIP LOCKED`,
-    [limit, deployment.contractAddress, minLeadSec],
+    [limit, deployment.contractAddress, minLeadSec, category],
   )
   if (rows.length === 0) {
     console.log('[publish-v2] no draft markets to publish.')
     return
   }
   console.log(
-    `[publish-v2] publishing up to ${rows.length} market(s) on-chain ` +
+    `[publish-v2:${category}] publishing up to ${rows.length} market(s) on-chain ` +
       `(wallet session ${sessionSize}, minimum lead ${minLeadSec}s)…`,
   )
 
@@ -159,6 +162,7 @@ export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>
 }
 
 async function main() {
+  configureKeeperCategory(process.argv[3])
   loadEnvFiles()
   await publishDraftsV2(resolveNetwork(process.argv[2]))
 }

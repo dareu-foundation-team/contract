@@ -38,6 +38,7 @@ import {
   stopWalletSafely,
   withKeeperTransactionTimeout,
 } from './reliability.js'
+import { configureKeeperCategory, requiredKeeperCategory } from './scope-v2.js'
 
 // The contract accepts an anchor less than one hour ahead of the applying block.
 // Fifteen minutes leaves room for proof generation / submission without letting a
@@ -50,6 +51,7 @@ const PROPOSAL_DEADLINE_BUFFER_SEC = 15n * 60n
 // sync three places (markets.status, onchain_status, upsert resolutions).
 export async function autoProposeResolutionsV2(network: ReturnType<typeof resolveNetwork>) {
   const dbUrl = requiredEnv('DATABASE_URL')
+  const category = requiredKeeperCategory()
   const limit = keeperBatchLimit('RESOLVE_LIMIT')
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
@@ -65,10 +67,11 @@ export async function autoProposeResolutionsV2(network: ReturnType<typeof resolv
         AND COALESCE(onchain_status, 'open') = 'open'
         AND outcome IN ('yes', 'no')
         AND challenge_window IS NOT NULL
+        AND category = $3
       ORDER BY close_time ASC
       LIMIT $1
       FOR UPDATE SKIP LOCKED`,
-    [limit, deployment.contractAddress],
+    [limit, deployment.contractAddress, category],
   )
   if (rows.length === 0) {
     console.log('[propose-v2] no ready_to_propose markets.')
@@ -162,6 +165,7 @@ export async function autoProposeResolutionsV2(network: ReturnType<typeof resolv
 // markets/resolutions='resolved' + onchain_status.
 export async function finalizeProposalsV2(network: ReturnType<typeof resolveNetwork>) {
   const dbUrl = requiredEnv('DATABASE_URL')
+  const category = requiredKeeperCategory()
   const limit = keeperBatchLimit('FINALIZE_LIMIT')
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
@@ -178,10 +182,11 @@ export async function finalizeProposalsV2(network: ReturnType<typeof resolveNetw
         AND m.onchain_contract_version = 'v2'
         AND m.onchain_contract_address = $2
         AND COALESCE(m.onchain_status, 'proposed') = 'proposed'
+        AND m.category = $3
       ORDER BY r.propose_deadline ASC
       LIMIT $1
       FOR UPDATE OF r SKIP LOCKED`,
-    [limit, deployment.contractAddress],
+    [limit, deployment.contractAddress, category],
   )
   if (rows.length === 0) {
     console.log('[finalize-v2] no proposals past challenge window.')
@@ -225,6 +230,7 @@ export async function finalizeProposalsV2(network: ReturnType<typeof resolveNetw
 // authorized for OPEN cancels) → cancelled.
 export async function cancelRequestedV2(network: ReturnType<typeof resolveNetwork>) {
   const dbUrl = requiredEnv('DATABASE_URL')
+  const category = requiredKeeperCategory()
   const limit = keeperBatchLimit('CANCEL_LIMIT')
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
@@ -238,10 +244,11 @@ export async function cancelRequestedV2(network: ReturnType<typeof resolveNetwor
         AND onchain_contract_version = 'v2'
         AND onchain_contract_address = $2
         AND COALESCE(onchain_status, 'open') = 'open'
+        AND category = $3
       ORDER BY updated_at ASC
       LIMIT $1
       FOR UPDATE SKIP LOCKED`,
-    [limit, deployment.contractAddress],
+    [limit, deployment.contractAddress, category],
   )
   if (rows.length === 0) {
     console.log('[cancel-v2] no cancel_requested markets to cancel.')
@@ -280,6 +287,7 @@ export async function cancelRequestedV2(network: ReturnType<typeof resolveNetwor
 // re-mints the proposer's (and any disputer's) bond back to their refund pks.
 export async function cancelStuckV2(network: ReturnType<typeof resolveNetwork>) {
   const dbUrl = requiredEnv('DATABASE_URL')
+  const category = requiredKeeperCategory()
   const limit = keeperBatchLimit('STUCK_CANCEL_LIMIT')
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
@@ -296,11 +304,12 @@ export async function cancelStuckV2(network: ReturnType<typeof resolveNetwork>) 
         AND m.onchain_contract_address = $2
         AND m.challenge_window IS NOT NULL
         AND COALESCE(m.onchain_status, m.status) IN ('proposed', 'disputed')
+        AND m.category = $3
         AND now() > r.propose_deadline + (m.challenge_window || ' seconds')::interval
       ORDER BY r.propose_deadline ASC
       LIMIT $1
       FOR UPDATE OF m SKIP LOCKED`,
-    [limit, deployment.contractAddress],
+    [limit, deployment.contractAddress, category],
   )
   if (rows.length === 0) {
     console.log('[stuck-cancel-v2] no stuck proposed/disputed markets.')
@@ -340,6 +349,7 @@ export async function cancelStuckV2(network: ReturnType<typeof resolveNetwork>) 
 }
 
 async function main() {
+  configureKeeperCategory(process.argv[3])
   loadEnvFiles()
   const network = resolveNetwork(process.argv[2])
   // Run all optimistic-oracle loops once (run-v2.ts schedules them on a cycle).

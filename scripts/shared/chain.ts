@@ -31,7 +31,7 @@ export { resolveNetwork } from './network.js'
 // Consumed by BOTH the local admin scripts (deploy.ts, market.ts) and the keeper
 // SERVICE (scripts/keeper/*). It is plumbing, not an entrypoint.
 
-const envFiles = ['.env', '.env.local']
+const defaultEnvFiles = ['.env', '.env.local']
 
 // One-shot Postgres exec (standard `pg`; opens/closes a connection per call).
 // Shared by the local market admin and the keeper service.
@@ -71,8 +71,16 @@ export async function pgTx(
 }
 
 export function loadEnvFiles() {
+  const explicitEnvFile = process.env.DAREU_ENV_FILE?.trim()
+  const envFiles = explicitEnvFile
+    ? [explicitEnvFile, ...defaultEnvFiles]
+    : defaultEnvFiles
+
   for (const filename of envFiles) {
-    const envPath = path.join(contractRoot, filename)
+    const envPath = path.isAbsolute(filename) ? filename : path.join(contractRoot, filename)
+    if (filename === explicitEnvFile && !fs.existsSync(envPath)) {
+      throw new Error(`DAREU_ENV_FILE does not exist: ${envPath}`)
+    }
     if (!fs.existsSync(envPath)) continue
     for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
       const trimmed = line.trim()
@@ -81,7 +89,9 @@ export function loadEnvFiles() {
       if (sep === -1) continue
       const key = trimmed.slice(0, sep).trim()
       const value = trimmed.slice(sep + 1).trim().replace(/^['"]|['"]$/g, '')
-      if (key && process.env[key] === undefined) process.env[key] = value
+      // A category-specific Keeper file is authoritative for its wallet. Common
+      // .env/.env.local values fill only variables that it did not define.
+      if (key && (filename === explicitEnvFile || process.env[key] === undefined)) process.env[key] = value
     }
   }
 }

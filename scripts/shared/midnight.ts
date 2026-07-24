@@ -59,8 +59,18 @@ type WalletStateCache = {
   dust: string;
 };
 
+function storageNamespace(name: 'MIDNIGHT_WALLET_CACHE_NAMESPACE' | 'MIDNIGHT_PRIVATE_STATE_NAMESPACE'): string | undefined {
+  const value = process.env[name]?.trim().toLowerCase();
+  if (!value) return undefined;
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(value)) {
+    throw new Error(`${name} may contain only lowercase letters, numbers, "_", and "-".`);
+  }
+  return value;
+}
+
 function walletCachePath(network: SupportedNetwork): string {
-  return path.join(walletCacheDir, `${network}.json`);
+  const namespace = storageNamespace('MIDNIGHT_WALLET_CACHE_NAMESPACE');
+  return path.join(walletCacheDir, `${network}${namespace ? `-${namespace}` : ''}.json`);
 }
 
 function walletCacheEnabled(): boolean {
@@ -711,10 +721,14 @@ export async function createProviders(
     },
   };
 
+  const privateStateNamespace = storageNamespace('MIDNIGHT_PRIVATE_STATE_NAMESPACE');
+
   return {
     privateStateProvider: levelPrivateStateProvider({
       accountId,
-      midnightDbName: path.join(stateRoot, 'level-db'),
+      // LevelDB takes an exclusive process lock. Dedicated Keeper instances must
+      // never open the same directory even though their accountIds differ.
+      midnightDbName: path.join(stateRoot, `level-db${privateStateNamespace ? `-${privateStateNamespace}` : ''}`),
       privateStateStoreName: 'dareu-private-states',
       signingKeyStoreName: 'dareu-signing-keys',
       privateStoragePasswordProvider: () => privateStoragePassword,

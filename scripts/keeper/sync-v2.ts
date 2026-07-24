@@ -1,12 +1,13 @@
 // Keeper SERVICE: mirror on-chain v2 market state into Postgres — v2 twin of
 // sync.ts. Read-only, needs no wallet, only the indexer.
 //
-//   npm run keeper:v2:sync -- preprod                       # one-shot
-//   SYNC_INTERVAL_SEC=30 npm run keeper:v2:sync -- preprod  # poll loop
+//   npm run keeper:v2:sync -- preprod crypto                       # one-shot
+//   SYNC_INTERVAL_SEC=30 npm run keeper:v2:sync -- preprod crypto  # poll loop
 import pg from 'pg'
 import { MarketStatus, Outcome } from '../../src/managed/dareu-v2/contract/index.js'
 import { loadEnvFiles, optionalEnv, requiredEnv, resolveNetwork } from '../shared/chain.js'
 import { ensureV2MarketColumns, readV2Ledger, resolveDeploymentV2 } from '../shared/chain-v2.js'
+import { configureKeeperCategory, requiredKeeperCategory } from './scope-v2.js'
 
 // On-chain enums → the lowercase strings the webapp/Postgres mirror columns expect.
 const STATUS_TEXT: Record<number, string> = {
@@ -28,6 +29,7 @@ function toHex(b: Uint8Array): string {
 
 export async function syncOnceV2(network: ReturnType<typeof resolveNetwork>): Promise<void> {
   const dbUrl = requiredEnv('DATABASE_URL')
+  const category = requiredKeeperCategory()
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
   const led = await readV2Ledger(network)
@@ -42,23 +44,24 @@ export async function syncOnceV2(network: ReturnType<typeof resolveNetwork>): Pr
   let n = 0
   try {
     for (const [id, m] of led.markets) {
-      await client.query(
+      const result = await client.query(
         `UPDATE markets
             SET onchain_status = $2, onchain_yes_pool = $3, onchain_no_pool = $4,
                 onchain_outcome = $5, onchain_contract_version='v2',
                 onchain_contract_address=$6, synced_at = now()
-          WHERE id = $1`,
-        [toHex(id), STATUS_TEXT[m.status] ?? null, m.yes_pool.toString(), m.no_pool.toString(), OUTCOME_TEXT[m.outcome] ?? null, deployment.contractAddress],
+          WHERE id = $1 AND category = $7`,
+        [toHex(id), STATUS_TEXT[m.status] ?? null, m.yes_pool.toString(), m.no_pool.toString(), OUTCOME_TEXT[m.outcome] ?? null, deployment.contractAddress, category],
       )
-      n++
+      n += result.rowCount ?? 0
     }
   } finally {
     await client.end()
   }
-  console.log(`[sync-v2] mirrored ${n} on-chain market(s) → Postgres.`)
+  console.log(`[sync-v2:${category}] mirrored ${n} on-chain market(s) → Postgres.`)
 }
 
 async function main(): Promise<void> {
+  configureKeeperCategory(process.argv[3])
   loadEnvFiles()
   const network = resolveNetwork(process.argv[2])
   const intervalSec = Number(optionalEnv('SYNC_INTERVAL_SEC') ?? '0')
