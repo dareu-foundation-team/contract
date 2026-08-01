@@ -1,14 +1,10 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import { randomBytes } from 'node:crypto'
-
-import * as Rx from 'rxjs'
 import WebSocket from 'ws'
 import { findDeployedContract } from '@midnight-ntwrk/midnight-js-contracts'
 import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider'
 import { CompiledContract } from '@midnight-ntwrk/compact-js'
 import { toHex } from '@midnight-ntwrk/midnight-js-utils'
-import * as ledgerRuntime from '@midnight-ntwrk/midnight-js-protocol/ledger'
 
 import {
   Contract,
@@ -22,19 +18,15 @@ import {
   contractRoot,
   createProviders,
   createWallet,
-  currentWalletState,
   requiredWalletSeedOrMnemonic,
   waitForSyncedState,
 } from './midnight.js'
 import { optionalEnv, parseHexBytes, pgExec, requiredEnv } from './chain.js'
 import { type SupportedNetwork } from './network.js'
+import { DIRECT_PROTOCOL_VERSION } from './protocol.js'
 
-// v2 twin of shared/chain.ts's deployment/connection layer. Kept separate because
-// almost every knob differs from v1: the managed asset dir, the deployment record
-// (`<network>-v2.json`, which also carries snightColorHex), the caller key (the
-// hot OPERATOR key per design decision D8 — the owner key stays cold), and the
-// balancer (v2 bond/bet circuits spend a custom-color shielded coin, so balanceTx
-// must be allowed to balance 'shielded' too).
+// Active market deployment/connection layer. It uses the hot operator key while
+// the owner stays cold, and enables shielded balancing for sNIGHT bet circuits.
 
 export const zkConfigPathV2 = path.resolve(contractRoot, 'src', 'managed', 'dareu-v2')
 
@@ -66,6 +58,12 @@ export function readDeploymentV2(network: SupportedNetwork): DeploymentV2 {
     throw new Error(`No v2 deployment record at ${deploymentPath}. Run "npm run deploy:v2:${network}" first.`)
   }
   const record = JSON.parse(fs.readFileSync(deploymentPath, 'utf8')) as Record<string, unknown>
+  if (record.protocolVersion !== DIRECT_PROTOCOL_VERSION) {
+    throw new Error(
+      `${deploymentPath} is not a ${DIRECT_PROTOCOL_VERSION} deployment. ` +
+        `Deploy a fresh direct-resolution contract before running the Keeper.`,
+    )
+  }
   const snightColorHex = typeof record.snightColorHex === 'string' ? record.snightColorHex : ''
   if (!snightColorHex) {
     throw new Error(`${deploymentPath} has no snightColorHex — redeploy with the current deploy-v2.ts.`)
@@ -213,7 +211,7 @@ export type KeeperV2Context = {
 /**
  * Connect to the deployed dareu-v2 contract for keeper writes. Mirrors
  * chain.ts#connectKeeper, with the v2 zk assets and 'all' token-kind balancing
- * (propose/dispute spend an sNIGHT bond coin; deposit spends unshielded NIGHT).
+ * (`place_bet` spends an sNIGHT coin; `deposit` spends unshielded NIGHT).
  */
 export async function connectKeeperV2(network: SupportedNetwork): Promise<KeeperV2Context> {
   ensureCompiledContractV2()
@@ -231,10 +229,10 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
 
   const providers = await createProviders(walletCtx, config, privateStoragePassword, {
     zkConfigPath: zkConfigPathV2,
-    // `deposit` is v2-only; the keeper's oracle circuits also exist in v1 and
+    // `deposit` and `resolve_market` identify the direct-resolution V2 artifact.
     // cannot by themselves detect that the wrong managed-contract directory was
     // selected. Preflight every circuit this shared connection may submit.
-    expectedCircuitIds: ['deposit', 'propose_resolution', 'finalize_proposal', 'cancel_market'],
+    expectedCircuitIds: ['deposit', 'resolve_market', 'cancel_market'],
     tokenKindsToBalance: 'all',
   })
   const compiledContract = createCompiledDareuV2Contract(key)
@@ -251,8 +249,7 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
   return { deployed, walletCtx, deployment, callerRole: role }
 }
 
-/** Read-only v2 ledger snapshot from the indexer (no wallet). Shared by sync-v2
- *  and the propose loop (which needs the immutable on-chain resolution_bond). */
+/** Read-only v2 ledger snapshot from the indexer (no wallet). */
 export async function readV2Ledger(network: SupportedNetwork): Promise<LedgerV2 | null> {
   globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket
   const config = configureNetwork(network)
@@ -263,106 +260,4 @@ export async function readV2Ledger(network: SupportedNetwork): Promise<LedgerV2 
   if (!state) return null
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return ledgerV2((state as any).data)
-}
-
-const normHex = (h: string) => h.trim().toLowerCase().replace(/^0x/, '')
-
-/** The keeper wallet's ZswapCoinPublicKey ({ bytes }) — used as the bond refund pk
- *  and as the sNIGHT deposit recipient. */
-export async function keeperCoinPublicKey(walletCtx: KeeperV2Context['walletCtx']): Promise<{ bytes: Uint8Array }> {
-  const state = await currentWalletState(walletCtx.wallet)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const pkHex: string = (state as any).shielded.coinPublicKey.toHexString()
-  return { bytes: ledgerRuntime.encodeCoinPublicKey(pkHex) }
-}
-
-export type BondCoin = { nonce: Uint8Array; color: Uint8Array; value: bigint }
-
-function findAvailableSnightCoin(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  state: any,
-  snightColorHex: string,
-  value: bigint,
-  usedNonces: Set<string>,
-): BondCoin | undefined {
-  const colorHex = normHex(snightColorHex)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const match = (state.shielded.availableCoins as any[]).find(
-    (c) => normHex(c.coin.type) === colorHex && BigInt(c.coin.value) === value && !usedNonces.has(normHex(c.coin.nonce)),
-  )
-  if (!match) return undefined
-  const encoded = ledgerRuntime.encodeShieldedCoinInfo({
-    type: match.coin.type,
-    nonce: match.coin.nonce,
-    value: BigInt(match.coin.value),
-  })
-  return { nonce: encoded.nonce, color: encoded.color, value: encoded.value }
-}
-
-/**
- * Produce an sNIGHT coin of EXACTLY `bond` for propose_resolution to escrow
- * (the circuit asserts value == resolution_bond, so no change-splitting exists).
- *
- * 1. Reuse an available wallet coin of that exact value — after a finalize the
- *    on-chain bond refund mints one back, so steady-state cycles a single coin.
- * 2. Otherwise mint one via the vault: deposit(bond, keeper_pk, random_nonce)
- *    (spends unshielded NIGHT 1:1), then wait for the wallet to detect the
- *    minted coin (its nonce is the mint nonce we chose).
- *
- * `usedNonces` tracks coins already committed to earlier proposes in this same
- * cycle, before the chain/wallet reflects their spend.
- */
-export async function ensureSnightBondCoin(
-  ctx: KeeperV2Context,
-  bond: bigint,
-  usedNonces: Set<string>,
-): Promise<BondCoin> {
-  const state = await currentWalletState(ctx.walletCtx.wallet)
-  const existing = findAvailableSnightCoin(state, ctx.deployment.snightColorHex, bond, usedNonces)
-  if (existing) {
-    usedNonces.add(normHex(toHex(existing.nonce)))
-    return existing
-  }
-
-  const mintNonce = new Uint8Array(randomBytes(32))
-  const recipient = await keeperCoinPublicKey(ctx.walletCtx)
-  console.log(`  [bond] no spare sNIGHT bond coin — depositing ${bond} NIGHT to mint one…`)
-  await ctx.deployed.callTx.deposit(bond, recipient, mintNonce)
-
-  // The minted coin's nonce IS the mint nonce; wait for the wallet to sync it.
-  const wantNonce = normHex(toHex(mintNonce))
-  const timeoutMs = Number(optionalEnv('DAREU_BOND_COIN_TIMEOUT_MS') ?? 10 * 60 * 1000)
-  const coin = await Rx.firstValueFrom(
-    ctx.walletCtx.wallet.state().pipe(
-      Rx.auditTime(2_000),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      Rx.map((s: any) =>
-        (s.shielded.availableCoins as any[]).find(
-          (c) =>
-            normHex(c.coin.nonce) === wantNonce &&
-            normHex(c.coin.type) === normHex(ctx.deployment.snightColorHex),
-        ),
-      ),
-      Rx.filter((c) => c !== undefined),
-      Rx.timeout({
-        first: timeoutMs,
-        with: () =>
-          Rx.throwError(
-            () =>
-              new Error(
-                `Deposit submitted but the minted sNIGHT bond coin (nonce ${wantNonce.slice(0, 12)}…) ` +
-                  `did not appear in the keeper wallet within ${timeoutMs}ms. ` +
-                  'Check indexer sync and that the wallet detects contract-minted coins (V2a demo check).',
-              ),
-          ),
-      }),
-    ),
-  )
-  usedNonces.add(wantNonce)
-  const encoded = ledgerRuntime.encodeShieldedCoinInfo({
-    type: coin.coin.type,
-    nonce: coin.coin.nonce,
-    value: BigInt(coin.coin.value),
-  })
-  return { nonce: encoded.nonce, color: encoded.color, value: encoded.value }
 }

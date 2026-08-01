@@ -117,23 +117,3 @@ test('place_bet: duplicate pos_nonce rejected (position already exists)', () => 
     'Position already exists',
   );
 });
-
-test('bond payment: wrong-color bond coin rejected in propose and dispute', () => {
-  const sim = DareuV2Sim.deploy({ ownerKey });
-  const m = bytes32('m1');
-  sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW, { challengeWindow: CHALLENGE });
-  sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.betCoin(m, 100n, 'a'), zswapPk('alice'), bytes32('pa'), NOW);
-  sim.placeBet(bytes32('bob'), m, Outcome.NO, 100n, sim.betCoin(m, 100n, 'b'), zswapPk('bob'), bytes32('pb'), NOW);
-  const deadline = BigInt(AFTER_CLOSE) + CHALLENGE;
-  // propose with wrong-color bond.
-  expectRevert(
-    () => sim.proposeResolution(proposerKey, m, Outcome.YES, deadline, sim.coinOfColor(bytes32('x'), BOND, 'p'), zswapPk('proposer'), AFTER_CLOSE),
-    'Bond coin is not sNIGHT',
-  );
-  // Now propose correctly, then dispute with wrong-color counter-bond.
-  sim.proposeResolution(proposerKey, m, Outcome.YES, deadline, sim.snightCoin(BOND, 'p'), zswapPk('proposer'), AFTER_CLOSE);
-  expectRevert(
-    () => sim.disputeResolution(bytes32('disputer'), m, sim.coinOfColor(bytes32('y'), BOND, 'd'), zswapPk('disputer'), AFTER_CLOSE + 1),
-    'Bond coin is not sNIGHT',
-  );
-});

@@ -12,8 +12,6 @@ import { configureKeeperCategory, requiredKeeperCategory } from './scope-v2.js'
 // On-chain enums → the lowercase strings the webapp/Postgres mirror columns expect.
 const STATUS_TEXT: Record<number, string> = {
   [MarketStatus.OPEN]: 'open',
-  [MarketStatus.PROPOSED]: 'proposed',
-  [MarketStatus.DISPUTED]: 'disputed',
   [MarketStatus.RESOLVED]: 'resolved',
   [MarketStatus.CANCELLED]: 'cancelled',
 }

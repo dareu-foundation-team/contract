@@ -17,17 +17,15 @@ import {
 const NOW = 1_900_000_000;
 const CLOSE = BigInt(NOW + 86_400);
 const AFTER_CLOSE = NOW + 90_000;
-const CHALLENGE = 7200n;
 
 const ownerKey = bytes32('owner');
 const oracleKey = bytes32('oracle');
-const proposerKey = bytes32('proposer');
 const aliceKey = bytes32('alice');
 const bobKey = bytes32('bob');
 
 /**
  * Set up a market with two bets (YES from alice, NO from bob), close it, and
- * resolve it to `outcome` via propose+finalize. Returns the market id, the two
+ * resolve it directly to `outcome`. Returns the market id, the two
  * position ids, and the pool sizes. platformBps defaults to 200 (2%).
  */
 function resolvedTwoSided(opts?: {
@@ -44,7 +42,6 @@ function resolvedTwoSided(opts?: {
   const sim = DareuV2Sim.deploy({ ownerKey });
   const m = bytes32('m1');
   sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW, {
-    challengeWindow: CHALLENGE,
     platformBps,
   });
   const aliceNonce = bytes32('pn-alice');
@@ -52,10 +49,7 @@ function resolvedTwoSided(opts?: {
   const alicePos = sim.placeBet(aliceKey, m, Outcome.YES, yesAmount, sim.betCoin(m, yesAmount, 'a'), zswapPk('alice'), aliceNonce, NOW);
   const bobPos = sim.placeBet(bobKey, m, Outcome.NO, noAmount, sim.betCoin(m, noAmount, 'b'), zswapPk('bob'), bobNonce, NOW);
 
-  // Resolve via optimistic oracle: propose `outcome`, finalize after deadline.
-  const deadline = BigInt(AFTER_CLOSE) + CHALLENGE;
-  sim.proposeResolution(proposerKey, m, outcome, deadline, sim.snightCoin(1_000_000n, 'bond'), zswapPk('proposer'), AFTER_CLOSE);
-  sim.finalizeProposal(ownerKey, m, Number(deadline) + 1);
+  sim.resolveMarket(oracleKey, m, outcome, AFTER_CLOSE);
 
   return { sim, m, alicePos, bobPos, yesAmount, noAmount, platformBps };
 }
@@ -221,11 +215,9 @@ test('floor-bracket: one-sided market (no losers) yields zero profit', () => {
   // Everyone bets YES; market resolves YES. losers(no)=0 so gross_profit=0, fee=0.
   const sim = DareuV2Sim.deploy({ ownerKey });
   const m = bytes32('m-oneside');
-  sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW, { challengeWindow: CHALLENGE });
+  sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW);
   const pos = sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.betCoin(m, 100n, 'a'), zswapPk('alice'), bytes32('pn'), NOW);
-  const deadline = BigInt(AFTER_CLOSE) + CHALLENGE;
-  sim.proposeResolution(proposerKey, m, Outcome.YES, deadline, sim.snightCoin(1_000_000n, 'bond'), zswapPk('proposer'), AFTER_CLOSE);
-  sim.finalizeProposal(ownerKey, m, Number(deadline) + 1);
+  sim.resolveMarket(oracleKey, m, Outcome.YES, AFTER_CLOSE);
   // gross_profit is 0 but the up-front stake fee remains earned after resolution.
   const stakeFee = sim.stakeFee(m, 100n);
   sim.claimSettled(aliceKey, pos, zswapPk('alice'), sim.ticketFor(pos), 0n, stakeFee, NOW);

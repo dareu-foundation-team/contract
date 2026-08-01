@@ -19,6 +19,7 @@ import {
 } from '../shared/midnight.js';
 import { resolveNetwork } from '../shared/network.js';
 import { resolveContractMaintenanceAuthority } from '../shared/chain.js';
+import { DIRECT_PROTOCOL_VERSION } from '../shared/protocol.js';
 import { Contract, pureCircuits, type Witnesses } from '../../src/managed/dareu-v2/contract/index.js';
 
 // DareU V2 per-asset deploy. The resulting address and sNIGHT color are written to
@@ -28,7 +29,6 @@ import { Contract, pureCircuits, type Witnesses } from '../../src/managed/dareu-
 
 const deploymentDir = path.join(contractRoot, 'deployments');
 const envFiles = ['.env', '.env.local'];
-// v2 has its own compiled output + zk assets (separate from v1's src/managed/dareu).
 const zkConfigPathV2 = path.resolve(contractRoot, 'src', 'managed', 'dareu-v2');
 
 function loadEnvFiles() {
@@ -90,17 +90,6 @@ function pad32Utf8(value: string, label: string): Uint8Array {
   const out = new Uint8Array(32);
   out.set(encoded);
   return out;
-}
-
-function parseBigIntEnv(name: string, fallback: bigint) {
-  const value = process.env[name]?.trim();
-  if (!value) return fallback;
-  try {
-    const parsed = BigInt(value);
-    return parsed >= 0n ? parsed : fallback;
-  } catch {
-    return fallback;
-  }
 }
 
 function bigintJson(_key: string, value: unknown) {
@@ -178,17 +167,14 @@ async function main() {
   const ownerSecretKey = parseHexBytes(requiredEnv('DAREU_OWNER_SECRET_KEY'), 32, 'DAREU_OWNER_SECRET_KEY');
   const ownerParticipantId = pureCircuits.participant_id(ownerSecretKey);
 
-  // Operator (hot key): constructor wants only its PUBLIC participant_id, derived
-  // here from an optional secret key. Absent -> all-zero sentinel -> contract
-  // defaults operator = owner (fine for a throwaway demo / single-key deploy).
-  const operatorSecretKey = parseOptionalHexBytes(
-    process.env.DAREU_OPERATOR_SECRET_KEY,
+  // Operator (hot key) is explicit. Direct-resolution deployments never fall
+  // back to loading or authorizing the cold owner key for routine keeper work.
+  const operatorSecretKey = parseHexBytes(
+    requiredEnv('DAREU_OPERATOR_SECRET_KEY'),
     32,
     'DAREU_OPERATOR_SECRET_KEY',
   );
-  const operatorParticipantId = operatorSecretKey
-    ? pureCircuits.participant_id(operatorSecretKey)
-    : new Uint8Array(32); // all-zero sentinel -> constructor defaults to owner
+  const operatorParticipantId = pureCircuits.participant_id(operatorSecretKey);
 
   // underlying: the vault's base asset color. Zero bytes = native NIGHT
   // (nativeToken()'s raw color happens to be the all-zero RawTokenType on Midnight;
@@ -201,9 +187,6 @@ async function main() {
   const tokenDomainStr = process.env.DAREU_V2_TOKEN_DOMAIN?.trim() || 'dareu:snight:v1';
   const domain = pad32Utf8(tokenDomainStr, 'DAREU_V2_TOKEN_DOMAIN');
 
-  const initBond = parseBigIntEnv('DAREU_V2_BOND', 1_000_000n);
-  const initThreshold = parseBigIntEnv('DAREU_V2_THRESHOLD', 1n);
-
   const privateStateId = process.env.DAREU_V2_PRIVATE_STATE_ID?.trim() || `dareu-v2-${network}`;
 
   console.log(`Deploying DareU v2 (demo) contract to Midnight ${network}.`);
@@ -213,13 +196,8 @@ async function main() {
   console.log(`Proof server: ${config.proofServer}`);
   console.log(`token_domain: "${tokenDomainStr}" (${toHex(domain)})`);
   console.log(`underlying: ${toHex(underlying)} (all-zero = native NIGHT)`);
-  console.log(`init_bond: ${initBond.toString()}  init_threshold: ${initThreshold.toString()}`);
   console.log(`owner participant_id: ${toHex(ownerParticipantId)}`);
-  console.log(
-    operatorSecretKey
-      ? `operator participant_id: ${toHex(operatorParticipantId)}`
-      : 'operator: not provided -> defaults to owner (DAREU_OPERATOR_SECRET_KEY not set)',
-  );
+  console.log(`operator participant_id: ${toHex(operatorParticipantId)}`);
   const cma = resolveContractMaintenanceAuthority();
   await ensureProofServer(config.proofServer);
 
@@ -239,7 +217,7 @@ async function main() {
     console.log('Submitting deploy transaction...');
     const deployed = await deployContract(providers as any, {
       compiledContract,
-      args: [ownerSecretKey, underlying, domain, initBond, initThreshold, operatorParticipantId],
+      args: [ownerSecretKey, underlying, domain, operatorParticipantId],
       privateStateId,
       initialPrivateState: {},
       signingKey: cma.signingKey,
@@ -255,6 +233,7 @@ async function main() {
 
     const deployment = {
       contractName: 'dareu-v2',
+      protocolVersion: DIRECT_PROTOCOL_VERSION,
       network,
       contractAddress,
       txId: String(deployed.deployTxData.public.txId),
@@ -272,11 +251,8 @@ async function main() {
         underlyingHex: toHex(underlying),
         tokenDomain: tokenDomainStr,
         tokenDomainHex: toHex(domain),
-        initBond,
-        initThreshold,
         ownerParticipantIdHex: toHex(ownerParticipantId),
         operatorParticipantIdHex: toHex(operatorParticipantId),
-        operatorDefaultedToOwner: !operatorSecretKey,
       },
       snightColorHex,
       maintenanceAuthorityHex: cma.verifyingKeyHex ?? null,

@@ -2,7 +2,6 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { CompiledContract } from '@midnight-ntwrk/compact-js';
 import { httpClientProofProvider } from '@midnight-ntwrk/midnight-js-http-client-proof-provider';
 import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
 import { levelPrivateStateProvider } from '@midnight-ntwrk/midnight-js-level-private-state-provider';
@@ -26,7 +25,6 @@ import * as ledger from '@midnight-ntwrk/midnight-js-protocol/ledger';
 import * as Rx from 'rxjs';
 import WebSocket from 'ws';
 
-import { Contract, type Witnesses } from '../../src/managed/dareu/contract/index.js';
 import { type SupportedNetwork, type NetworkConfig, resolveNetworkConfig } from './network.js';
 
 type WalletSyncedState = Awaited<ReturnType<WalletFacade['waitForSyncedState']>>;
@@ -43,7 +41,7 @@ export type WalletContext = {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // This file lives in scripts/shared/, so the contract root is two levels up.
 export const contractRoot = path.resolve(__dirname, '..', '..');
-export const zkConfigPath = path.resolve(contractRoot, 'src', 'managed', 'dareu');
+export const zkConfigPath = path.resolve(contractRoot, 'src', 'managed', 'dareu-v2');
 
 // On-disk cache of synced wallet state so repeated deploy/keeper runs sync
 // incrementally instead of replaying ~1M events from scratch each time.
@@ -204,34 +202,6 @@ export function isWalletStateSyncedWithin(
 export function configureNetwork(network: SupportedNetwork): NetworkConfig {
   setNetworkId(network);
   return resolveNetworkConfig(network);
-}
-
-// The contract uses no per-session private state (the secret key is captured by the
-// closure below, not stored in private state), so the private-state type is an empty
-// record — matching the `initialPrivateState: {}` used by deploy.ts / chain.ts.
-type DareuPrivateState = Record<string, never>;
-
-export function createCompiledDareuContract(localSecretKey: Uint8Array) {
-  const witnesses: Witnesses<DareuPrivateState> = {
-    local_secret_key: ({ privateState }) => [privateState, localSecretKey],
-  };
-
-  // Effect-style Pipeable: apply both data-last transforms in one variadic pipe.
-  // Chaining `.pipe(a).pipe(b)` fails because the intermediate value isn't pipeable.
-  return CompiledContract.make('dareu', Contract).pipe(
-    CompiledContract.withWitnesses(witnesses),
-    CompiledContract.withCompiledFileAssets(zkConfigPath),
-  );
-}
-
-export function ensureCompiledContract() {
-  const contractIndex = path.join(zkConfigPath, 'contract', 'index.js');
-  const keyDir = path.join(zkConfigPath, 'keys');
-  const zkirDir = path.join(zkConfigPath, 'zkir');
-
-  if (!fs.existsSync(contractIndex) || !fs.existsSync(keyDir) || !fs.existsSync(zkirDir)) {
-    throw new Error('DareU contract is not compiled. Run: npm run build:contract');
-  }
 }
 
 const SEED_HEX_RE = /^[0-9a-fA-F]+$/;
@@ -644,9 +614,9 @@ export async function waitForSyncedState(wallet: WalletFacade) {
 }
 
 export type CreateProvidersOptions = {
-  /** Compiled-contract asset dir (defaults to the v1 `managed/dareu`). Threading it
+  /** Compiled-contract asset dir (defaults to the active V2 assets). Threading it
    *  here (instead of overwriting `providers.zkConfigProvider` after the fact, as
-   *  deploy-v2/market-v2 historically did) also points the proofProvider at the
+   *  separate deploy/market callers historically did) also points the proofProvider at the
    *  right prover keys, since it is constructed from this same zkConfigProvider. */
   zkConfigPath?: string;
   /** Circuit assets that this workflow will use. The upstream HTTP proof provider
@@ -654,9 +624,8 @@ export type CreateProvidersOptions = {
    *  turn a missing/wrong asset directory into an opaque proof-server `bad input`.
    *  Loading these circuits here makes that configuration error fail locally. */
   expectedCircuitIds?: readonly string[];
-  /** Which token kinds balanceTx may spend. v1 circuits only ever need
-   *  ['unshielded','dust']; v2 circuits that take a ShieldedCoinInfo argument
-   *  (propose/dispute bond, place_bet) need 'shielded' balancing too — pass 'all'. */
+  /** Which token kinds balanceTx may spend. V2 `place_bet` takes a
+   *  ShieldedCoinInfo argument, so transaction flows normally pass `all`. */
   tokenKindsToBalance?: 'all' | Array<'unshielded' | 'dust' | 'shielded'>;
 };
 

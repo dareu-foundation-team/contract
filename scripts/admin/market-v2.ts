@@ -16,7 +16,8 @@ import {
   waitForDustSyncedState,
 } from '../shared/midnight.js';
 import { resolveNetwork } from '../shared/network.js';
-import { Contract, pureCircuits, type Witnesses } from '../../src/managed/dareu-v2/contract/index.js';
+import { DIRECT_PROTOCOL_VERSION } from '../shared/protocol.js';
+import { Contract, Outcome, pureCircuits, type Witnesses } from '../../src/managed/dareu-v2/contract/index.js';
 
 // Minimal admin CLI for the v2 THROWAWAY demo instance: creates ONE demo market so
 // the webapp's /debug/v2-demo page has something to place_bet / claim_settled
@@ -27,9 +28,8 @@ import { Contract, pureCircuits, type Witnesses } from '../../src/managed/dareu-
 //   npm run market:v2:create -- preprod   (reads DAREU_V2_MARKET_* env, or uses
 //                                           built-in defaults for a quick demo)
 //
-// Auth: create_market requires owner OR operator. Prefers DAREU_OPERATOR_SECRET_KEY
-// (the least-privilege hot key, matching how the real keeper would call this) and
-// falls back to DAREU_OWNER_SECRET_KEY if no operator key is configured.
+// Auth: the CLI always uses the least-privilege hot operator key. The owner key
+// remains cold and is not a runtime fallback.
 
 const zkConfigPathV2 = path.resolve(contractRoot, 'src', 'managed', 'dareu-v2');
 const envFiles = ['.env', '.env.local'];
@@ -75,6 +75,11 @@ function readDeploymentV2(network: string): { contractAddress: string; privateSt
     throw new Error(`No v2 deployment record at ${deploymentPath}. Run "npm run deploy:v2:${network}" first.`);
   }
   const record = JSON.parse(fs.readFileSync(deploymentPath, 'utf8')) as Record<string, unknown>;
+  if (record.protocolVersion !== DIRECT_PROTOCOL_VERSION) {
+    throw new Error(
+      `${deploymentPath} is not a ${DIRECT_PROTOCOL_VERSION} deployment. Deploy a fresh direct-resolution contract.`,
+    );
+  }
   return {
     contractAddress: String(record.contractAddress),
     privateStateId: typeof record.privateStateId === 'string' ? record.privateStateId : `dareu-v2-${network}`,
@@ -95,7 +100,7 @@ function createCompiledDareuV2Contract(localSecretKey: Uint8Array) {
 async function connectDemoV2(
   network: ReturnType<typeof resolveNetwork>,
   callerSecretKey: Uint8Array,
-  expectedCircuitId: 'create_market' | 'cancel_market',
+  expectedCircuitId: 'create_market' | 'resolve_market' | 'cancel_market',
 ) {
   const config = configureNetwork(network);
   const walletSeed = requiredWalletSeedOrMnemonic();
@@ -108,8 +113,7 @@ async function connectDemoV2(
 
   const providers = await createProviders(walletCtx, config, privateStoragePassword, {
     zkConfigPath: zkConfigPathV2,
-    // `deposit` is v2-only, so this also catches an accidental fallback to the v1
-    // asset directory even though create_market/cancel_market exist in both.
+    // `deposit` confirms that the active V2 proving assets are available.
     expectedCircuitIds: ['deposit', expectedCircuitId],
     tokenKindsToBalance: 'all',
   });
@@ -125,10 +129,11 @@ async function connectDemoV2(
   return { deployed, walletCtx };
 }
 
-function callerSecretKey(): { key: Uint8Array; role: 'operator' | 'owner' } {
-  const operator = optionalEnv('DAREU_OPERATOR_SECRET_KEY');
-  if (operator) return { key: parseHexBytes(operator, 32, 'DAREU_OPERATOR_SECRET_KEY'), role: 'operator' };
-  return { key: parseHexBytes(requiredEnv('DAREU_OWNER_SECRET_KEY'), 32, 'DAREU_OWNER_SECRET_KEY'), role: 'owner' };
+function callerSecretKey(): { key: Uint8Array; role: 'operator' } {
+  return {
+    key: parseHexBytes(requiredEnv('DAREU_OPERATOR_SECRET_KEY'), 32, 'DAREU_OPERATOR_SECRET_KEY'),
+    role: 'operator',
+  };
 }
 
 function logTx(label: string, result: unknown) {
@@ -157,7 +162,6 @@ async function createDemoMarket(network: ReturnType<typeof resolveNetwork>) {
   const closeTime = BigInt(
     optionalEnv('DAREU_V2_MARKET_CLOSE_TIME') ?? String(Math.floor(Date.now() / 1000) + 3600), // +1h
   );
-  const challengeWindow = BigInt(optionalEnv('DAREU_V2_MARKET_CHALLENGE_WINDOW') ?? '60'); // min allowed
   const platformFeeRate = BigInt(optionalEnv('DAREU_V2_MARKET_FEE_BPS') ?? '100'); // 1%
   const bettingCutoff = BigInt(optionalEnv('DAREU_V2_MARKET_BETTING_CUTOFF') ?? '60'); // min allowed
 
@@ -171,7 +175,6 @@ async function createDemoMarket(network: ReturnType<typeof resolveNetwork>) {
       metadataHash,
       oracleParticipantId,
       closeTime,
-      challengeWindow,
       platformFeeRate,
       bettingCutoff,
     );
@@ -196,6 +199,24 @@ async function cancelDemoMarket(network: ReturnType<typeof resolveNetwork>) {
   }
 }
 
+async function resolveDemoMarket(network: ReturnType<typeof resolveNetwork>) {
+  const { key } = callerSecretKey();
+  const marketId = parseHexBytes(requiredEnv('DAREU_V2_MARKET_ID'), 32, 'DAREU_V2_MARKET_ID');
+  const rawOutcome = requiredEnv('DAREU_V2_MARKET_OUTCOME').toLowerCase();
+  if (rawOutcome !== 'yes' && rawOutcome !== 'no') {
+    throw new Error('DAREU_V2_MARKET_OUTCOME must be yes or no.');
+  }
+  const outcome = rawOutcome === 'yes' ? Outcome.YES : Outcome.NO;
+
+  const { deployed, walletCtx } = await connectDemoV2(network, key, 'resolve_market');
+  try {
+    const result = await deployed.callTx.resolve_market(marketId, outcome);
+    logTx('resolve_market', result);
+  } finally {
+    await walletCtx.wallet.stop();
+  }
+}
+
 async function main() {
   loadEnvFiles();
   const command = process.argv[2];
@@ -203,9 +224,10 @@ async function main() {
   setNetworkId(network);
 
   if (command === 'create') return createDemoMarket(network);
+  if (command === 'resolve') return resolveDemoMarket(network);
   if (command === 'cancel') return cancelDemoMarket(network);
 
-  throw new Error('Usage: tsx scripts/admin/market-v2.ts <create|cancel> <network>');
+  throw new Error('Usage: tsx scripts/admin/market-v2.ts <create|resolve|cancel> <network>');
 }
 
 main().catch((error) => {

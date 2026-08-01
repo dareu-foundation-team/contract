@@ -2,7 +2,6 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 
 import pg from 'pg'
-import { findDeployedContract } from '@midnight-ntwrk/midnight-js-contracts'
 import { fromHex } from '@midnight-ntwrk/midnight-js-utils'
 import {
   signingKeyFromBip340,
@@ -10,61 +9,21 @@ import {
   type SigningKey,
 } from '@midnight-ntwrk/midnight-js-protocol/ledger'
 
-import {
-  configureNetwork,
-  contractRoot,
-  createCompiledDareuContract,
-  createProviders,
-  createWallet,
-  ensureCompiledContract,
-  requiredWalletSeedOrMnemonic,
-  waitForDustSyncedState,
-} from './midnight.js'
-import { type SupportedNetwork } from './network.js'
+import { contractRoot } from './midnight.js'
 
-// Re-export so existing importers (admin/market.ts, keeper/*) keep getting
-// resolveNetwork from chain.js; the implementation lives in network.ts.
+// Re-export for the current V2 admin and Keeper entrypoints.
 export { resolveNetwork } from './network.js'
 
-// Shared chain/env infrastructure: env loading, network resolution, deployment
-// lookup, Postgres exec, and `connectKeeper` (owner-authenticated contract handle).
-// Consumed by BOTH the local admin scripts (deploy.ts, market.ts) and the keeper
-// SERVICE (scripts/keeper/*). It is plumbing, not an entrypoint.
+// Shared env, Postgres and maintenance-authority infrastructure.
 
 const defaultEnvFiles = ['.env', '.env.local']
 
 // One-shot Postgres exec (standard `pg`; opens/closes a connection per call).
-// Shared by the local market admin and the keeper service.
 export async function pgExec(connectionString: string, text: string, params: unknown[]) {
   const client = new pg.Client({ connectionString })
   await client.connect()
   try {
     return await client.query(text, params)
-  } finally {
-    await client.end()
-  }
-}
-
-// Run several statements atomically in one connection/transaction. Used where the
-// spec requires syncing PG status across markets + resolutions in a single tx
-// (propose / finalize / cancel). Rolls back on any error.
-export async function pgTx(
-  connectionString: string,
-  fn: (client: pg.Client) => Promise<void>,
-): Promise<void> {
-  const client = new pg.Client({ connectionString })
-  await client.connect()
-  try {
-    await client.query('BEGIN')
-    await fn(client)
-    await client.query('COMMIT')
-  } catch (err) {
-    try {
-      await client.query('ROLLBACK')
-    } catch {
-      /* ignore rollback failure */
-    }
-    throw err
   } finally {
     await client.end()
   }
@@ -172,58 +131,4 @@ export function resolveContractMaintenanceAuthority(): ContractMaintenanceAuthor
   console.log(`CMA verifying key: ${verifyingKeyHex}`)
 
   return { signingKey: cmaSigningKey, verifyingKeyHex, deterministic: true }
-}
-
-export function readDeployment(network: SupportedNetwork): { contractAddress: string; privateStateId: string } {
-  const deploymentPath = path.join(contractRoot, 'deployments', `${network}.json`)
-  if (!fs.existsSync(deploymentPath)) {
-    throw new Error(`No deployment record at ${deploymentPath}. Run "npm run deploy:${network}" first.`)
-  }
-  const record = JSON.parse(fs.readFileSync(deploymentPath, 'utf8')) as Record<string, unknown>
-  return {
-    contractAddress: String(record.contractAddress),
-    privateStateId: typeof record.privateStateId === 'string' ? record.privateStateId : `dareu-${network}`,
-  }
-}
-
-export type KeeperContext = {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  deployed: any
-  walletCtx: Awaited<ReturnType<typeof createWallet>>
-  ownerSecretKey: Uint8Array
-}
-
-/**
- * Connect to the deployed DareU contract with the owner key so owner/oracle
- * circuits authorize. Assumes the wallet is already funded with DUST (run the
- * deploy script / faucet first); we only wait for DUST sync here.
- */
-export async function connectKeeper(network: SupportedNetwork): Promise<KeeperContext> {
-  ensureCompiledContract()
-  const config = configureNetwork(network)
-  const walletSeed = requiredWalletSeedOrMnemonic()
-  const privateStoragePassword = requiredEnv('MIDNIGHT_PRIVATE_STATE_PASSWORD')
-  const ownerSecretKey = parseHexBytes(requiredEnv('DAREU_OWNER_SECRET_KEY'), 32, 'DAREU_OWNER_SECRET_KEY')
-  const { contractAddress, privateStateId } = readDeployment(network)
-
-  const walletCtx = await createWallet(walletSeed, network, config)
-  await waitForDustSyncedState(walletCtx.wallet)
-  // Cache the synced wallet state so the next keeper run resyncs incrementally.
-  await walletCtx.saveState()
-
-  const providers = await createProviders(walletCtx, config, privateStoragePassword)
-  const compiledContract = createCompiledDareuContract(ownerSecretKey)
-
-  // CONFIRM against a live deployment: findDeployedContract option shape mirrors
-  // deployContract's (compiledContract + privateStateId). Casts match deploy.ts.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const deployed = await findDeployedContract(providers as any, {
-    compiledContract,
-    contractAddress,
-    privateStateId,
-    initialPrivateState: {},
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } as any)
-
-  return { deployed, walletCtx, ownerSecretKey }
 }

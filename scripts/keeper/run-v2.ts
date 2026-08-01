@@ -1,7 +1,7 @@
 // Keeper SERVICE entrypoint — v2 contract. One long-running process, same cycle
 // shape as run.ts:
 //   sync (mirror on-chain status/pools, correct PG) → publish drafts →
-//   propose (sNIGHT bond) → finalize → cancel → stuck-cancel.
+//   direct resolve → cancel.
 // sync runs FIRST so the loops see fresh onchain_status before deciding to send a
 // tx (avoids duplicate on-chain submission). Holds the OPERATOR hot key (owner
 // key stays cold — D8) + needs the proof server.
@@ -10,11 +10,9 @@
 import { loadEnvFiles, optionalEnv, resolveNetwork } from '../shared/chain.js'
 import { publishDraftsV2 } from './publish-v2.js'
 import {
-  autoProposeResolutionsV2,
-  finalizeProposalsV2,
+  resolveMarketsV2,
   cancelRequestedV2,
-  cancelStuckV2,
-} from './autopropose-v2.js'
+} from './resolve-v2.js'
 import { syncOnceV2 } from './sync-v2.js'
 import { resolveDeploymentV2 } from '../shared/chain-v2.js'
 import {
@@ -34,7 +32,7 @@ async function main() {
     `[keeper-v2] registry ${deployment.registryAddress} → ${deployment.symbol} ` +
       `${deployment.contractAddress} (${deployment.decimals} decimals, enabled)`,
   )
-  console.log(`[keeper-v2:${category}] up — full cycle (sync+publish+propose+finalize+cancel+stuck-cancel) every ${cycleSec}s`)
+  console.log(`[keeper-v2:${category}] up — full cycle (sync+publish+resolve+cancel) every ${cycleSec}s`)
 
   for (;;) {
     let cycleFailed = false
@@ -42,10 +40,8 @@ async function main() {
       // sync FIRST: mirror chain state so the loops below see fresh onchain_status.
       await syncOnceV2(network)
       await publishDraftsV2(network)
-      await autoProposeResolutionsV2(network)
-      await finalizeProposalsV2(network)
+      await resolveMarketsV2(network)
       await cancelRequestedV2(network)
-      await cancelStuckV2(network)
     } catch (err) {
       console.error(`[keeper-v2:${category}] cycle error:`, errorMessage(err))
       if (isKeeperTransactionTimeout(err)) {

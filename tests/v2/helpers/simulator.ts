@@ -43,10 +43,9 @@ import {
   type Ledger,
   type Witnesses,
   Outcome,
-  Role,
 } from '../../../src/managed/dareu-v2/contract/index.js';
 
-export { Outcome, Role };
+export { Outcome };
 export type { Ledger };
 
 type PS = Record<string, never>;
@@ -176,9 +175,6 @@ export class DareuV2Sim {
     ownerKey: Uint8Array;
     underlying?: Uint8Array;
     domain?: Uint8Array;
-    initBond?: bigint;
-    initThreshold?: bigint;
-    /** Pass EMPTY_ID (default) to exercise the "operator defaults to owner" path. */
     operatorId?: Uint8Array;
   }): DareuV2Sim {
     const underlying = args.underlying ?? bytes32('night');
@@ -190,9 +186,7 @@ export class DareuV2Sim {
       args.ownerKey,
       underlying,
       domain,
-      args.initBond ?? 1_000_000n,
-      args.initThreshold ?? 1n,
-      args.operatorId ?? EMPTY_ID,
+      args.operatorId ?? participantId(args.ownerKey),
     );
     const sim = new DareuV2Sim(res.currentContractState.data, underlying, domain, addr);
     // Overwrite the sampled address so it matches the one used for tokenType.
@@ -300,7 +294,6 @@ export class DareuV2Sim {
     time: number,
     opts?: {
       metadataHash?: Uint8Array;
-      challengeWindow?: bigint;
       platformBps?: bigint;
       bettingCutoff?: bigint;
     },
@@ -312,7 +305,6 @@ export class DareuV2Sim {
         opts?.metadataHash ?? bytes32(`meta:${toHex(marketId).slice(0, 6)}`),
         oracleId,
         closeTime,
-        opts?.challengeWindow ?? 7200n,
         opts?.platformBps ?? 200n,
         opts?.bettingCutoff ?? 300n,
       ),
@@ -350,38 +342,8 @@ export class DareuV2Sim {
     );
   }
 
-  proposeResolution(
-    proposer: Uint8Array,
-    marketId: Uint8Array,
-    result: Outcome,
-    deadline: bigint,
-    coin: { nonce: Uint8Array; color: Uint8Array; value: bigint },
-    refundPk: { bytes: Uint8Array },
-    time: number,
-  ): void {
-    this.run(proposer, time, (c, ctx) =>
-      c.impureCircuits.propose_resolution(ctx, marketId, result, deadline, coin, refundPk),
-    );
-  }
-
-  disputeResolution(
-    disputer: Uint8Array,
-    marketId: Uint8Array,
-    coin: { nonce: Uint8Array; color: Uint8Array; value: bigint },
-    refundPk: { bytes: Uint8Array },
-    time: number,
-  ): void {
-    this.run(disputer, time, (c, ctx) =>
-      c.impureCircuits.dispute_resolution(ctx, marketId, coin, refundPk),
-    );
-  }
-
-  finalizeProposal(caller: Uint8Array, marketId: Uint8Array, time: number): void {
-    this.run(caller, time, (c, ctx) => c.impureCircuits.finalize_proposal(ctx, marketId));
-  }
-
-  voteDispute(arbiter: Uint8Array, marketId: Uint8Array, result: Outcome, time: number): void {
-    this.run(arbiter, time, (c, ctx) => c.impureCircuits.vote_dispute(ctx, marketId, result));
+  resolveMarket(caller: Uint8Array, marketId: Uint8Array, result: Outcome, time: number): void {
+    this.run(caller, time, (c, ctx) => c.impureCircuits.resolve_market(ctx, marketId, result));
   }
 
   cancelMarket(caller: Uint8Array, marketId: Uint8Array, time: number): void {
@@ -390,14 +352,13 @@ export class DareuV2Sim {
 
   // ---- Admin ----
 
-  setRole(
+  setOperator(
     owner: Uint8Array,
-    role: Role,
     participant: Uint8Array,
     enabled: boolean,
     time: number,
   ): void {
-    this.run(owner, time, (c, ctx) => c.impureCircuits.set_role(ctx, role, participant, enabled));
+    this.run(owner, time, (c, ctx) => c.impureCircuits.set_operator(ctx, participant, enabled));
   }
 
   withdrawTreasury(

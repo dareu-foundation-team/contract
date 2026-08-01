@@ -1,7 +1,6 @@
 // Keeper SERVICE: publish drafted markets on-chain — v2 contract.
 //
-// Identical Postgres contract and circuit signature to publish.ts (v1 and v2
-// create_market take the same seven args); only the connection layer differs:
+// Publishes the direct-resolution V2 create_market ABI; only the connection layer differs:
 // dareu-v2 assets + the hot OPERATOR key (create_market authorizes owner OR
 // operator — D8 keeps the owner key off the keeper server).
 //
@@ -34,20 +33,19 @@ export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>
   const minLeadSec = keeperBatchLimit('PUBLISH_MIN_LEAD_SEC', 120, 'PUBLISH_MAX_MIN_LEAD_SEC', 3600)
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
-  // 🔴 Per-market params come from the PG draft row's mirror columns
-  // (challenge_window / betting_cutoff / platform_fee_rate), written by the
+  // Per-market params come from the PG draft row's mirror columns
+  // (betting_cutoff / platform_fee_rate), written by the
   // dataprovider when it drafted the market — NEVER from env here (spec §6).
   const { rows } = await pgExec(
     dbUrl,
     `SELECT id, metadata_hash, oracle_participant_id,
             EXTRACT(EPOCH FROM close_time)::bigint AS close_unix,
-            challenge_window, betting_cutoff, platform_fee_rate
+            betting_cutoff, platform_fee_rate
        FROM markets
       WHERE (onchain_tx_id IS NULL
              OR onchain_contract_version IS DISTINCT FROM 'v2'
              OR onchain_contract_address IS DISTINCT FROM $2)
         AND status IN ('draft', 'open')
-        AND challenge_window IS NOT NULL
         AND betting_cutoff IS NOT NULL
         AND platform_fee_rate IS NOT NULL
         AND close_time > now() + (betting_cutoff + $3::bigint) * interval '1 second'
@@ -73,7 +71,6 @@ export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>
     metadata_hash: string
     oracle_participant_id: string
     close_unix: string
-    challenge_window: string | number
     betting_cutoff: string | number
     platform_fee_rate: string | number
   }
@@ -109,7 +106,6 @@ export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>
               parseHexBytes(row.metadata_hash, 32, 'metadata_hash'),
               parseHexBytes(row.oracle_participant_id, 32, 'oracle'),
               BigInt(row.close_unix),
-              BigInt(row.challenge_window),
               BigInt(row.platform_fee_rate),
               BigInt(row.betting_cutoff),
             ),

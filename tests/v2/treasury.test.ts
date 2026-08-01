@@ -19,12 +19,9 @@ import {
 const NOW = 1_900_000_000;
 const CLOSE = BigInt(NOW + 86_400);
 const AFTER_CLOSE = NOW + 90_000;
-const CHALLENGE = 7200n;
-const BOND = 1_000_000n;
 
 const ownerKey = bytes32('owner');
 const oracleKey = bytes32('oracle');
-const proposerKey = bytes32('proposer');
 const aliceKey = bytes32('alice');
 const bobKey = bytes32('bob');
 
@@ -32,12 +29,10 @@ const bobKey = bytes32('bob');
 function marketWithAccruedFee(platformBps = 200n) {
   const sim = DareuV2Sim.deploy({ ownerKey });
   const m = bytes32('m1');
-  sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW, { challengeWindow: CHALLENGE, platformBps });
+  sim.createMarket(ownerKey, m, participantId(oracleKey), CLOSE, NOW, { platformBps });
   const alicePos = sim.placeBet(aliceKey, m, Outcome.YES, 100n, sim.betCoin(m, 100n, 'a'), zswapPk('alice'), bytes32('pa'), NOW);
   sim.placeBet(bobKey, m, Outcome.NO, 100n, sim.betCoin(m, 100n, 'b'), zswapPk('bob'), bytes32('pb'), NOW);
-  const deadline = BigInt(AFTER_CLOSE) + CHALLENGE;
-  sim.proposeResolution(proposerKey, m, Outcome.YES, deadline, sim.snightCoin(BOND, 'p'), zswapPk('proposer'), AFTER_CLOSE);
-  sim.finalizeProposal(ownerKey, m, Number(deadline) + 1);
+  sim.resolveMarket(oracleKey, m, Outcome.YES, AFTER_CLOSE);
   const b = payoutBreakdown({ amount: 100n, winners: 100n, losers: 100n, platformBps });
   sim.claimSettled(aliceKey, alicePos, zswapPk('alice'), sim.ticketFor(alicePos), b.grossProfit, b.platformFee, NOW);
   return { sim, m, fee: sim.stakeFee(m, 100n) * 2n };

@@ -17,6 +17,7 @@ import {
 } from '../shared/midnight.js';
 import { resolveNetwork, type SupportedNetwork } from '../shared/network.js';
 import { loadEnvFiles, optionalEnv, parseHexBytes, requiredEnv } from '../shared/chain.js';
+import { DIRECT_PROTOCOL_VERSION } from '../shared/protocol.js';
 import { Contract, type Witnesses } from '../../src/managed/dareu-registry/contract/index.js';
 
 // Asset registry maintenance CLI — adds/updates or disables one asset record in the
@@ -72,16 +73,28 @@ function pad32Utf8(value: string, label: string): Uint8Array {
 
 function readDeploymentAddress(network: SupportedNetwork, suffix: 'v2' | 'registry', envVar: string): string {
   const fromEnv = optionalEnv(envVar);
-  if (fromEnv) return fromEnv;
+  if (fromEnv && suffix === 'registry') return fromEnv;
+  if (fromEnv && suffix === 'v2') {
+    throw new Error(
+      `${envVar} is no longer accepted. Register assets only from a verified ${DIRECT_PROTOCOL_VERSION} deployment record.`,
+    );
+  }
 
   const deploymentPath = path.join(contractRoot, 'deployments', `${network}-${suffix}.json`);
   if (!fs.existsSync(deploymentPath)) {
     throw new Error(
-      `${envVar} is not set and no deployment record exists at ${deploymentPath}. ` +
-        `Set ${envVar} explicitly or run the matching deploy script first.`,
+      suffix === 'v2'
+        ? `No direct-resolution deployment record exists at ${deploymentPath}. Run the V2 deploy script first.`
+        : `${envVar} is not set and no deployment record exists at ${deploymentPath}. ` +
+            `Set ${envVar} explicitly or run the matching deploy script first.`,
     );
   }
   const record = JSON.parse(fs.readFileSync(deploymentPath, 'utf8')) as Record<string, unknown>;
+  if (suffix === 'v2' && record.protocolVersion !== DIRECT_PROTOCOL_VERSION) {
+    throw new Error(
+      `${deploymentPath} is not a ${DIRECT_PROTOCOL_VERSION} deployment. Deploy a fresh direct-resolution contract.`,
+    );
+  }
   const address = record.contractAddress;
   if (typeof address !== 'string' || !address) {
     throw new Error(`Deployment record ${deploymentPath} has no contractAddress.`);
