@@ -24,6 +24,7 @@ import {
 import { optionalEnv, parseHexBytes, pgExec, requiredEnv } from './chain.js'
 import { type SupportedNetwork } from './network.js'
 import { DIRECT_PROTOCOL_VERSION } from './protocol.js'
+import { errorMessage, stopWalletSafely } from '../keeper/reliability.js'
 
 // Active market deployment/connection layer. It uses the hot operator key while
 // the owner stays cold, and enables shielded balancing for sNIGHT bet circuits.
@@ -222,31 +223,45 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
   const deployment = await resolveDeploymentV2(network)
 
   const walletCtx = await createWallet(walletSeed, network, config)
-  // V2 consumes sNIGHT coins. Waiting only for DUST leaves shielded.availableCoins
-  // empty even after a successful deposit, causing repeated bond deposits.
-  await waitForSyncedState(walletCtx.wallet)
-  await walletCtx.saveState()
+  try {
+    // V2 consumes sNIGHT coins. Waiting only for DUST leaves shielded.availableCoins
+    // empty even after a successful deposit, causing repeated bond deposits.
+    await waitForSyncedState(walletCtx.wallet)
+    await walletCtx.saveState()
 
-  const providers = await createProviders(walletCtx, config, privateStoragePassword, {
-    zkConfigPath: zkConfigPathV2,
-    // `deposit` and `resolve_market` identify the direct-resolution V2 artifact.
-    // cannot by themselves detect that the wrong managed-contract directory was
-    // selected. Preflight every circuit this shared connection may submit.
-    expectedCircuitIds: ['deposit', 'resolve_market', 'cancel_market'],
-    tokenKindsToBalance: 'all',
-  })
-  const compiledContract = createCompiledDareuV2Contract(key)
+    const providers = await createProviders(walletCtx, config, privateStoragePassword, {
+      zkConfigPath: zkConfigPathV2,
+      // `deposit` and `resolve_market` identify the direct-resolution V2 artifact.
+      // cannot by themselves detect that the wrong managed-contract directory was
+      // selected. Preflight every circuit this shared connection may submit.
+      expectedCircuitIds: ['deposit', 'resolve_market', 'cancel_market'],
+      tokenKindsToBalance: 'all',
+    })
+    const compiledContract = createCompiledDareuV2Contract(key)
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const deployed = await findDeployedContract(providers as any, {
-    compiledContract,
-    contractAddress: deployment.contractAddress,
-    privateStateId: deployment.privateStateId,
-    initialPrivateState: {},
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } as any)
+    const deployed = await findDeployedContract(providers as any, {
+      compiledContract,
+      contractAddress: deployment.contractAddress,
+      privateStateId: deployment.privateStateId,
+      initialPrivateState: {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any)
 
-  return { deployed, walletCtx, deployment, callerRole: role }
+    return { deployed, walletCtx, deployment, callerRole: role }
+  } catch (error) {
+    // createWallet has already started four long-lived services. If setup fails
+    // before this context reaches the caller, nobody else owns their cleanup.
+    // Save partial sync progress first, then stop them before the supervisor
+    // creates a replacement process.
+    try {
+      await walletCtx.saveState()
+    } catch (saveError) {
+      console.warn(`[keeper-v2] could not save wallet state after setup failure: ${errorMessage(saveError)}`)
+    }
+    await stopWalletSafely(walletCtx.wallet, 'connectKeeperV2 failed setup')
+    throw error
+  }
 }
 
 /** Read-only v2 ledger snapshot from the indexer (no wallet). */

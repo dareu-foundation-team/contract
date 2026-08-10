@@ -32,6 +32,12 @@ export DAREU_ENV_FILE="$KEEPER_ENV_FILE"
 export DAREU_KEEPER_CATEGORY="$CATEGORY"
 export MIDNIGHT_WALLET_CACHE_NAMESPACE="${MIDNIGHT_WALLET_CACHE_NAMESPACE:-$CATEGORY}"
 export MIDNIGHT_PRIVATE_STATE_NAMESPACE="${MIDNIGHT_PRIVATE_STATE_NAMESPACE:-$CATEGORY}"
+# A new wallet can need hours to replay the preprod DUST history. The generic
+# five-minute SDK guard is suitable for interactive commands, but it makes a
+# keeper repeatedly abandon healthy progress. Checkpoint often so an actual
+# disconnect/restart resumes close to the last applied event.
+export MIDNIGHT_WALLET_SYNC_TIMEOUT_MS="${MIDNIGHT_WALLET_SYNC_TIMEOUT_MS:-21600000}"
+export MIDNIGHT_WALLET_CHECKPOINT_EVERY="${MIDNIGHT_WALLET_CHECKPOINT_EVERY:-10000}"
 
 stop_process_tree() {
   local parent_pid="$1"

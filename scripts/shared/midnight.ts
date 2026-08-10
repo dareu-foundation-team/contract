@@ -10,17 +10,20 @@ import { NodeZkConfigProvider } from '@midnight-ntwrk/midnight-js-node-zk-config
 import { ApiPromise, WsProvider } from '@polkadot/api';
 import { u8aToHex } from '@polkadot/util';
 import { WalletFacade } from '@midnight-ntwrk/wallet-sdk-facade';
-import { DustWallet } from '@midnight-ntwrk/wallet-sdk-dust-wallet';
+import { CustomDustWallet } from '@midnight-ntwrk/wallet-sdk-dust-wallet';
+import { V1Builder as DustV1Builder } from '@midnight-ntwrk/wallet-sdk-dust-wallet/v1';
 import { HDWallet, Roles } from '@midnight-ntwrk/wallet-sdk-hd';
 import { mnemonicToSeedSync, validateMnemonic } from '@scure/bip39';
 import { wordlist as englishWordlist } from '@scure/bip39/wordlists/english.js';
-import { ShieldedWallet } from '@midnight-ntwrk/wallet-sdk-shielded';
+import { CustomShieldedWallet } from '@midnight-ntwrk/wallet-sdk-shielded';
+import { V1Builder as ShieldedV1Builder } from '@midnight-ntwrk/wallet-sdk-shielded/v1';
 import {
   createKeystore,
   PublicKey,
   UnshieldedWallet,
 } from '@midnight-ntwrk/wallet-sdk-unshielded-wallet';
 import { NoOpTransactionHistoryStorage, TransactionHistoryStorage } from '@midnight-ntwrk/wallet-sdk-abstractions';
+import { Effect } from 'effect';
 import * as ledger from '@midnight-ntwrk/midnight-js-protocol/ledger';
 import * as Rx from 'rxjs';
 import WebSocket from 'ws';
@@ -28,6 +31,28 @@ import WebSocket from 'ws';
 import { type SupportedNetwork, type NetworkConfig, resolveNetworkConfig } from './network.js';
 
 type WalletSyncedState = Awaited<ReturnType<WalletFacade['waitForSyncedState']>>;
+
+/**
+ * Headless admin/Keeper processes never expose transaction history. The wallet
+ * SDK's default shielded/DUST history services nevertheless issue one Indexer
+ * metadata query per relevant historical transaction, with unbounded
+ * concurrency. During a long replay that request burst is rejected with HTTP
+ * 403 and substantially slows the actual wallet-state sync.
+ *
+ * Returning synthetic metadata is safe here because `put` is also a no-op: the
+ * metadata is used only to build a history entry that this application
+ * deliberately does not store or consume.
+ */
+export function makeHeadlessTransactionHistoryService() {
+  return {
+    put: () => Effect.succeed(undefined),
+    getTransactionDetails: (hash: string) => Effect.succeed({
+      hash,
+      status: 'SUCCESS',
+      timestamp: 0,
+    } as const),
+  };
+}
 
 export type WalletContext = {
   wallet: WalletFacade;
@@ -314,9 +339,19 @@ export async function createWallet(seedHex: string, network: SupportedNetwork, c
   // wallet-sdk 4.x: each wallet factory takes only its own config slice (no more
   // shared provingServerUrl/relayURL on the per-wallet configs). The proving/
   // submission endpoints live on the WalletFacade configuration below.
-  const shieldedClass = ShieldedWallet({ networkId: network, indexerClientConnection, txHistoryStorage });
+  const shieldedClass = CustomShieldedWallet(
+    { networkId: network, indexerClientConnection, txHistoryStorage },
+    new ShieldedV1Builder()
+      .withDefaults()
+      .withTransactionHistory(() => makeHeadlessTransactionHistoryService()),
+  );
   const unshieldedClass = UnshieldedWallet({ networkId: network, indexerClientConnection, txHistoryStorage });
-  const dustClass = DustWallet({ networkId: network, indexerClientConnection, txHistoryStorage, costParameters });
+  const dustClass = CustomDustWallet(
+    { networkId: network, indexerClientConnection, txHistoryStorage, costParameters },
+    new DustV1Builder()
+      .withDefaults()
+      .withTransactionHistory(() => makeHeadlessTransactionHistoryService()),
+  );
 
   // Resume from a cached synced state when available (incremental sync); otherwise
   // start fresh. Any restore failure (stale/incompatible cache) falls back to fresh.

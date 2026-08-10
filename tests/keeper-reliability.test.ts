@@ -23,6 +23,7 @@ test('transport failures invalidate the current wallet context', () => {
     'Observed ServerError in PendingTransactionsService',
     'Invalid Transaction: Custom error: 170',
     'websocket connection closed',
+    'Timed out while waiting for Midnight wallet sync. Check the Indexer websocket and wallet seed.',
   ]) {
     assert.equal(isBrokenKeeperContext(new Error(message)), true, message)
   }

@@ -31,3 +31,7 @@ contract-keeper-run.sh
 contract-runbook.md
 keeper-runbook.md
 proof-server-runbook.md
+
+logs/*
+
+keeper.sh

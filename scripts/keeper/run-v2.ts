@@ -17,6 +17,7 @@ import { syncOnceV2 } from './sync-v2.js'
 import { resolveDeploymentV2 } from '../shared/chain-v2.js'
 import {
   errorMessage,
+  isBrokenKeeperContext,
   isKeeperTransactionTimeout,
 } from './reliability.js'
 import { configureKeeperCategory } from './scope-v2.js'
@@ -44,10 +45,10 @@ async function main() {
       await cancelRequestedV2(network)
     } catch (err) {
       console.error(`[keeper-v2:${category}] cycle error:`, errorMessage(err))
-      if (isKeeperTransactionTimeout(err)) {
+      if (isKeeperTransactionTimeout(err) || isBrokenKeeperContext(err)) {
         // Promise.race cannot cancel an in-flight SDK call. Exit the whole process
-        // so the supervisor can guarantee that no zombie submission overlaps the
-        // replacement wallet.
+        // so the supervisor can guarantee that no stale wallet/session overlaps
+        // its replacement.
         throw err
       }
       cycleFailed = true

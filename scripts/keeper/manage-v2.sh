@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ACTION="${1:-status}"
 NETWORK="${2:-preprod}"
 CATEGORIES=(crypto stocks sports)
+LOG_TIMESTAMP="${KEEPER_LOG_TIMESTAMP:-$(date '+%Y%m%d-%H%M%S')}"
 
 cd "$ROOT_DIR"
 mkdir -p logs
@@ -13,8 +14,22 @@ pid_file() {
   echo "$ROOT_DIR/logs/keeper-$1-supervisor.pid"
 }
 
-log_file() {
-  echo "$ROOT_DIR/logs/keeper-$1.log"
+log_path_file() {
+  echo "$ROOT_DIR/logs/keeper-$1-supervisor.log-path"
+}
+
+new_log_file() {
+  local category="$1"
+  local base="$ROOT_DIR/logs/keeper-${category}-${LOG_TIMESTAMP}"
+  local candidate="${base}.log"
+  local suffix=1
+
+  while [[ -e "$candidate" ]]; do
+    candidate="${base}-${suffix}.log"
+    suffix=$((suffix + 1))
+  done
+
+  echo "$candidate"
 }
 
 is_running() {
@@ -30,6 +45,7 @@ start_one() {
   local category="$1"
   local env_file="$ROOT_DIR/.env.keeper.${category}.local"
   local file
+  local log
   file="$(pid_file "$category")"
 
   if is_running "$category"; then
@@ -47,11 +63,15 @@ start_one() {
     return 1
   fi
 
+  log="$(new_log_file "$category")"
+  printf '[keeper-manager:%s] %s starting supervisor on %s\n' \
+    "$category" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$NETWORK" > "$log"
   nohup bash scripts/keeper/supervise-v2.sh "$NETWORK" "$category" \
-    >> "$(log_file "$category")" 2>&1 &
+    >> "$log" 2>&1 &
   local pid=$!
   echo "$pid" > "$file"
-  echo "[$category] started supervisor PID $pid; log: $(log_file "$category")"
+  echo "$log" > "$(log_path_file "$category")"
+  echo "[$category] started supervisor PID $pid; log: $log"
 }
 
 stop_one() {
@@ -82,11 +102,25 @@ stop_one() {
 status_one() {
   local category="$1"
   local file
+  local log_path_record
+  local log=""
   file="$(pid_file "$category")"
+  log_path_record="$(log_path_file "$category")"
+  if [[ -f "$log_path_record" ]]; then
+    log="$(tr -d '\r\n' < "$log_path_record")"
+  fi
   if is_running "$category"; then
-    echo "[$category] running (supervisor PID $(tr -d '[:space:]' < "$file"))"
+    if [[ -n "$log" ]]; then
+      echo "[$category] running (supervisor PID $(tr -d '[:space:]' < "$file")); log: $log"
+    else
+      echo "[$category] running (supervisor PID $(tr -d '[:space:]' < "$file"))"
+    fi
   else
-    echo "[$category] stopped"
+    if [[ -n "$log" ]]; then
+      echo "[$category] stopped; last log: $log"
+    else
+      echo "[$category] stopped"
+    fi
   fi
 }
 

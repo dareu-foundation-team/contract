@@ -26,6 +26,25 @@ Run one process per category (`crypto`, `stocks`, `sports`). Each category must
 have separate wallet cache, private-state namespace, PID/log files and operator
 wallet configuration.
 
+For managed background processes, use:
+
+```bash
+npm run keeper:multi -- start preprod
+npm run keeper:multi -- status preprod
+npm run keeper:multi -- restart preprod
+npm run keeper:multi -- stop preprod
+```
+
+Every `start` or `restart` creates a fresh log for each category under `logs/`,
+named `keeper-<category>-YYYYMMDD-HHMMSS.log`. The status command prints the
+log path associated with the current process (or the most recently stopped one).
+
+The supervisor gives the initial Preprod wallet replay up to six hours and saves
+a wallet-state checkpoint every 10,000 applied DUST events. Override
+`MIDNIGHT_WALLET_SYNC_TIMEOUT_MS` or `MIDNIGHT_WALLET_CHECKPOINT_EVERY` in a
+category-specific env file when needed. A failed setup saves its partial state,
+closes the wallet, and exits before the supervisor starts a fresh process.
+
 Required configuration includes:
 
 - `DATABASE_URL`

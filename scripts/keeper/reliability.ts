@@ -87,7 +87,7 @@ export function isKeeperTransactionTimeout(error: unknown): error is KeeperTrans
 export function isBrokenKeeperContext(error: unknown): boolean {
   if (isKeeperTransactionTimeout(error) || error instanceof KeeperContextBrokenError) return true
   const message = errorMessage(error)
-  return /ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|ENOTFOUND|socket hang up|websocket|wallet\.sync|servererror|connection.*(?:closed|lost|reset)|disconnected|Custom error:\s*170/i.test(message)
+  return /ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|ENOTFOUND|socket hang up|websocket|wallet[.\s_-]*sync|servererror|connection.*(?:closed|lost|reset)|disconnected|Custom error:\s*170/i.test(message)
 }
 
 /** Re-throw transport failures so the current wallet is never reused for the next row. */
