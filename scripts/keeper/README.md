@@ -1,16 +1,23 @@
 # DareU V2 Keeper
 
-The Keeper is the active direct-resolution pipeline:
+The Keeper consists of an independent read-only mirror and the active
+direct-resolution pipeline:
 
 ```text
-sync → publish → resolve → cancel → sleep
+Indexer → sync (30s, global, change-only batch update) → Postgres
+
+crypto/stocks/sports: publish → resolve → cancel → sleep
 ```
 
-- `sync-v2.ts`: mirrors OPEN/RESOLVED/CANCELLED state and pools from chain.
+- `sync-v2.ts`: one global process mirrors OPEN/RESOLVED/CANCELLED state and
+  pools from chain. It reads the shared contract once per cycle and uses one
+  conditional batch update, so unchanged rows are not rewritten. Cycles never
+  overlap; the default 30-second interval starts after the previous cycle ends.
 - `publish-v2.ts`: publishes eligible drafts with `create_market`.
 - `resolve-v2.ts`: submits `resolve_market` for `ready_to_resolve`, and
   `cancel_market` for `cancel_requested`.
-- `run-v2.ts`: schedules the complete cycle.
+- `run-v2.ts`: schedules wallet/prover transaction work only. DUST shortages or
+  a long publish/cancel queue cannot delay the read-only mirror.
 
 There are no proposal, finalization, bond, challenge, dispute or stuck-market
 loops.
@@ -38,6 +45,24 @@ npm run keeper:multi -- stop preprod
 Every `start` or `restart` creates a fresh log for each category under `logs/`,
 named `keeper-<category>-YYYYMMDD-HHMMSS.log`. The status command prints the
 log path associated with the current process (or the most recently stopped one).
+The same command also manages the one global mirror process and its
+`keeper-sync-YYYYMMDD-HHMMSS.log` file.
+
+To manage only the mirror without restarting transaction Keepers:
+
+```bash
+npm run keeper:sync:multi -- start preprod
+npm run keeper:sync:multi -- status preprod
+npm run keeper:sync:multi -- restart preprod
+npm run keeper:sync:multi -- stop preprod
+```
+
+Set `SYNC_INTERVAL_SEC` to override the 30-second default. Set it to `0` for a
+single foreground sync, for example:
+
+```bash
+SYNC_INTERVAL_SEC=0 npm run keeper:v2:sync -- preprod
+```
 
 The supervisor gives the initial Preprod wallet replay up to six hours and saves
 a wallet-state checkpoint every 10,000 applied DUST events. Override

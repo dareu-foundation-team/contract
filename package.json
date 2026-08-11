@@ -27,6 +27,8 @@
     "keeper:run": "NODE_OPTIONS=--max-old-space-size=8192 tsx scripts/keeper/run-v2.ts",
     "keeper:service": "bash scripts/keeper/supervise-v2.sh",
     "keeper:multi": "bash scripts/keeper/manage-v2.sh",
+    "keeper:sync:service": "bash scripts/keeper/supervise-sync-v2.sh",
+    "keeper:sync:multi": "bash scripts/keeper/manage-sync-v2.sh",
     "keeper:publish": "NODE_OPTIONS=--max-old-space-size=8192 tsx scripts/keeper/publish-v2.ts",
     "keeper:sync": "NODE_OPTIONS=--max-old-space-size=8192 tsx scripts/keeper/sync-v2.ts",
     "keeper:resolve": "NODE_OPTIONS=--max-old-space-size=8192 tsx scripts/keeper/resolve-v2.ts",

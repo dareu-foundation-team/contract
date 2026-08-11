@@ -133,21 +133,25 @@ case "$ACTION" in
       exit 1
     fi
     failed=0
+    bash scripts/keeper/manage-sync-v2.sh start "$NETWORK" || failed=1
     for category in "${CATEGORIES[@]}"; do start_one "$category" || failed=1; done
     exit "$failed"
     ;;
   stop)
     failed=0
     for category in "${CATEGORIES[@]}"; do stop_one "$category" || failed=1; done
+    bash scripts/keeper/manage-sync-v2.sh stop "$NETWORK" || failed=1
     exit "$failed"
     ;;
   restart)
     failed=0
     for category in "${CATEGORIES[@]}"; do stop_one "$category" || failed=1; done
+    bash scripts/keeper/manage-sync-v2.sh restart "$NETWORK" || failed=1
     for category in "${CATEGORIES[@]}"; do start_one "$category" || failed=1; done
     exit "$failed"
     ;;
   status)
+    bash scripts/keeper/manage-sync-v2.sh status "$NETWORK"
     for category in "${CATEGORIES[@]}"; do status_one "$category"; done
     ;;
   *)

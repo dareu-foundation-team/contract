@@ -1,10 +1,9 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import WebSocket from 'ws'
+import { ContractState } from '@midnight-ntwrk/compact-runtime'
 import { findDeployedContract } from '@midnight-ntwrk/midnight-js-contracts'
-import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider'
 import { CompiledContract } from '@midnight-ntwrk/compact-js'
-import { toHex } from '@midnight-ntwrk/midnight-js-utils'
+import { fromHex, toHex } from '@midnight-ntwrk/midnight-js-utils'
 
 import {
   Contract,
@@ -101,6 +100,34 @@ function decodePaddedSymbol(bytes: Uint8Array): string {
 
 const resolvedDeploymentCache = new Map<SupportedNetwork, Promise<ResolvedDeploymentV2>>()
 
+/**
+ * Hosted preview/preprod indexers reject the SDK's latest-state request when it
+ * serializes an explicit `offset: null`. Send the latest-state GraphQL query
+ * directly, omitting offset entirely, then deserialize the Compact state.
+ */
+async function queryLatestContractState(indexerUrl: string, contractAddress: string): Promise<ContractState | null> {
+  const response = await fetch(indexerUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      query: `query LatestContractState($address: HexEncoded!) {
+        contractAction(address: $address) { state }
+      }`,
+      variables: { address: contractAddress },
+    }),
+  })
+  if (!response.ok) throw new Error(`Indexer HTTP ${response.status} while reading ${contractAddress}`)
+  const payload = await response.json() as {
+    data?: { contractAction?: { state?: string } | null }
+    errors?: Array<{ message?: string }>
+  }
+  if (payload.errors?.length) {
+    throw new Error(payload.errors.map((error) => error.message ?? 'Unknown Indexer error').join('; '))
+  }
+  const stateHex = payload.data?.contractAction?.state
+  return stateHex ? ContractState.deserialize(fromHex(stateHex.replace(/^0x/i, ''))) : null
+}
+
 /** Add the V2 mirror namespace columns without requiring a separate migration run. */
 export async function ensureV2MarketColumns(dbUrl: string): Promise<void> {
   await pgExec(dbUrl, 'ALTER TABLE markets ADD COLUMN IF NOT EXISTS onchain_contract_version text', [])
@@ -118,7 +145,6 @@ export function resolveDeploymentV2(network: SupportedNetwork): Promise<Resolved
   if (cached) return cached
 
   const resolving = (async () => {
-    globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket
     const config = configureNetwork(network)
     const local = readDeploymentV2(network)
     const registryAddress = readRegistryAddress(network)
@@ -126,9 +152,7 @@ export function resolveDeploymentV2(network: SupportedNetwork): Promise<Resolved
       ? parseHexBytes(requiredEnv('DAREU_KEEPER_ASSET_UNDERLYING_HEX'), 32, 'DAREU_KEEPER_ASSET_UNDERLYING_HEX')
       : new Uint8Array(32)
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const provider = indexerPublicDataProvider(config.indexer, config.indexerWS, WebSocket as any)
-    const state = await provider.queryContractState(registryAddress)
+    const state = await queryLatestContractState(config.indexer, registryAddress)
     if (!state) {
       throw new Error(
         `Registry ${registryAddress} is not available from the ${network} indexer yet.`,
@@ -266,12 +290,9 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
 
 /** Read-only v2 ledger snapshot from the indexer (no wallet). */
 export async function readV2Ledger(network: SupportedNetwork): Promise<LedgerV2 | null> {
-  globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket
   const config = configureNetwork(network)
   const { contractAddress } = await resolveDeploymentV2(network)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const provider = indexerPublicDataProvider(config.indexer, config.indexerWS, WebSocket as any)
-  const state = await provider.queryContractState(contractAddress)
+  const state = await queryLatestContractState(config.indexer, contractAddress)
   if (!state) return null
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return ledgerV2((state as any).data)
