@@ -21,15 +21,54 @@ import {
   withKeeperTransactionTimeout,
 } from './reliability.js'
 import { configureKeeperCategory, requiredKeeperCategory } from './scope-v2.js'
+import type { KeeperWorkResult } from './scheduling-v2.js'
 
-export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>) {
+type PublishOptions = {
+  /** Bound one scheduler turn. The standalone CLI keeps using PUBLISH_LIMIT. */
+  limit?: number
+  /** Yield between transactions when settlement/refund work appears. */
+  preemptForSettlement?: boolean
+}
+
+export const PRIORITY_MARKET_EXISTS_SQL = `SELECT EXISTS (
+  SELECT 1
+    FROM markets
+   WHERE status IN ('ready_to_resolve', 'cancel_requested')
+     AND onchain_tx_id IS NOT NULL
+     AND onchain_contract_version = 'v2'
+     AND onchain_contract_address = $1
+     AND COALESCE(onchain_status, 'open') = 'open'
+     AND category = $2
+) AS has_priority_work`
+
+async function hasPrioritySettlementWork(
+  dbUrl: string,
+  contractAddress: string,
+  category: string,
+): Promise<boolean> {
+  const { rows } = await pgExec(
+    dbUrl,
+    PRIORITY_MARKET_EXISTS_SQL,
+    [contractAddress, category],
+  )
+  return rows[0]?.has_priority_work === true
+}
+
+export async function publishDraftsV2(
+  network: ReturnType<typeof resolveNetwork>,
+  options: PublishOptions = {},
+): Promise<KeeperWorkResult> {
   const dbUrl = requiredEnv('DATABASE_URL')
   const category = requiredKeeperCategory()
-  // Total work per keeper cycle is intentionally large so a backlog drains
-  // continuously. The wallet is rotated every `sessionSize` transactions below,
-  // which avoids one websocket/UTXO context living for hundreds of proofs.
-  const limit = keeperBatchLimit('PUBLISH_LIMIT', 500, 'KEEPER_MAX_PUBLISH_LIMIT', 1000)
-  const sessionSize = keeperBatchLimit('PUBLISH_SESSION_SIZE', 20)
+  // The standalone publish CLI may still drain a large configured batch. The
+  // long-running scheduler passes a much smaller quantum so lifecycle work can
+  // preempt creation between transactions. Wallet rotation below prevents one
+  // websocket/UTXO context from living for hundreds of proofs.
+  const configuredLimit = keeperBatchLimit('PUBLISH_LIMIT', 500, 'KEEPER_MAX_PUBLISH_LIMIT', 1000)
+  const limit = options.limit == null
+    ? configuredLimit
+    : Math.min(configuredLimit, Math.max(1, Math.floor(options.limit)))
+  const sessionSize = Math.min(keeperBatchLimit('PUBLISH_SESSION_SIZE', 20), limit)
   const minLeadSec = keeperBatchLimit('PUBLISH_MIN_LEAD_SEC', 120, 'PUBLISH_MAX_MIN_LEAD_SEC', 3600)
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
@@ -58,7 +97,7 @@ export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>
   )
   if (rows.length === 0) {
     console.log('[publish-v2] no draft markets to publish.')
-    return
+    return { selected: 0, succeeded: 0 }
   }
   console.log(
     `[publish-v2:${category}] publishing up to ${rows.length} market(s) on-chain ` +
@@ -66,6 +105,7 @@ export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>
   )
 
   let ok = 0
+  let preempted = false
   type PublishRow = {
     id: string
     metadata_hash: string
@@ -82,9 +122,28 @@ export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>
     const sessionCount = Math.ceil(publishRows.length / sessionSize)
     console.log(`[publish-v2] wallet session ${sessionNumber}/${sessionCount}: ${chunk.length} market(s)`)
 
+    if (
+      options.preemptForSettlement &&
+      await hasPrioritySettlementWork(dbUrl, deployment.contractAddress, category)
+    ) {
+      preempted = true
+      console.log('[publish-v2] yielding before wallet start: settlement work is waiting.')
+      break
+    }
+
     const { deployed, walletCtx } = await connectKeeperV2(network)
     try {
       for (const row of chunk) {
+        // A proof/call already in flight cannot be cancelled safely. Check only
+        // at transaction boundaries and let the outer scheduler settle first.
+        if (
+          options.preemptForSettlement &&
+          await hasPrioritySettlementWork(dbUrl, deployment.contractAddress, category)
+        ) {
+          preempted = true
+          console.log('[publish-v2] yielding at transaction boundary: settlement work is waiting.')
+          break
+        }
         try {
           // A large backlog can take hours. Re-check the lead time immediately
           // before proving so an item selected at the start of the sweep cannot
@@ -134,6 +193,7 @@ export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>
                       updated_at=now() WHERE id=$1`,
               [row.id, deployment.contractAddress],
             )
+            ok++
             console.log(`  • ${row.id.slice(0, 12)}… already on-chain — marked`)
           } else {
             console.error(`  ✗ ${row.id.slice(0, 12)}… failed (left as draft): ${msg}`)
@@ -153,8 +213,13 @@ export async function publishDraftsV2(network: ReturnType<typeof resolveNetwork>
       }
       await stopWalletSafely(walletCtx.wallet, `publish-v2 session ${sessionNumber}`)
     }
+    if (preempted) break
   }
-  console.log(`[publish-v2] done. ${ok}/${rows.length} published.`)
+  console.log(
+    `[publish-v2] done. ${ok}/${rows.length} published` +
+      `${preempted ? '; yielded to settlement.' : '.'}`,
+  )
+  return { selected: rows.length, succeeded: ok, preempted }
 }
 
 async function main() {

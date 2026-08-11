@@ -1,5 +1,5 @@
 // Keeper SERVICE entrypoint — v2 contract. One long-running transaction process:
-//   publish drafts → direct resolve → cancel.
+//   direct resolve → cancel → bounded/preemptible publish → direct resolve → cancel.
 // The read-only on-chain mirror is intentionally a separate 30-second process
 // (sync-v2.ts), so wallet/prover work cannot delay web metrics. This process holds
 // the OPERATOR hot key (owner key stays cold — D8) + needs the proof server.
@@ -16,28 +16,54 @@ import {
   errorMessage,
   isBrokenKeeperContext,
   isKeeperTransactionTimeout,
+  keeperBatchLimit,
 } from './reliability.js'
 import { configureKeeperCategory } from './scope-v2.js'
+import { runKeeperPriorityCycle } from './scheduling-v2.js'
 
 async function main() {
   const category = configureKeeperCategory(process.argv[3])
   loadEnvFiles()
   const network = resolveNetwork(process.argv[2])
   const cycleSec = Number(optionalEnv('KEEPER_CYCLE_SEC') ?? '300')
+  const busyRetrySec = Number(optionalEnv('KEEPER_BUSY_RETRY_SEC') ?? '5')
   const errorRetrySec = Number(optionalEnv('KEEPER_ERROR_RETRY_SEC') ?? '20')
+  const publishQuantum = keeperBatchLimit(
+    'PUBLISH_QUANTUM',
+    10,
+    'KEEPER_MAX_PUBLISH_QUANTUM',
+    50,
+  )
   const deployment = await resolveDeploymentV2(network)
   console.log(
     `[keeper-v2] registry ${deployment.registryAddress} → ${deployment.symbol} ` +
       `${deployment.contractAddress} (${deployment.decimals} decimals, enabled)`,
   )
-  console.log(`[keeper-v2:${category}] up — transaction cycle (publish+resolve+cancel) every ${cycleSec}s`)
+  console.log(
+    `[keeper-v2:${category}] up — settlement-priority cycle every ${cycleSec}s ` +
+      `(publish quantum ${publishQuantum}, busy retry ${busyRetrySec}s)`,
+  )
 
   for (;;) {
     let cycleFailed = false
+    let madeProgress = false
     try {
-      await publishDraftsV2(network)
-      await resolveMarketsV2(network)
-      await cancelRequestedV2(network)
+      const cycle = await runKeeperPriorityCycle({
+        resolve: () => resolveMarketsV2(network),
+        cancel: () => cancelRequestedV2(network),
+        publish: () => publishDraftsV2(network, {
+          limit: publishQuantum,
+          preemptForSettlement: true,
+        }),
+      })
+      madeProgress = cycle.madeProgress
+      console.log(
+        `[keeper-v2:${category}] cycle: ` +
+          `resolve ${cycle.resolveBeforePublish.succeeded}+${cycle.resolveAfterPublish.succeeded}, ` +
+          `cancel ${cycle.cancelBeforePublish.succeeded}+${cycle.cancelAfterPublish.succeeded}, ` +
+          `publish ${cycle.publish.succeeded}` +
+          `${cycle.publish.preempted ? ' (preempted for settlement)' : ''}.`,
+      )
     } catch (err) {
       console.error(`[keeper-v2:${category}] cycle error:`, errorMessage(err))
       if (isKeeperTransactionTimeout(err) || isBrokenKeeperContext(err)) {
@@ -48,8 +74,13 @@ async function main() {
       }
       cycleFailed = true
     }
-    const waitSec = cycleFailed ? errorRetrySec : cycleSec
-    console.log(`[keeper-v2:${category}] next cycle in ${waitSec}s${cycleFailed ? ' (recovery retry)' : ''}.`)
+    const waitSec = cycleFailed ? errorRetrySec : madeProgress ? busyRetrySec : cycleSec
+    const waitReason = cycleFailed
+      ? ' (recovery retry)'
+      : madeProgress
+        ? ' (queue still active)'
+        : ''
+    console.log(`[keeper-v2:${category}] next cycle in ${waitSec}s${waitReason}.`)
     await new Promise((r) => setTimeout(r, waitSec * 1000))
   }
 }

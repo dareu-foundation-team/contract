@@ -6,18 +6,28 @@ direct-resolution pipeline:
 ```text
 Indexer → sync (30s, global, change-only batch update) → Postgres
 
-crypto/stocks/sports: publish → resolve → cancel → sleep
+crypto/stocks/sports: resolve → cancel → bounded publish → resolve → cancel
 ```
 
 - `sync-v2.ts`: one global process mirrors OPEN/RESOLVED/CANCELLED state and
   pools from chain. It reads the shared contract once per cycle and uses one
   conditional batch update, so unchanged rows are not rewritten. Cycles never
   overlap; the default 30-second interval starts after the previous cycle ends.
-- `publish-v2.ts`: publishes eligible drafts with `create_market`.
+- `publish-v2.ts`: publishes eligible drafts with `create_market`. The managed
+  keeper limits each turn with `PUBLISH_QUANTUM` (default 10) and checks for
+  settlement/refund work between transactions. An in-flight proof is allowed to
+  finish before publishing yields, so wallet contexts never overlap.
 - `resolve-v2.ts`: submits `resolve_market` for `ready_to_resolve`, and
   `cancel_market` for `cancel_requested`.
 - `run-v2.ts`: schedules wallet/prover transaction work only. DUST shortages or
   a long publish/cancel queue cannot delay the read-only mirror.
+
+Lifecycle work has strict priority over market creation. If a cycle resolves,
+cancels or publishes anything, the next priority check runs after
+`KEEPER_BUSY_RETRY_SEC` (default 5 seconds); an idle keeper keeps the normal
+`KEEPER_CYCLE_SEC` interval (default 300 seconds). The standalone
+`keeper:v2:publish` command remains a bulk operation controlled by
+`PUBLISH_LIMIT`.
 
 There are no proposal, finalization, bond, challenge, dispute or stuck-market
 loops.

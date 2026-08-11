@@ -25,8 +25,11 @@ import {
   withKeeperTransactionTimeout,
 } from './reliability.js'
 import { configureKeeperCategory, requiredKeeperCategory } from './scope-v2.js'
+import type { KeeperWorkResult } from './scheduling-v2.js'
 
-export async function resolveMarketsV2(network: ReturnType<typeof resolveNetwork>) {
+export async function resolveMarketsV2(
+  network: ReturnType<typeof resolveNetwork>,
+): Promise<KeeperWorkResult> {
   const dbUrl = requiredEnv('DATABASE_URL')
   const category = requiredKeeperCategory()
   const limit = keeperBatchLimit('RESOLVE_LIMIT')
@@ -51,10 +54,11 @@ export async function resolveMarketsV2(network: ReturnType<typeof resolveNetwork
   )
   if (rows.length === 0) {
     console.log('[resolve-v2] no ready_to_resolve markets.')
-    return
+    return { selected: 0, succeeded: 0 }
   }
 
   console.log(`[resolve-v2] resolving ${rows.length} market(s) directly on-chain…`)
+  let succeeded = 0
   const { deployed, walletCtx } = await connectKeeperV2(network)
   try {
     for (const row of rows as Array<{ id: string; outcome: 'yes' | 'no' }>) {
@@ -74,6 +78,7 @@ export async function resolveMarketsV2(network: ReturnType<typeof resolveNetwork
             WHERE id=$1 AND status='ready_to_resolve'`,
           [row.id],
         )
+        succeeded++
         console.log(`  ✓ ${row.id.slice(0, 12)}… resolved ${row.outcome.toUpperCase()}`)
       } catch (error) {
         console.error(`  ✗ ${row.id.slice(0, 12)}… resolve failed: ${errorMessage(error)}`)
@@ -83,9 +88,12 @@ export async function resolveMarketsV2(network: ReturnType<typeof resolveNetwork
   } finally {
     await stopWalletSafely(walletCtx.wallet, 'resolve-v2')
   }
+  return { selected: rows.length, succeeded }
 }
 
-export async function cancelRequestedV2(network: ReturnType<typeof resolveNetwork>) {
+export async function cancelRequestedV2(
+  network: ReturnType<typeof resolveNetwork>,
+): Promise<KeeperWorkResult> {
   const dbUrl = requiredEnv('DATABASE_URL')
   const category = requiredKeeperCategory()
   const limit = keeperBatchLimit('CANCEL_LIMIT')
@@ -109,10 +117,11 @@ export async function cancelRequestedV2(network: ReturnType<typeof resolveNetwor
   )
   if (rows.length === 0) {
     console.log('[cancel-v2] no cancel_requested markets.')
-    return
+    return { selected: 0, succeeded: 0 }
   }
 
   console.log(`[cancel-v2] cancelling ${rows.length} market(s) on-chain…`)
+  let succeeded = 0
   const { deployed, walletCtx } = await connectKeeperV2(network)
   try {
     for (const row of rows as Array<{ id: string }>) {
@@ -128,6 +137,7 @@ export async function cancelRequestedV2(network: ReturnType<typeof resolveNetwor
             WHERE id=$1 AND status='cancel_requested'`,
           [row.id],
         )
+        succeeded++
         console.log(`  ✓ ${row.id.slice(0, 12)}… cancelled`)
       } catch (error) {
         console.error(`  ✗ ${row.id.slice(0, 12)}… cancel failed: ${errorMessage(error)}`)
@@ -137,6 +147,7 @@ export async function cancelRequestedV2(network: ReturnType<typeof resolveNetwor
   } finally {
     await stopWalletSafely(walletCtx.wallet, 'cancel-v2')
   }
+  return { selected: rows.length, succeeded }
 }
 
 async function main() {
