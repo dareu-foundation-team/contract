@@ -7,6 +7,7 @@ import pg from 'pg'
 import { MarketStatus, Outcome } from '../../src/managed/dareu-v2/contract/index.js'
 import { loadEnvFiles, optionalEnv, requiredEnv, resolveNetwork } from '../shared/chain.js'
 import { ensureV2MarketColumns, readV2Ledger, resolveDeploymentV2 } from '../shared/chain-v2.js'
+import { V2_MARKET_MIRROR_UPDATE_SQL } from './sync-v2-sql.js'
 
 // On-chain enums → the lowercase strings the webapp/Postgres mirror columns expect.
 const STATUS_TEXT: Record<number, string> = {
@@ -35,10 +36,11 @@ let schemaReady: Promise<void> | undefined
 /**
  * Mirror one ledger snapshot with one conditional batch UPDATE.
  *
- * PostgreSQL performs the change detection with IS DISTINCT FROM, so unchanged
- * markets are not rewritten and do not generate WAL/autovacuum work. The global
- * process intentionally has no category scope: all categories share this one
- * on-chain contract, and market ids are globally unique in Postgres.
+ * PostgreSQL performs change/freshness detection, so unchanged markets are not
+ * continuously rewritten. A closed OPEN market is observed once after close even
+ * when its pools did not change; the resolver needs that observation to prove the
+ * final pool snapshot is fresh. The global process intentionally has no category
+ * scope: all categories share this contract and market ids are globally unique.
  */
 export async function syncOnceV2(network: ReturnType<typeof resolveNetwork>): Promise<SyncV2Stats> {
   const startedAt = Date.now()
@@ -74,30 +76,7 @@ export async function syncOnceV2(network: ReturnType<typeof resolveNetwork>): Pr
   let updated = 0
   try {
     const result = await client.query(
-      `WITH incoming AS (
-         SELECT *
-           FROM unnest(
-             $1::text[], $2::text[], $3::numeric[], $4::numeric[], $5::text[]
-           ) AS state(id, status, yes_pool, no_pool, outcome)
-       )
-       UPDATE markets AS market
-          SET onchain_status = state.status,
-              onchain_yes_pool = state.yes_pool,
-              onchain_no_pool = state.no_pool,
-              onchain_outcome = state.outcome,
-              onchain_contract_version = 'v2',
-              onchain_contract_address = $6,
-              synced_at = now()
-         FROM incoming AS state
-        WHERE market.id = state.id
-          AND (
-            market.onchain_status IS DISTINCT FROM state.status OR
-            market.onchain_yes_pool IS DISTINCT FROM state.yes_pool OR
-            market.onchain_no_pool IS DISTINCT FROM state.no_pool OR
-            market.onchain_outcome IS DISTINCT FROM state.outcome OR
-            market.onchain_contract_version IS DISTINCT FROM 'v2' OR
-            market.onchain_contract_address IS DISTINCT FROM $6
-          )`,
+      V2_MARKET_MIRROR_UPDATE_SQL,
       [ids, statuses, yesPools, noPools, outcomes, deployment.contractAddress],
     )
     updated = result.rowCount ?? 0
@@ -108,7 +87,7 @@ export async function syncOnceV2(network: ReturnType<typeof resolveNetwork>): Pr
   const stats = { scanned: ids.length, updated, durationMs: Date.now() - startedAt }
   console.log(
     `[sync-v2] checked ${stats.scanned} on-chain market(s); ` +
-      `updated ${stats.updated} changed row(s) in ${stats.durationMs}ms.`,
+      `refreshed ${stats.updated} changed/stale row(s) in ${stats.durationMs}ms.`,
   )
   return stats
 }

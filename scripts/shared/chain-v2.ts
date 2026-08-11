@@ -132,6 +132,7 @@ async function queryLatestContractState(indexerUrl: string, contractAddress: str
 export async function ensureV2MarketColumns(dbUrl: string): Promise<void> {
   await pgExec(dbUrl, 'ALTER TABLE markets ADD COLUMN IF NOT EXISTS onchain_contract_version text', [])
   await pgExec(dbUrl, 'ALTER TABLE markets ADD COLUMN IF NOT EXISTS onchain_contract_address text', [])
+  await pgExec(dbUrl, 'ALTER TABLE markets ADD COLUMN IF NOT EXISTS onchain_observed_at timestamptz', [])
 }
 
 /**
