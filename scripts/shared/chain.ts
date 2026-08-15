@@ -18,14 +18,72 @@ export { resolveNetwork } from './network.js'
 
 const defaultEnvFiles = ['.env', '.env.local']
 
+function positiveTimeout(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim()
+  if (!raw) return fallback
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer; received ${JSON.stringify(raw)}.`)
+  }
+  return value
+}
+
+export function pgClientConfig(connectionString: string): pg.ClientConfig {
+  return {
+    connectionString,
+    application_name: process.env.DAREU_KEEPER_CATEGORY
+      ? `dareu-keeper-${process.env.DAREU_KEEPER_CATEGORY}`
+      : 'dareu-maintenance',
+    connectionTimeoutMillis: positiveTimeout('PG_CONNECT_TIMEOUT_MS', 10_000),
+    query_timeout: positiveTimeout('PG_QUERY_TIMEOUT_MS', 30_000),
+    statement_timeout: positiveTimeout('PG_STATEMENT_TIMEOUT_MS', 30_000),
+    lock_timeout: positiveTimeout('PG_LOCK_TIMEOUT_MS', 10_000),
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 5_000,
+  }
+}
+
+export function createPgClient(connectionString: string): pg.Client {
+  return new pg.Client(pgClientConfig(connectionString))
+}
+
+export async function closePgClient(client: pg.Client): Promise<void> {
+  const timeoutMs = positiveTimeout('PG_CLOSE_TIMEOUT_MS', 5_000)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      client.end(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error(`Postgres client close timed out after ${timeoutMs}ms`)
+          ;(error as Error & { code?: string }).code = 'PG_CLOSE_TIMEOUT'
+          reject(error)
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 // One-shot Postgres exec (standard `pg`; opens/closes a connection per call).
 export async function pgExec(connectionString: string, text: string, params: unknown[]) {
-  const client = new pg.Client({ connectionString })
-  await client.connect()
+  const client = createPgClient(connectionString)
+  let operationFailed = false
   try {
+    await client.connect()
     return await client.query(text, params)
+  } catch (error) {
+    operationFailed = true
+    throw error
   } finally {
-    await client.end()
+    try {
+      await closePgClient(client)
+    } catch (closeError) {
+      // Preserve the connect/query error when both the operation and teardown fail.
+      // A standalone close timeout remains fatal so the keeper supervisor restarts.
+      if (!operationFailed) throw closeError
+    }
   }
 }
 

@@ -6,45 +6,56 @@ export type KeeperWorkResult = {
 
 export type KeeperPriorityCycle = {
   resolveBeforePublish: KeeperWorkResult
-  cancelBeforePublish: KeeperWorkResult
+  fundedCancelBeforePublish: KeeperWorkResult
   publish: KeeperWorkResult
   resolveAfterPublish: KeeperWorkResult
-  cancelAfterPublish: KeeperWorkResult
+  fundedCancelAfterPublish: KeeperWorkResult
+  emptyCancelAfterPublish: KeeperWorkResult
   madeProgress: boolean
 }
 
 type KeeperPriorityTasks = {
   resolve: () => Promise<KeeperWorkResult>
-  cancel: () => Promise<KeeperWorkResult>
+  cancelFunded: () => Promise<KeeperWorkResult>
+  cancelEmpty: () => Promise<KeeperWorkResult>
   publish: () => Promise<KeeperWorkResult>
 }
 
 const progressed = (result: KeeperWorkResult) => result.succeeded > 0
+const noWork = (): KeeperWorkResult => ({ selected: 0, succeeded: 0 })
 
 /**
- * Lifecycle work always gets two opportunities around a bounded publish quantum.
- * The same task functions are awaited serially so one operator wallet context is
- * never shared by concurrent proof/transaction calls.
+ * Funded lifecycle work gets two opportunities around a bounded publish quantum.
+ * Empty 0/0 markets receive one small cleanup turn after publishing, unless funded
+ * work preempted that publish. Tasks remain serial so one operator wallet context
+ * is never shared by concurrent proof/transaction calls.
  */
 export async function runKeeperPriorityCycle(tasks: KeeperPriorityTasks): Promise<KeeperPriorityCycle> {
   const resolveBeforePublish = await tasks.resolve()
-  const cancelBeforePublish = await tasks.cancel()
+  const fundedCancelBeforePublish = await tasks.cancelFunded()
   const publish = await tasks.publish()
   const resolveAfterPublish = await tasks.resolve()
-  const cancelAfterPublish = await tasks.cancel()
+  const fundedCancelAfterPublish = await tasks.cancelFunded()
+  // A preempted publish means funded lifecycle work is still waiting. Do not spend
+  // wallet/prover capacity on empty 0/0 cleanup until the funded queue is clear.
+  const emptyCancelAfterPublish = publish.preempted
+    ? noWork()
+    : await tasks.cancelEmpty()
 
   return {
     resolveBeforePublish,
-    cancelBeforePublish,
+    fundedCancelBeforePublish,
     publish,
     resolveAfterPublish,
-    cancelAfterPublish,
+    fundedCancelAfterPublish,
+    emptyCancelAfterPublish,
     madeProgress: [
       resolveBeforePublish,
-      cancelBeforePublish,
+      fundedCancelBeforePublish,
       publish,
       resolveAfterPublish,
-      cancelAfterPublish,
+      fundedCancelAfterPublish,
+      emptyCancelAfterPublish,
     ].some(progressed),
   }
 }

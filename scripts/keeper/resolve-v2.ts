@@ -27,6 +27,21 @@ import {
 import { configureKeeperCategory, requiredKeeperCategory } from './scope-v2.js'
 import type { KeeperWorkResult } from './scheduling-v2.js'
 
+export type CancelMode = 'funded' | 'empty' | 'all'
+
+type CancelOptions = {
+  mode?: CancelMode
+  limit?: number
+}
+
+export const FUNDED_CANCEL_PREDICATE = `
+  COALESCE(onchain_yes_pool, 0::numeric)
+    + COALESCE(onchain_no_pool, 0::numeric) > 0`
+
+export const EMPTY_CANCEL_PREDICATE = `
+  COALESCE(onchain_yes_pool, 0::numeric)
+    + COALESCE(onchain_no_pool, 0::numeric) = 0`
+
 export async function resolveMarketsV2(
   network: ReturnType<typeof resolveNetwork>,
 ): Promise<KeeperWorkResult> {
@@ -93,10 +108,22 @@ export async function resolveMarketsV2(
 
 export async function cancelRequestedV2(
   network: ReturnType<typeof resolveNetwork>,
+  options: CancelOptions = {},
 ): Promise<KeeperWorkResult> {
   const dbUrl = requiredEnv('DATABASE_URL')
   const category = requiredKeeperCategory()
-  const limit = keeperBatchLimit('CANCEL_LIMIT')
+  const mode = options.mode ?? 'all'
+  const configuredLimit = mode === 'empty'
+    ? keeperBatchLimit('EMPTY_CANCEL_LIMIT', 2, 'KEEPER_MAX_EMPTY_CANCEL_LIMIT', 10)
+    : keeperBatchLimit('CANCEL_LIMIT')
+  const limit = options.limit == null
+    ? configuredLimit
+    : Math.min(configuredLimit, Math.max(1, Math.floor(options.limit)))
+  const poolPredicate = mode === 'funded'
+    ? `AND ${FUNDED_CANCEL_PREDICATE}`
+    : mode === 'empty'
+      ? `AND ${EMPTY_CANCEL_PREDICATE}`
+      : ''
   await ensureV2MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV2(network)
 
@@ -110,17 +137,21 @@ export async function cancelRequestedV2(
         AND onchain_contract_address = $2
         AND COALESCE(onchain_status, 'open') = 'open'
         AND category = $3
-      ORDER BY updated_at ASC
+        ${poolPredicate}
+      ORDER BY
+        (COALESCE(onchain_yes_pool, 0::numeric)
+          + COALESCE(onchain_no_pool, 0::numeric) > 0) DESC,
+        updated_at ASC
       LIMIT $1
       FOR UPDATE SKIP LOCKED`,
     [limit, deployment.contractAddress, category],
   )
   if (rows.length === 0) {
-    console.log('[cancel-v2] no cancel_requested markets.')
+    console.log(`[cancel-v2:${mode}] no cancel_requested markets.`)
     return { selected: 0, succeeded: 0 }
   }
 
-  console.log(`[cancel-v2] cancelling ${rows.length} market(s) on-chain…`)
+  console.log(`[cancel-v2:${mode}] cancelling ${rows.length} market(s) on-chain…`)
   let succeeded = 0
   const { deployed, walletCtx } = await connectKeeperV2(network)
   try {

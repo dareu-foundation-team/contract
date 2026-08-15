@@ -33,7 +33,14 @@ type PublishOptions = {
 export const PRIORITY_MARKET_EXISTS_SQL = `SELECT EXISTS (
   SELECT 1
     FROM markets
-   WHERE status IN ('ready_to_resolve', 'cancel_requested')
+   WHERE (
+          status = 'ready_to_resolve'
+          OR (
+            status = 'cancel_requested'
+            AND COALESCE(onchain_yes_pool, 0::numeric)
+                + COALESCE(onchain_no_pool, 0::numeric) > 0
+          )
+         )
      AND onchain_tx_id IS NOT NULL
      AND onchain_contract_version = 'v2'
      AND onchain_contract_address = $1
@@ -127,7 +134,7 @@ export async function publishDraftsV2(
       await hasPrioritySettlementWork(dbUrl, deployment.contractAddress, category)
     ) {
       preempted = true
-      console.log('[publish-v2] yielding before wallet start: settlement work is waiting.')
+      console.log('[publish-v2] yielding before wallet start: funded settlement/refund work is waiting.')
       break
     }
 
@@ -141,7 +148,7 @@ export async function publishDraftsV2(
           await hasPrioritySettlementWork(dbUrl, deployment.contractAddress, category)
         ) {
           preempted = true
-          console.log('[publish-v2] yielding at transaction boundary: settlement work is waiting.')
+          console.log('[publish-v2] yielding at transaction boundary: funded settlement/refund work is waiting.')
           break
         }
         try {
@@ -217,7 +224,7 @@ export async function publishDraftsV2(
   }
   console.log(
     `[publish-v2] done. ${ok}/${rows.length} published` +
-      `${preempted ? '; yielded to settlement.' : '.'}`,
+      `${preempted ? '; yielded to funded settlement/refund work.' : '.'}`,
   )
   return { selected: rows.length, succeeded: ok, preempted }
 }

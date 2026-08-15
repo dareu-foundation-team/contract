@@ -6,7 +6,8 @@ direct-resolution pipeline:
 ```text
 Indexer → sync (30s, global, change-only batch update) → Postgres
 
-crypto/stocks/sports: resolve → cancel → bounded publish → resolve → cancel
+crypto/stocks/sports:
+funded resolve/cancel → bounded publish → funded resolve/cancel → empty cleanup
 ```
 
 - `sync-v2.ts`: one global process mirrors OPEN/RESOLVED/CANCELLED state and
@@ -17,13 +18,15 @@ crypto/stocks/sports: resolve → cancel → bounded publish → resolve → can
   keeper limits each turn with `PUBLISH_QUANTUM` (default 10) and checks for
   settlement/refund work between transactions. An in-flight proof is allowed to
   finish before publishing yields, so wallet contexts never overlap.
-- `resolve-v2.ts`: submits `resolve_market` for `ready_to_resolve`, and
-  `cancel_market` for `cancel_requested`.
+- `resolve-v2.ts`: submits `resolve_market` for `ready_to_resolve`. Funded
+  `cancel_requested` refunds are urgent; empty 0/0 cancellations are handled by
+  a separate low-volume cleanup turn.
 - `run-v2.ts`: schedules wallet/prover transaction work only. DUST shortages or
   a long publish/cancel queue cannot delay the read-only mirror.
 
-Lifecycle work has strict priority over market creation. If a cycle resolves,
-cancels or publishes anything, the next priority check runs after
+Funded lifecycle work has strict priority over market creation. Empty markets do
+not preempt publishing and are capped by `EMPTY_CANCEL_LIMIT` (default 2) per
+eligible cleanup turn. If a cycle resolves, cancels or publishes anything, the next priority check runs after
 `KEEPER_BUSY_RETRY_SEC` (default 5 seconds); an idle keeper keeps the normal
 `KEEPER_CYCLE_SEC` interval (default 300 seconds). The standalone
 `keeper:v2:publish` command remains a bulk operation controlled by
@@ -79,6 +82,11 @@ a wallet-state checkpoint every 10,000 applied DUST events. Override
 `MIDNIGHT_WALLET_SYNC_TIMEOUT_MS` or `MIDNIGHT_WALLET_CHECKPOINT_EVERY` in a
 category-specific env file when needed. A failed setup saves its partial state,
 closes the wallet, and exits before the supervisor starts a fresh process.
+
+Postgres connect, query, statement, lock and close phases are independently
+bounded by the `PG_*_TIMEOUT_MS` settings. Database timeouts invalidate the
+current keeper process so the supervisor can recover instead of leaving a live
+PID blocked on a dead socket.
 
 Required configuration includes:
 

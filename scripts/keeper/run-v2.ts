@@ -34,6 +34,12 @@ async function main() {
     'KEEPER_MAX_PUBLISH_QUANTUM',
     50,
   )
+  const emptyCancelQuantum = keeperBatchLimit(
+    'EMPTY_CANCEL_LIMIT',
+    2,
+    'KEEPER_MAX_EMPTY_CANCEL_LIMIT',
+    10,
+  )
   const deployment = await resolveDeploymentV2(network)
   console.log(
     `[keeper-v2] registry ${deployment.registryAddress} → ${deployment.symbol} ` +
@@ -41,7 +47,8 @@ async function main() {
   )
   console.log(
     `[keeper-v2:${category}] up — settlement-priority cycle every ${cycleSec}s ` +
-      `(publish quantum ${publishQuantum}, busy retry ${busyRetrySec}s)`,
+      `(publish quantum ${publishQuantum}, empty cleanup quantum ${emptyCancelQuantum}, ` +
+      `busy retry ${busyRetrySec}s)`,
   )
 
   for (;;) {
@@ -50,7 +57,11 @@ async function main() {
     try {
       const cycle = await runKeeperPriorityCycle({
         resolve: () => resolveMarketsV2(network),
-        cancel: () => cancelRequestedV2(network),
+        cancelFunded: () => cancelRequestedV2(network, { mode: 'funded' }),
+        cancelEmpty: () => cancelRequestedV2(network, {
+          mode: 'empty',
+          limit: emptyCancelQuantum,
+        }),
         publish: () => publishDraftsV2(network, {
           limit: publishQuantum,
           preemptForSettlement: true,
@@ -60,9 +71,10 @@ async function main() {
       console.log(
         `[keeper-v2:${category}] cycle: ` +
           `resolve ${cycle.resolveBeforePublish.succeeded}+${cycle.resolveAfterPublish.succeeded}, ` +
-          `cancel ${cycle.cancelBeforePublish.succeeded}+${cycle.cancelAfterPublish.succeeded}, ` +
+          `funded-cancel ${cycle.fundedCancelBeforePublish.succeeded}+${cycle.fundedCancelAfterPublish.succeeded}, ` +
+          `empty-cancel ${cycle.emptyCancelAfterPublish.succeeded}, ` +
           `publish ${cycle.publish.succeeded}` +
-          `${cycle.publish.preempted ? ' (preempted for settlement)' : ''}.`,
+          `${cycle.publish.preempted ? ' (preempted for funded settlement/refund)' : ''}.`,
       )
     } catch (err) {
       console.error(`[keeper-v2:${category}] cycle error:`, errorMessage(err))

@@ -2,6 +2,10 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { PRIORITY_MARKET_EXISTS_SQL } from '../scripts/keeper/publish-v2.js'
 import {
+  EMPTY_CANCEL_PREDICATE,
+  FUNDED_CANCEL_PREDICATE,
+} from '../scripts/keeper/resolve-v2.js'
+import {
   type KeeperWorkResult,
   runKeeperPriorityCycle,
 } from '../scripts/keeper/scheduling-v2.js'
@@ -18,9 +22,13 @@ test('keeper settles before publishing and checks settlement again afterwards', 
       calls.push(`resolve-${++resolveCalls}`)
       return resolveCalls === 1 ? { selected: 1, succeeded: 1 } : none()
     },
-    cancel: async () => {
-      calls.push(`cancel-${++cancelCalls}`)
+    cancelFunded: async () => {
+      calls.push(`funded-cancel-${++cancelCalls}`)
       return none()
+    },
+    cancelEmpty: async () => {
+      calls.push('empty-cancel')
+      return { selected: 2, succeeded: 2 }
     },
     publish: async () => {
       calls.push('publish')
@@ -30,11 +38,13 @@ test('keeper settles before publishing and checks settlement again afterwards', 
 
   assert.deepEqual(calls, [
     'resolve-1',
-    'cancel-1',
+    'funded-cancel-1',
     'publish',
     'resolve-2',
-    'cancel-2',
+    'funded-cancel-2',
+    'empty-cancel',
   ])
+  assert.equal(cycle.emptyCancelAfterPublish.succeeded, 2)
   assert.equal(cycle.madeProgress, true)
 })
 
@@ -48,8 +58,12 @@ test('a preempted publish turn still reaches the post-publish settlement check',
       resolveCalls++
       return resolveCalls === 2 ? { selected: 1, succeeded: 1 } : none()
     },
-    cancel: async () => {
-      calls.push('cancel')
+    cancelFunded: async () => {
+      calls.push('funded-cancel')
+      return none()
+    },
+    cancelEmpty: async () => {
+      calls.push('empty-cancel')
       return none()
     },
     publish: async () => {
@@ -58,14 +72,23 @@ test('a preempted publish turn still reaches the post-publish settlement check',
     },
   })
 
-  assert.deepEqual(calls, ['resolve', 'cancel', 'publish', 'resolve', 'cancel'])
+  assert.deepEqual(calls, ['resolve', 'funded-cancel', 'publish', 'resolve', 'funded-cancel'])
   assert.equal(cycle.publish.preempted, true)
   assert.equal(cycle.resolveAfterPublish.succeeded, 1)
+  assert.equal(cycle.emptyCancelAfterPublish.succeeded, 0)
 })
 
-test('publish preemption query covers both resolution and refund work in the same scope', () => {
+test('publish preemption covers resolutions and funded refunds, but not empty cleanup', () => {
   assert.match(PRIORITY_MARKET_EXISTS_SQL, /ready_to_resolve/)
   assert.match(PRIORITY_MARKET_EXISTS_SQL, /cancel_requested/)
+  assert.match(PRIORITY_MARKET_EXISTS_SQL, /onchain_yes_pool/)
+  assert.match(PRIORITY_MARKET_EXISTS_SQL, /onchain_no_pool/)
+  assert.match(PRIORITY_MARKET_EXISTS_SQL, /> 0/)
   assert.match(PRIORITY_MARKET_EXISTS_SQL, /onchain_contract_address = \$1/)
   assert.match(PRIORITY_MARKET_EXISTS_SQL, /category = \$2/)
+})
+
+test('cancel queue predicates separate funded refunds from empty market cleanup', () => {
+  assert.match(FUNDED_CANCEL_PREDICATE, /> 0/)
+  assert.match(EMPTY_CANCEL_PREDICATE, /= 0/)
 })

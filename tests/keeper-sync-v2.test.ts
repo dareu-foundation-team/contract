@@ -12,3 +12,10 @@ test('V2 mirror refreshes an unchanged market once after close', () => {
 test('V2 mirror initializes observation time for existing rows', () => {
   assert.match(V2_MARKET_MIRROR_UPDATE_SQL, /market\.onchain_observed_at IS NULL/)
 })
+
+test('V2 mirror converges final on-chain status back into the canonical DB status', () => {
+  assert.match(V2_MARKET_MIRROR_UPDATE_SQL, /state\.status IN \('resolved', 'cancelled'\)/)
+  assert.match(V2_MARKET_MIRROR_UPDATE_SQL, /market\.status IS DISTINCT FROM state\.status/)
+  assert.match(V2_MARKET_MIRROR_UPDATE_SQL, /WHEN state\.status = 'resolved' THEN state\.outcome/)
+  assert.match(V2_MARKET_MIRROR_UPDATE_SQL, /WHEN state\.status = 'cancelled' THEN NULL/)
+})

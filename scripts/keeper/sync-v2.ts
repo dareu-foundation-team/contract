@@ -3,9 +3,14 @@
 //
 //   npm run keeper:v2:sync -- preprod                    # dedicated 30s loop
 //   SYNC_INTERVAL_SEC=0 npm run keeper:v2:sync -- preprod # one-shot
-import pg from 'pg'
 import { MarketStatus, Outcome } from '../../src/managed/dareu-v2/contract/index.js'
-import { loadEnvFiles, optionalEnv, requiredEnv, resolveNetwork } from '../shared/chain.js'
+import {
+  loadEnvFiles,
+  optionalEnv,
+  pgExec,
+  requiredEnv,
+  resolveNetwork,
+} from '../shared/chain.js'
 import { ensureV2MarketColumns, readV2Ledger, resolveDeploymentV2 } from '../shared/chain-v2.js'
 import { V2_MARKET_MIRROR_UPDATE_SQL } from './sync-v2-sql.js'
 
@@ -71,18 +76,12 @@ export async function syncOnceV2(network: ReturnType<typeof resolveNetwork>): Pr
     return { scanned: 0, updated: 0, durationMs: Date.now() - startedAt }
   }
 
-  const client = new pg.Client({ connectionString: dbUrl })
-  await client.connect()
-  let updated = 0
-  try {
-    const result = await client.query(
-      V2_MARKET_MIRROR_UPDATE_SQL,
-      [ids, statuses, yesPools, noPools, outcomes, deployment.contractAddress],
-    )
-    updated = result.rowCount ?? 0
-  } finally {
-    await client.end()
-  }
+  const result = await pgExec(
+    dbUrl,
+    V2_MARKET_MIRROR_UPDATE_SQL,
+    [ids, statuses, yesPools, noPools, outcomes, deployment.contractAddress],
+  )
+  const updated = result.rowCount ?? 0
 
   const stats = { scanned: ids.length, updated, durationMs: Date.now() - startedAt }
   console.log(
