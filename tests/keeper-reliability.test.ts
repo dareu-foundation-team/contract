@@ -27,12 +27,23 @@ test('transport failures invalidate the current wallet context', () => {
     'Query read timeout',
     'canceling statement due to statement timeout',
     'Timed out while waiting for Midnight wallet sync. Check the Indexer websocket and wallet seed.',
+    'No response received from RPC endpoint in 60s',
+    'FATAL: Unable to initialize the API: No response received from RPC endpoint in 60s',
+    'API-WS disconnected: 1006 Abnormal Closure',
+    'RPC preflight timed out after 15000ms',
   ]) {
     assert.equal(isBrokenKeeperContext(new Error(message)), true, message)
   }
   assert.equal(isBrokenKeeperContext(new Error('failed assert: Market does not exist')), false)
   assert.throws(
     () => abortBatchIfContextBroken('publish-v2', new Error('read ECONNRESET')),
+    KeeperContextBrokenError,
+  )
+  assert.throws(
+    () => abortBatchIfContextBroken(
+      'publish-v2 create_market',
+      new Error('Invalid Transaction: Custom error: 170'),
+    ),
     KeeperContextBrokenError,
   )
 })

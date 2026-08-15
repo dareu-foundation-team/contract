@@ -5,8 +5,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 NETWORK="${1:-preprod}"
 CATEGORY="${2:-}"
 RESTART_DELAY_SEC="${KEEPER_RESTART_DELAY_SEC:-20}"
+RESTART_MAX_DELAY_SEC="${KEEPER_RESTART_MAX_DELAY_SEC:-300}"
+RESTART_STABLE_SEC="${KEEPER_RESTART_STABLE_SEC:-600}"
 STOPPING=0
 CHILD_PID=""
+CONSECUTIVE_FAILURES=0
 
 cd "$ROOT_DIR"
 
@@ -62,6 +65,7 @@ trap stop_child INT TERM
 
 while [[ "$STOPPING" -eq 0 ]]; do
   echo "[keeper-supervisor:$CATEGORY] $(date -u +%Y-%m-%dT%H:%M:%SZ) starting V2 keeper on $NETWORK"
+  STARTED_AT=$(date +%s)
   npm run keeper:run -- "$NETWORK" "$CATEGORY" &
   CHILD_PID=$!
   wait "$CHILD_PID"
@@ -72,8 +76,30 @@ while [[ "$STOPPING" -eq 0 ]]; do
     break
   fi
 
-  echo "[keeper-supervisor:$CATEGORY] keeper exited with status $STATUS; restarting in ${RESTART_DELAY_SEC}s"
-  sleep "$RESTART_DELAY_SEC" &
+  RUNTIME_SEC=$(( $(date +%s) - STARTED_AT ))
+  if [[ "$RUNTIME_SEC" -ge "$RESTART_STABLE_SEC" ]]; then
+    CONSECUTIVE_FAILURES=1
+  else
+    CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+  fi
+
+  # Exponential backoff prevents three category wallets from hammering an unhealthy
+  # public RPC every 20 seconds. A small jitter also keeps their retries de-synchronized.
+  DELAY_SEC="$RESTART_DELAY_SEC"
+  for ((attempt = 1; attempt < CONSECUTIVE_FAILURES; attempt++)); do
+    DELAY_SEC=$((DELAY_SEC * 2))
+    if [[ "$DELAY_SEC" -ge "$RESTART_MAX_DELAY_SEC" ]]; then
+      DELAY_SEC="$RESTART_MAX_DELAY_SEC"
+      break
+    fi
+  done
+  JITTER_MAX=$((DELAY_SEC / 5))
+  JITTER_SEC=$((RANDOM % (JITTER_MAX + 1)))
+  DELAY_SEC=$((DELAY_SEC + JITTER_SEC))
+  if [[ "$DELAY_SEC" -gt "$RESTART_MAX_DELAY_SEC" ]]; then DELAY_SEC="$RESTART_MAX_DELAY_SEC"; fi
+
+  echo "[keeper-supervisor:$CATEGORY] keeper exited with status $STATUS after ${RUNTIME_SEC}s; consecutive failure ${CONSECUTIVE_FAILURES}; restarting in ${DELAY_SEC}s"
+  sleep "$DELAY_SEC" &
   CHILD_PID=$!
   wait "$CHILD_PID" 2>/dev/null || true
   CHILD_PID=""

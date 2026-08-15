@@ -229,6 +229,64 @@ export function configureNetwork(network: SupportedNetwork): NetworkConfig {
   return resolveNetworkConfig(network);
 }
 
+/**
+ * Fail fast before starting four wallet services when the public node websocket is
+ * accepting TCP connections but not answering JSON-RPC. Without this guard the SDK
+ * waits 60 seconds per initialization and may leave reconnecting providers behind.
+ */
+export async function assertNodeRpcResponsive(config: NetworkConfig): Promise<void> {
+  const waitMs = timeoutMs('MIDNIGHT_RPC_PREFLIGHT_TIMEOUT_MS', 15_000);
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(config.nodeWS);
+    let settled = false;
+    const timer = setTimeout(() => {
+      finish(new Error(`RPC preflight timed out after ${waitMs}ms waiting for ${config.nodeWS}`));
+    }, waitMs);
+
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // terminate() is deliberate: this socket is a one-shot health probe and must not
+      // enter the provider-style reconnect loop after a failed or successful response.
+      try { ws.terminate(); } catch { /* already closed */ }
+      if (error) reject(error);
+      else resolve();
+    };
+
+    ws.once('open', () => {
+      try {
+        ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'system_health', params: [] }));
+      } catch (error) {
+        finish(new Error(`RPC preflight could not query ${config.nodeWS}: ${errorMessage(error)}`));
+      }
+    });
+    ws.on('message', (raw) => {
+      try {
+        const response = JSON.parse(String(raw)) as { id?: number; result?: unknown; error?: unknown };
+        if (response.id !== 1) return;
+        if (response.error) {
+          finish(new Error(`RPC preflight failed for ${config.nodeWS}: ${JSON.stringify(response.error)}`));
+          return;
+        }
+        if (response.result == null) {
+          finish(new Error(`RPC preflight received an empty system_health response from ${config.nodeWS}`));
+          return;
+        }
+        finish();
+      } catch (error) {
+        finish(new Error(`RPC preflight received an invalid response from ${config.nodeWS}: ${errorMessage(error)}`));
+      }
+    });
+    ws.once('error', (error) => {
+      finish(new Error(`RPC preflight websocket error for ${config.nodeWS}: ${errorMessage(error)}`));
+    });
+    ws.once('close', (code, reason) => {
+      if (!settled) finish(new Error(`RPC preflight websocket closed for ${config.nodeWS}: ${code} ${String(reason)}`));
+    });
+  });
+}
+
 const SEED_HEX_RE = /^[0-9a-fA-F]+$/;
 
 /**
@@ -314,6 +372,7 @@ export function deriveKeys(seedOrMnemonic: string) {
 
 export async function createWallet(seedHex: string, network: SupportedNetwork, config: NetworkConfig): Promise<WalletContext> {
   globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket;
+  await assertNodeRpcResponsive(config);
   // NOTE: ledger-v8 8.1.0 parses & replays the v9 `DustGenerationDtimeUpdate` events
   // natively, so the old replay-filter workaround (removed) is no longer needed. If
   // DUST replay errors ever return, recover the patch from git history.
@@ -397,16 +456,32 @@ export async function createWallet(seedHex: string, network: SupportedNetwork, c
   });
 
   console.log('Starting Midnight wallet services...');
-  await withTimeout(
-    Promise.all([
-      wallet.shielded.start(shieldedSecretKeys),
-      wallet.unshielded.start(),
-      wallet.dust.start(dustSecretKey),
-      wallet.pendingTransactionsService.start(),
-    ]).then(() => undefined),
-    timeoutMs('MIDNIGHT_WALLET_START_TIMEOUT_MS', 300_000),
-    'Timed out while starting Midnight wallet services. Check Preprod RPC/Indexer connectivity and try again.',
-  );
+  try {
+    await withTimeout(
+      Promise.all([
+        wallet.shielded.start(shieldedSecretKeys),
+        wallet.unshielded.start(),
+        wallet.dust.start(dustSecretKey),
+        wallet.pendingTransactionsService.start(),
+      ]).then(() => undefined),
+      timeoutMs('MIDNIGHT_WALLET_START_TIMEOUT_MS', 300_000),
+      'Timed out while starting Midnight wallet services. Check Preprod RPC/Indexer connectivity and try again.',
+    );
+  } catch (error) {
+    // createWallet has not returned yet, so the caller cannot own cleanup. Stop every
+    // partially-started service here or its websocket will keep reconnecting after the
+    // supervisor starts a replacement process.
+    try {
+      await withTimeout(
+        wallet.stop(),
+        timeoutMs('KEEPER_WALLET_STOP_TIMEOUT_MS', 30_000),
+        'Partially-started Midnight wallet did not stop within the cleanup timeout.',
+      );
+    } catch (stopError) {
+      console.warn(`Could not stop partially-started Midnight wallet: ${errorMessage(stopError)}`);
+    }
+    throw error;
+  }
   console.log('Midnight wallet services started (shielded + unshielded + DUST).');
 
   // Persist the synced state to disk (atomic write) so the next run resumes
@@ -481,19 +556,101 @@ export async function currentWalletState(wallet: WalletFacade) {
   return Rx.firstValueFrom(wallet.state());
 }
 
+export type WalletTransactionCheckpoint = {
+  /** DUST event index applied before the transaction starts proving. */
+  dustAppliedIndex: number;
+};
+
+/**
+ * Capture the DUST sync position immediately before building a transaction.
+ * The post-transaction barrier requires this index to advance, which prevents a
+ * merely "currently synced" wallet from satisfying the barrier against the
+ * pre-transaction Indexer view.
+ */
+export async function captureWalletTransactionCheckpoint(
+  wallet: WalletFacade,
+): Promise<WalletTransactionCheckpoint> {
+  const state = await currentWalletState(wallet);
+  return { dustAppliedIndex: dustAppliedIndex(state) };
+}
+
+/** Exported as a small pure predicate so the strict Keeper barrier is testable. */
+export function isWalletTransactionSettled(
+  state: Awaited<ReturnType<typeof currentWalletState>>,
+  checkpoint: WalletTransactionCheckpoint,
+): boolean {
+  return (
+    // callTx already waits for Indexer finalization. The pending service then
+    // independently observes that finalized transaction through the Indexer.
+    state.pending.all.length === 0 &&
+    // A DUST spend is booked while balancing. Do not let another proof reuse
+    // the session until the wallet has consumed/released every booked DUST coin.
+    state.dust.pendingCoins.length === 0 &&
+    // Require the wallet to have applied at least one new DUST-relevant event
+    // after the pre-proof checkpoint, not just report the old tip as synced.
+    dustAppliedIndex(state) > checkpoint.dustAppliedIndex &&
+    // Publishing uses an exact post-transaction barrier even if a looser gap is
+    // configured for the initial, potentially very long wallet replay.
+    isWalletStateSyncedWithin(state, 0n)
+  );
+}
+
+/**
+ * Block before the next proof until the finalized transaction is visible to the
+ * wallet, all pending bookkeeping is cleared, and every wallet stream has caught
+ * up exactly to the Indexer tip. A timeout is fatal to the current Keeper context.
+ */
+export async function waitForWalletTransactionSettlement(
+  wallet: WalletFacade,
+  txId: string,
+  checkpoint: WalletTransactionCheckpoint,
+) {
+  const waitMs = timeoutMs('MIDNIGHT_WALLET_POST_TX_SYNC_TIMEOUT_MS', 300_000);
+  console.log(
+    `Waiting for wallet/DUST confirmation of transaction ${txId || '(unknown)'} ` +
+      `(DUST applied index > ${checkpoint.dustAppliedIndex})...`,
+  );
+
+  const state = await Rx.firstValueFrom(
+    wallet.state().pipe(
+      Rx.filter((next) => isWalletTransactionSettled(next, checkpoint)),
+      Rx.timeout({
+        first: waitMs,
+        with: () => Rx.throwError(
+          () => new Error(
+            `Timed out after ${waitMs}ms waiting for wallet sync and DUST pending state to clear ` +
+              `after transaction ${txId || '(unknown)'}.`,
+          ),
+        ),
+      }),
+    ),
+  );
+
+  console.log(
+    `Wallet/DUST confirmed transaction ${txId || '(unknown)'} ` +
+      `(DUST applied=${dustAppliedIndex(state)}, pending=0).`,
+  );
+  return state;
+}
+
 export async function submitTransactionOnce(tx: { serialize(): Uint8Array }, config: NetworkConfig) {
-  const api = await ApiPromise.create({
-    provider: new WsProvider(config.nodeWS),
-    throwOnConnect: false,
-    noInitWarn: true,
-  });
+  const provider = new WsProvider(config.nodeWS);
+  let api: ApiPromise | undefined;
 
   try {
+    api = await ApiPromise.create({
+      provider,
+      throwOnConnect: false,
+      noInitWarn: true,
+    });
     const serializedTx = u8aToHex(tx.serialize());
     const txHash = await (api.tx as any).midnight.sendMnTransaction(serializedTx).send();
     return String(txHash);
   } finally {
-    await api.disconnect();
+    // ApiPromise.create itself can reject after the 60s RPC initialization timeout.
+    // In that case there is no `api` to disconnect, but the WsProvider is already live.
+    if (api) await api.disconnect().catch(() => undefined);
+    else await provider.disconnect().catch(() => undefined);
   }
 }
 

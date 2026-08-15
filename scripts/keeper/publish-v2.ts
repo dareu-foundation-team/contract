@@ -14,8 +14,13 @@ import {
 } from '../shared/chain.js'
 import { connectKeeperV2, ensureV2MarketColumns, resolveDeploymentV2 } from '../shared/chain-v2.js'
 import {
+  captureWalletTransactionCheckpoint,
+  waitForWalletTransactionSettlement,
+} from '../shared/midnight.js'
+import {
   abortBatchIfContextBroken,
   errorMessage,
+  KeeperContextBrokenError,
   keeperBatchLimit,
   stopWalletSafely,
   withKeeperTransactionTimeout,
@@ -151,6 +156,8 @@ export async function publishDraftsV2(
           console.log('[publish-v2] yielding at transaction boundary: funded settlement/refund work is waiting.')
           break
         }
+        let confirmedOnChain = false
+        let recordedInDatabase = false
         try {
           // A large backlog can take hours. Re-check the lead time immediately
           // before proving so an item selected at the start of the sweep cannot
@@ -165,6 +172,7 @@ export async function publishDraftsV2(
             continue
           }
 
+          const walletCheckpoint = await captureWalletTransactionCheckpoint(walletCtx.wallet)
           const result = await withKeeperTransactionTimeout(
             `create_market ${row.id.slice(0, 12)}`,
             () => deployed.callTx.create_market(
@@ -179,6 +187,10 @@ export async function publishDraftsV2(
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const r = result as any
           const txId: string = r?.public?.txId ?? r?.txId ?? r?.finalizedTxData?.txId ?? ''
+          // callTx is blocking and returns only after Indexer finalization. From
+          // this point on, any local DB/barrier failure must destroy the session:
+          // proceeding would build the next proof from an unconfirmed wallet view.
+          confirmedOnChain = true
           await pgExec(
             dbUrl,
             `UPDATE markets SET status='open', onchain_tx_id=$2,
@@ -188,11 +200,43 @@ export async function publishDraftsV2(
               WHERE id=$1 AND status IN ('draft', 'open')`,
             [row.id, txId || 'onchain', deployment.contractAddress],
           )
+          recordedInDatabase = true
           ok++
           console.log(`  ✓ ${row.id.slice(0, 12)}… published (tx ${txId ? txId.slice(0, 12) + '…' : '?'})`)
+
+          // callTx returns only after the Indexer has finalized the transaction,
+          // but the wallet's DUST stream and pending service can still lag that
+          // observation. Never build the next proof until both have caught up.
+          try {
+            await withKeeperTransactionTimeout(
+              `post-transaction wallet sync ${row.id.slice(0, 12)}`,
+              () => waitForWalletTransactionSettlement(
+                walletCtx.wallet,
+                txId,
+                walletCheckpoint,
+              ),
+            )
+            await walletCtx.saveState()
+          } catch (error) {
+            throw new KeeperContextBrokenError(
+              `post-transaction wallet sync ${row.id.slice(0, 12)}`,
+              error,
+            )
+          }
         } catch (err) {
           const msg = errorMessage(err)
-          if (/Market already exists/i.test(msg)) {
+          if (confirmedOnChain) {
+            console.error(
+              `  ✗ ${row.id.slice(0, 12)}… is on-chain, but post-confirmation handling failed; ` +
+                `${recordedInDatabase ? 'the market remains marked open' : 'the database will reconcile it on retry'} ` +
+                `and this wallet session will be destroyed: ${msg}`,
+            )
+            if (err instanceof KeeperContextBrokenError) throw err
+            throw new KeeperContextBrokenError(
+              `post-confirmation handling ${row.id.slice(0, 12)}`,
+              err,
+            )
+          } else if (/Market already exists/i.test(msg)) {
             await pgExec(
               dbUrl,
               `UPDATE markets SET status='open', onchain_tx_id='onchain',
@@ -204,8 +248,10 @@ export async function publishDraftsV2(
             console.log(`  • ${row.id.slice(0, 12)}… already on-chain — marked`)
           } else {
             console.error(`  ✗ ${row.id.slice(0, 12)}… failed (left as draft): ${msg}`)
-            // A transport failure invalidates the wallet's view of DUST/UTXOs.
-            // Abort this session instead of poisoning every remaining row.
+            // A transport failure or InvalidDustSpendProof (Custom error 170)
+            // invalidates the wallet's view of DUST/UTXOs. 170 is deliberately
+            // fatal here: only the supervisor may retry it in a fresh process and
+            // wallet context; this loop must never retry it in the same session.
             abortBatchIfContextBroken(`publish-v2 ${row.id.slice(0, 12)}`, err)
           }
         }

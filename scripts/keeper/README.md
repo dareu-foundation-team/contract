@@ -80,8 +80,26 @@ SYNC_INTERVAL_SEC=0 npm run keeper:v2:sync -- preprod
 The supervisor gives the initial Preprod wallet replay up to six hours and saves
 a wallet-state checkpoint every 10,000 applied DUST events. Override
 `MIDNIGHT_WALLET_SYNC_TIMEOUT_MS` or `MIDNIGHT_WALLET_CHECKPOINT_EVERY` in a
-category-specific env file when needed. A failed setup saves its partial state,
-closes the wallet, and exits before the supervisor starts a fresh process.
+category-specific env file when needed. Before starting wallet services, the
+keeper performs a bounded `system_health` websocket probe
+(`MIDNIGHT_RPC_PREFLIGHT_TIMEOUT_MS`, default 15 seconds). A failed setup closes
+every partially-started wallet service and exits before the supervisor starts a
+fresh process.
+
+After every successful write, the Keeper waits for the transaction to be
+finalized by the Indexer, for the wallet's DUST applied index to advance, for
+all DUST/pending-transaction bookings to clear, and for every wallet stream to
+reach the exact Indexer tip before it builds another proof. The barrier timeout
+defaults to five minutes and can be changed with
+`MIDNIGHT_WALLET_POST_TX_SYNC_TIMEOUT_MS`. A barrier failure or node
+`Custom error: 170` destroys the current wallet context; only the supervisor's
+fresh process may retry. A transaction rejected with 170 stays `draft`, while a
+transaction finalized before a barrier failure stays marked `open`.
+
+Consecutive short-lived process failures use exponential restart backoff instead
+of reconnecting every 20 seconds. Configure the base, cap and stable-runtime reset
+with `KEEPER_RESTART_DELAY_SEC` (default 20), `KEEPER_RESTART_MAX_DELAY_SEC`
+(default 300) and `KEEPER_RESTART_STABLE_SEC` (default 600).
 
 Postgres connect, query, statement, lock and close phases are independently
 bounded by the `PG_*_TIMEOUT_MS` settings. Database timeouts invalidate the

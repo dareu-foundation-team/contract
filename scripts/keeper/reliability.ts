@@ -89,7 +89,7 @@ export function isBrokenKeeperContext(error: unknown): boolean {
   const message = errorMessage(error)
   const code = error instanceof Error ? (error as Error & { code?: string }).code : undefined
   return code === 'PG_CLOSE_TIMEOUT' ||
-    /ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|ENOTFOUND|socket hang up|websocket|wallet[.\s_-]*sync|servererror|connection.*(?:closed|lost|reset|timeout)|query.*timeout|statement timeout|disconnected|Custom error:\s*170/i.test(message)
+    /ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|ENOTFOUND|socket hang up|websocket|wallet[.\s_-]*sync|servererror|connection.*(?:closed|lost|reset|timeout)|query.*timeout|statement timeout|disconnected|no response received from RPC endpoint|unable to initialize the API|RPC preflight|abnormal closure|Custom error:\s*170/i.test(message)
 }
 
 /** Re-throw transport failures so the current wallet is never reused for the next row. */
