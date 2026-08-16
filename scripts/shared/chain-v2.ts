@@ -15,6 +15,7 @@ import { ledger as ledgerRegistry } from '../../src/managed/dareu-registry/contr
 import {
   configureNetwork,
   contractRoot,
+  currentWalletState,
   createProviders,
   createWallet,
   requiredWalletSeedOrMnemonic,
@@ -252,6 +253,29 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
     // V2 consumes sNIGHT coins. Waiting only for DUST leaves shielded.availableCoins
     // empty even after a successful deposit, causing repeated bond deposits.
     await waitForSyncedState(walletCtx.wallet)
+    const walletState = await currentWalletState(walletCtx.wallet)
+    const dustBalance = walletState.dust.balance(new Date())
+    console.log(
+      `[keeper-v2] DUST spendable=${dustBalance.toString()} ` +
+        `(available coins=${walletState.dust.availableCoins.length}, ` +
+        `pending coins=${walletState.dust.pendingCoins.length})`,
+    )
+    if (dustBalance <= 0n || walletState.dust.availableCoins.length === 0) {
+      const unshieldedAddress = String(walletCtx.unshieldedKeystore.getBech32Address())
+      const nightUtxos = walletState.unshielded.availableCoins
+      const unregisteredNightUtxos = nightUtxos.filter(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (coin: any) => !coin.meta?.registeredForDustGeneration,
+      )
+      console.warn(
+        `[keeper-v2] wallet=${unshieldedAddress}; NIGHT UTXOs=${nightUtxos.length} ` +
+          `(unregistered for DUST=${unregisteredNightUtxos.length})`,
+      )
+      throw new Error(
+        'Wallet.InsufficientFunds: no spendable DUST coin is available after an exact wallet sync. ' +
+          'The Keeper will wait for DUST generation/maturity before retrying.',
+      )
+    }
     await walletCtx.saveState()
 
     const providers = await createProviders(walletCtx, config, privateStoragePassword, {

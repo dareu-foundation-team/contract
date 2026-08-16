@@ -2,9 +2,12 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   KeeperContextBrokenError,
+  KeeperDustUnavailableError,
   KeeperTransactionTimeoutError,
   abortBatchIfContextBroken,
+  abortBatchIfWalletUnavailable,
   isBrokenKeeperContext,
+  isKeeperDustUnavailable,
   keeperBatchLimit,
   withKeeperTransactionTimeout,
 } from '../scripts/keeper/reliability.js'
@@ -45,6 +48,23 @@ test('transport failures invalidate the current wallet context', () => {
       new Error('Invalid Transaction: Custom error: 170'),
     ),
     KeeperContextBrokenError,
+  )
+})
+
+test('DUST insufficiency stops the whole batch without marking the context broken', () => {
+  const error = new Error(
+    'Wallet.InsufficientFunds: Insufficient Funds: could not balance dust',
+  )
+  assert.equal(isKeeperDustUnavailable(error), true)
+  assert.equal(isBrokenKeeperContext(error), false)
+  assert.throws(
+    () => abortBatchIfWalletUnavailable('publish-v2 market-a', error),
+    (caught: unknown) => caught instanceof KeeperDustUnavailableError &&
+      caught.operation === 'publish-v2 market-a',
+  )
+  assert.equal(
+    isKeeperDustUnavailable(new Error('Wallet.InsufficientFunds: shielded NIGHT is missing')),
+    false,
   )
 })
 

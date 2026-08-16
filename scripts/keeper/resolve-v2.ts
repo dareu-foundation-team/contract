@@ -18,7 +18,7 @@ import {
   resolveDeploymentV2,
 } from '../shared/chain-v2.js'
 import {
-  abortBatchIfContextBroken,
+  abortBatchIfWalletUnavailable,
   errorMessage,
   keeperBatchLimit,
   stopWalletSafely,
@@ -97,7 +97,7 @@ export async function resolveMarketsV2(
         console.log(`  ✓ ${row.id.slice(0, 12)}… resolved ${row.outcome.toUpperCase()}`)
       } catch (error) {
         console.error(`  ✗ ${row.id.slice(0, 12)}… resolve failed: ${errorMessage(error)}`)
-        abortBatchIfContextBroken(`resolve-v2 ${row.id.slice(0, 12)}`, error)
+        abortBatchIfWalletUnavailable(`resolve-v2 ${row.id.slice(0, 12)}`, error)
       }
     }
   } finally {
@@ -172,7 +172,7 @@ export async function cancelRequestedV2(
         console.log(`  ✓ ${row.id.slice(0, 12)}… cancelled`)
       } catch (error) {
         console.error(`  ✗ ${row.id.slice(0, 12)}… cancel failed: ${errorMessage(error)}`)
-        abortBatchIfContextBroken(`cancel-v2 ${row.id.slice(0, 12)}`, error)
+        abortBatchIfWalletUnavailable(`cancel-v2 ${row.id.slice(0, 12)}`, error)
       }
     }
   } finally {

@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { isWalletTransactionSettled } from '../scripts/shared/midnight.js'
+import {
+  dustCostParameters,
+  isWalletTransactionSettled,
+} from '../scripts/shared/midnight.js'
 
 type StateOptions = {
   dustApplied?: number
@@ -53,4 +56,18 @@ test('post-transaction barrier requires Indexer, DUST and strict wallet sync', (
     walletState({ synced: false }) as any,
     checkpoint,
   ), false)
+})
+
+test('remote DUST fee overhead defaults low and remains configurable', () => {
+  const previous = process.env.MIDNIGHT_DUST_ADDITIONAL_FEE_OVERHEAD
+  try {
+    delete process.env.MIDNIGHT_DUST_ADDITIONAL_FEE_OVERHEAD
+    assert.equal(dustCostParameters().additionalFeeOverhead, 1_000n)
+
+    process.env.MIDNIGHT_DUST_ADDITIONAL_FEE_OVERHEAD = '2500'
+    assert.equal(dustCostParameters().additionalFeeOverhead, 2_500n)
+  } finally {
+    if (previous === undefined) delete process.env.MIDNIGHT_DUST_ADDITIONAL_FEE_OVERHEAD
+    else process.env.MIDNIGHT_DUST_ADDITIONAL_FEE_OVERHEAD = previous
+  }
 })

@@ -101,6 +101,22 @@ of reconnecting every 20 seconds. Configure the base, cap and stable-runtime res
 with `KEEPER_RESTART_DELAY_SEC` (default 20), `KEEPER_RESTART_MAX_DELAY_SEC`
 (default 300) and `KEEPER_RESTART_STABLE_SEC` (default 600).
 
+Before proving a write, each wallet session performs an exact sync and reports
+its spendable DUST coin count. A wallet with no spendable DUST aborts the whole
+batch before proving the first market and retries after `KEEPER_DUST_RETRY_SEC`
+(default 300 seconds). This is expected time-based backpressure, not a broken
+wallet context. Fund and register a new Keeper wallet once with:
+
+```bash
+npm run keeper:v2:prepare-wallet -- preprod crypto
+```
+
+Use the appropriate category in place of `crypto`. The DUST fee headroom defaults
+to 1,000 specks and can be overridden with
+`MIDNIGHT_DUST_ADDITIONAL_FEE_OVERHEAD`; do not restore the old
+`300000000000000` value because it can make an otherwise affordable transaction
+fail local DUST coin selection.
+
 Postgres connect, query, statement, lock and close phases are independently
 bounded by the `PG_*_TIMEOUT_MS` settings. Database timeouts invalidate the
 current keeper process so the supervisor can recover instead of leaving a live

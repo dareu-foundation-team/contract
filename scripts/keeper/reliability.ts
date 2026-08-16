@@ -25,6 +25,21 @@ export class KeeperContextBrokenError extends Error {
   }
 }
 
+/**
+ * Expected backpressure while generated DUST cannot fund the next transaction.
+ * It is not a corrupt wallet context, but it is batch-wide: proving more rows in
+ * the same session can only repeat the same balance failure.
+ */
+export class KeeperDustUnavailableError extends Error {
+  readonly code = 'KEEPER_DUST_UNAVAILABLE'
+
+  constructor(readonly operation: string, cause: unknown) {
+    super(`${operation} is waiting for spendable DUST: ${errorMessage(cause)}`)
+    this.name = 'KeeperDustUnavailableError'
+    ;(this as Error & { cause?: unknown }).cause = cause
+  }
+}
+
 export function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message
   if (typeof error === 'string') return error
@@ -84,6 +99,14 @@ export function isKeeperTransactionTimeout(error: unknown): error is KeeperTrans
     (error instanceof Error && (error as Error & { code?: string }).code === 'KEEPER_TX_TIMEOUT')
 }
 
+export function isKeeperDustUnavailable(error: unknown): boolean {
+  if (error instanceof KeeperDustUnavailableError) return true
+  const message = errorMessage(error)
+  const code = error instanceof Error ? (error as Error & { code?: string }).code : undefined
+  return code === 'KEEPER_DUST_UNAVAILABLE' ||
+    /Wallet\.InsufficientFunds[\s\S]*(?:balance dust|spendable DUST)|could not balance dust|no spendable DUST coin/i.test(message)
+}
+
 export function isBrokenKeeperContext(error: unknown): boolean {
   if (isKeeperTransactionTimeout(error) || error instanceof KeeperContextBrokenError) return true
   const message = errorMessage(error)
@@ -96,6 +119,12 @@ export function isBrokenKeeperContext(error: unknown): boolean {
 export function abortBatchIfContextBroken(operation: string, error: unknown): void {
   if (isKeeperTransactionTimeout(error)) throw error
   if (isBrokenKeeperContext(error)) throw new KeeperContextBrokenError(operation, error)
+}
+
+/** Stop a batch on either a broken context or expected DUST backpressure. */
+export function abortBatchIfWalletUnavailable(operation: string, error: unknown): void {
+  if (isKeeperDustUnavailable(error)) throw new KeeperDustUnavailableError(operation, error)
+  abortBatchIfContextBroken(operation, error)
 }
 
 export async function stopWalletSafely(

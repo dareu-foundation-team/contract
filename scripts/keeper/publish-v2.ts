@@ -18,7 +18,7 @@ import {
   waitForWalletTransactionSettlement,
 } from '../shared/midnight.js'
 import {
-  abortBatchIfContextBroken,
+  abortBatchIfWalletUnavailable,
   errorMessage,
   KeeperContextBrokenError,
   keeperBatchLimit,
@@ -252,7 +252,10 @@ export async function publishDraftsV2(
             // invalidates the wallet's view of DUST/UTXOs. 170 is deliberately
             // fatal here: only the supervisor may retry it in a fresh process and
             // wallet context; this loop must never retry it in the same session.
-            abortBatchIfContextBroken(`publish-v2 ${row.id.slice(0, 12)}`, err)
+            // Insufficient DUST is batch-wide, not market-specific. Stop after
+            // the first failure instead of proving every remaining draft only
+            // to hit the same wallet coin-selection error.
+            abortBatchIfWalletUnavailable(`publish-v2 ${row.id.slice(0, 12)}`, err)
           }
         }
       }

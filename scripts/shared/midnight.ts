@@ -138,6 +138,20 @@ function bigintEnv(name: string, fallback: bigint) {
   }
 }
 
+/**
+ * Fee headroom added after the ledger's own DUST fee estimate.
+ *
+ * The previous 300e12-speck value came from early wallet examples and can make
+ * an affordable remote-network transaction fail local coin selection. Keep the
+ * current small remote-network cushion configurable for future fee changes.
+ */
+export function dustCostParameters() {
+  return {
+    additionalFeeOverhead: bigintEnv('MIDNIGHT_DUST_ADDITIONAL_FEE_OVERHEAD', 1_000n),
+    feeBlocksMargin: 5,
+  };
+}
+
 async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeoutPromise = new Promise<never>((_resolve, reject) => {
@@ -386,10 +400,7 @@ export async function createWallet(seedHex: string, network: SupportedNetwork, c
   // We don't surface tx history in the admin CLI, so a no-op store satisfies the
   // wallets' required txHistoryStorage without the schema InMemory now demands.
   const txHistoryStorage = new NoOpTransactionHistoryStorage<TransactionHistoryStorage.TransactionHistoryEntryWithHash>();
-  const costParameters = {
-    additionalFeeOverhead: 300_000_000_000_000n,
-    feeBlocksMargin: 5,
-  };
+  const costParameters = dustCostParameters();
   const indexerClientConnection = {
     indexerHttpUrl: config.indexer,
     indexerWsUrl: config.indexerWS,

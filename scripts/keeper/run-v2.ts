@@ -15,6 +15,7 @@ import { resolveDeploymentV2 } from '../shared/chain-v2.js'
 import {
   errorMessage,
   isBrokenKeeperContext,
+  isKeeperDustUnavailable,
   isKeeperTransactionTimeout,
   keeperBatchLimit,
 } from './reliability.js'
@@ -28,6 +29,7 @@ async function main() {
   const cycleSec = Number(optionalEnv('KEEPER_CYCLE_SEC') ?? '300')
   const busyRetrySec = Number(optionalEnv('KEEPER_BUSY_RETRY_SEC') ?? '5')
   const errorRetrySec = Number(optionalEnv('KEEPER_ERROR_RETRY_SEC') ?? '20')
+  const dustRetrySec = Number(optionalEnv('KEEPER_DUST_RETRY_SEC') ?? String(cycleSec))
   const publishQuantum = keeperBatchLimit(
     'PUBLISH_QUANTUM',
     10,
@@ -53,6 +55,7 @@ async function main() {
 
   for (;;) {
     let cycleFailed = false
+    let dustUnavailable = false
     let madeProgress = false
     try {
       const cycle = await runKeeperPriorityCycle({
@@ -84,14 +87,23 @@ async function main() {
         // its replacement.
         throw err
       }
-      cycleFailed = true
+      if (isKeeperDustUnavailable(err)) dustUnavailable = true
+      else cycleFailed = true
     }
-    const waitSec = cycleFailed ? errorRetrySec : madeProgress ? busyRetrySec : cycleSec
-    const waitReason = cycleFailed
-      ? ' (recovery retry)'
-      : madeProgress
-        ? ' (queue still active)'
-        : ''
+    const waitSec = dustUnavailable
+      ? dustRetrySec
+      : cycleFailed
+        ? errorRetrySec
+        : madeProgress
+          ? busyRetrySec
+          : cycleSec
+    const waitReason = dustUnavailable
+      ? ' (waiting for spendable DUST)'
+      : cycleFailed
+        ? ' (recovery retry)'
+        : madeProgress
+          ? ' (queue still active)'
+          : ''
     console.log(`[keeper-v2:${category}] next cycle in ${waitSec}s${waitReason}.`)
     await new Promise((r) => setTimeout(r, waitSec * 1000))
   }
