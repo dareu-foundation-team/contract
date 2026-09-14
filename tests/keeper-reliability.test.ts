@@ -52,16 +52,24 @@ test('transport failures invalidate the current wallet context', () => {
 })
 
 test('DUST insufficiency stops the whole batch without marking the context broken', () => {
-  const error = new Error(
-    'Wallet.InsufficientFunds: Insufficient Funds: could not balance dust',
-  )
-  assert.equal(isKeeperDustUnavailable(error), true)
-  assert.equal(isBrokenKeeperContext(error), false)
-  assert.throws(
-    () => abortBatchIfWalletUnavailable('publish-v2 market-a', error),
-    (caught: unknown) => caught instanceof KeeperDustUnavailableError &&
-      caught.operation === 'publish-v2 market-a',
-  )
+  for (const error of [
+    new Error('Wallet.InsufficientFunds: Insufficient Funds: could not balance dust'),
+    new Error(
+      'Wallet.InsufficientFunds: no spendable DUST coin is available after an exact wallet sync.',
+    ),
+    new KeeperDustUnavailableError(
+      'keeper wallet preflight',
+      new Error('no spendable DUST coin is available after an exact wallet sync'),
+    ),
+  ]) {
+    assert.equal(isKeeperDustUnavailable(error), true)
+    assert.equal(isBrokenKeeperContext(error), false)
+    assert.throws(
+      () => abortBatchIfWalletUnavailable('publish-v2 market-a', error),
+      (caught: unknown) => caught instanceof KeeperDustUnavailableError &&
+        caught.operation === 'publish-v2 market-a',
+    )
+  }
   assert.equal(
     isKeeperDustUnavailable(new Error('Wallet.InsufficientFunds: shielded NIGHT is missing')),
     false,

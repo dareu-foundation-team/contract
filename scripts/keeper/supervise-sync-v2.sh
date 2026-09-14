@@ -3,11 +3,17 @@ set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 NETWORK="${1:-preprod}"
+KEEPER_CONTRACT_VERSION="${DAREU_KEEPER_CONTRACT_VERSION:-v3}"
 RESTART_DELAY_SEC="${KEEPER_RESTART_DELAY_SEC:-20}"
 STOPPING=0
 CHILD_PID=""
 
 cd "$ROOT_DIR"
+
+case "$KEEPER_CONTRACT_VERSION" in
+  v2|v3) ;;
+  *) echo "Unsupported DAREU_KEEPER_CONTRACT_VERSION: $KEEPER_CONTRACT_VERSION" >&2; exit 2 ;;
+esac
 
 # The mirror is read-only: no Keeper wallet, proof server or private-state
 # namespace is loaded. Its default cadence can be overridden for operations.
@@ -33,8 +39,8 @@ stop_child() {
 trap stop_child INT TERM
 
 while [[ "$STOPPING" -eq 0 ]]; do
-  echo "[sync-supervisor] $(date -u +%Y-%m-%dT%H:%M:%SZ) starting V2 mirror on $NETWORK (${SYNC_INTERVAL_SEC}s)"
-  npm run keeper:sync -- "$NETWORK" &
+  echo "[sync-supervisor] $(date -u +%Y-%m-%dT%H:%M:%SZ) starting ${KEEPER_CONTRACT_VERSION} mirror on $NETWORK (${SYNC_INTERVAL_SEC}s)"
+  npm run "keeper:${KEEPER_CONTRACT_VERSION}:sync" -- "$NETWORK" &
   CHILD_PID=$!
   wait "$CHILD_PID"
   STATUS=$?

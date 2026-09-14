@@ -7,10 +7,10 @@ import { fromHex, toHex } from '@midnight-ntwrk/midnight-js-utils'
 
 import {
   Contract,
-  ledger as ledgerV2,
-  type Ledger as LedgerV2,
+  ledger as ledgerV3,
+  type Ledger as LedgerV3,
   type Witnesses,
-} from '../../src/managed/dareu-v2/contract/index.js'
+} from '../../src/managed/dareu-v3/contract/index.js'
 import { ledger as ledgerRegistry } from '../../src/managed/dareu-registry/contract/index.js'
 import {
   configureNetwork,
@@ -35,36 +35,39 @@ import {
 // Active market deployment/connection layer. It uses the hot operator key while
 // the owner stays cold, and enables shielded balancing for sNIGHT bet circuits.
 
-export const zkConfigPathV2 = path.resolve(contractRoot, 'src', 'managed', 'dareu-v2')
+export const zkConfigPathV3 = path.resolve(contractRoot, 'src', 'managed', 'dareu-v3')
 
-export function ensureCompiledContractV2() {
-  const indexPath = path.join(zkConfigPathV2, 'contract', 'index.js')
+export function ensureCompiledContractV3() {
+  const indexPath = path.join(zkConfigPathV3, 'contract', 'index.js')
   if (!fs.existsSync(indexPath)) {
-    throw new Error(`Compiled dareu-v2 contract not found at ${indexPath}. Run "npm run build:v2" first.`)
+    throw new Error(`Compiled dareu-v3 contract not found at ${indexPath}. Run "npm run build:v3" first.`)
   }
 }
 
-export type DeploymentV2 = {
+export type DeploymentV3 = {
   contractAddress: string
   privateStateId: string
-  /** rawTokenType(token_domain, contractAddress) recorded by deploy-v2.ts — the
+  /** rawTokenType(token_domain, contractAddress) recorded by deploy-v3.ts — the
    *  color the wallet sees on sNIGHT coins. */
   snightColorHex: string
 }
 
-export type ResolvedDeploymentV2 = DeploymentV2 & {
+export type ResolvedDeploymentV3 = DeploymentV3 & {
   registryAddress: string
   symbol: string
   underlyingColorHex: string
   decimals: number
 }
 
-export function readDeploymentV2(network: SupportedNetwork): DeploymentV2 {
-  const deploymentPath = path.join(contractRoot, 'deployments', `${network}-v2.json`)
+export function readDeploymentV3(network: SupportedNetwork): DeploymentV3 {
+  const deploymentPath = path.join(contractRoot, 'deployments', `${network}-v3.json`)
   if (!fs.existsSync(deploymentPath)) {
-    throw new Error(`No v2 deployment record at ${deploymentPath}. Run "npm run deploy:v2:${network}" first.`)
+    throw new Error(`No v3 deployment record at ${deploymentPath}. Run "npm run deploy:v3:${network}" first.`)
   }
   const record = JSON.parse(fs.readFileSync(deploymentPath, 'utf8')) as Record<string, unknown>
+  if (record.contractName !== 'dareu-v3') {
+    throw new Error(`${deploymentPath} is not a dareu-v3 deployment.`)
+  }
   if (record.protocolVersion !== DIRECT_PROTOCOL_VERSION) {
     throw new Error(
       `${deploymentPath} is not a ${DIRECT_PROTOCOL_VERSION} deployment. ` +
@@ -73,11 +76,11 @@ export function readDeploymentV2(network: SupportedNetwork): DeploymentV2 {
   }
   const snightColorHex = typeof record.snightColorHex === 'string' ? record.snightColorHex : ''
   if (!snightColorHex) {
-    throw new Error(`${deploymentPath} has no snightColorHex — redeploy with the current deploy-v2.ts.`)
+    throw new Error(`${deploymentPath} has no snightColorHex — redeploy with the current deploy-v3.ts.`)
   }
   return {
     contractAddress: String(record.contractAddress),
-    privateStateId: typeof record.privateStateId === 'string' ? record.privateStateId : `dareu-v2-${network}`,
+    privateStateId: typeof record.privateStateId === 'string' ? record.privateStateId : `dareu-v3-${network}`,
     snightColorHex,
   }
 }
@@ -105,7 +108,7 @@ function decodePaddedSymbol(bytes: Uint8Array): string {
   return new TextDecoder().decode(bytes.subarray(0, end))
 }
 
-const resolvedDeploymentCache = new Map<SupportedNetwork, Promise<ResolvedDeploymentV2>>()
+const resolvedDeploymentCache = new Map<SupportedNetwork, Promise<ResolvedDeploymentV3>>()
 
 /**
  * Hosted preview/preprod indexers reject the SDK's latest-state request when it
@@ -135,26 +138,26 @@ async function queryLatestContractState(indexerUrl: string, contractAddress: str
   return stateHex ? ContractState.deserialize(fromHex(stateHex.replace(/^0x/i, ''))) : null
 }
 
-/** Add the V2 mirror namespace columns without requiring a separate migration run. */
-export async function ensureV2MarketColumns(dbUrl: string): Promise<void> {
+/** Add the V3 mirror namespace columns without requiring a separate migration run. */
+export async function ensureV3MarketColumns(dbUrl: string): Promise<void> {
   await pgExec(dbUrl, 'ALTER TABLE markets ADD COLUMN IF NOT EXISTS onchain_contract_version text', [])
   await pgExec(dbUrl, 'ALTER TABLE markets ADD COLUMN IF NOT EXISTS onchain_contract_address text', [])
   await pgExec(dbUrl, 'ALTER TABLE markets ADD COLUMN IF NOT EXISTS onchain_observed_at timestamptz', [])
 }
 
 /**
- * Resolve the keeper's asset instance from the on-chain registry. The local v2
+ * Resolve the keeper's asset instance from the on-chain registry. The local v3
  * deployment file is retained only for private-state metadata and as a drift
  * check; the registry is the authoritative source for the market address,
  * sNIGHT color, decimals, and enabled flag.
  */
-export function resolveDeploymentV2(network: SupportedNetwork): Promise<ResolvedDeploymentV2> {
+export function resolveDeploymentV3(network: SupportedNetwork): Promise<ResolvedDeploymentV3> {
   const cached = resolvedDeploymentCache.get(network)
   if (cached) return cached
 
   const resolving = (async () => {
     const config = configureNetwork(network)
-    const local = readDeploymentV2(network)
+    const local = readDeploymentV3(network)
     const registryAddress = readRegistryAddress(network)
     const underlyingColor = optionalEnv('DAREU_KEEPER_ASSET_UNDERLYING_HEX')
       ? parseHexBytes(requiredEnv('DAREU_KEEPER_ASSET_UNDERLYING_HEX'), 32, 'DAREU_KEEPER_ASSET_UNDERLYING_HEX')
@@ -184,14 +187,22 @@ export function resolveDeploymentV2(network: SupportedNetwork): Promise<Resolved
     if (local.contractAddress.toLowerCase().replace(/^0x/, '') !== contractAddress) {
       throw new Error(
         `Registry/deployment drift: registry points ${symbol} to ${contractAddress}, ` +
-          `but deployments/${network}-v2.json contains ${local.contractAddress}.`,
+          `but deployments/${network}-v3.json contains ${local.contractAddress}.`,
       )
     }
     if (local.snightColorHex.toLowerCase().replace(/^0x/, '') !== snightColorHex) {
       throw new Error(
         `Registry/deployment drift: registry sNIGHT color is ${snightColorHex}, ` +
-          `but deployments/${network}-v2.json contains ${local.snightColorHex}.`,
+          `but deployments/${network}-v3.json contains ${local.snightColorHex}.`,
       )
+    }
+
+    const manifestPath = path.join(contractRoot, 'deployments', `${network}-v3.json`)
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as {
+      constructor?: { underlyingHex?: string }
+    }
+    if (manifest.constructor?.underlyingHex?.toLowerCase().replace(/^0x/, '') !== toHex(underlyingColor)) {
+      throw new Error(`Registry/deployment drift: V3 underlying color differs from ${manifestPath}.`)
     }
 
     return {
@@ -210,53 +221,53 @@ export function resolveDeploymentV2(network: SupportedNetwork): Promise<Resolved
   return resolving
 }
 
-export function createCompiledDareuV2Contract(localSecretKey: Uint8Array) {
+export function createCompiledDareuV3Contract(localSecretKey: Uint8Array) {
   const witnesses: Witnesses<Record<string, never>> = {
     local_secret_key: ({ privateState }) => [privateState, localSecretKey],
   }
-  return CompiledContract.make('dareu-v2', Contract).pipe(
+  return CompiledContract.make('dareu-v3', Contract).pipe(
     CompiledContract.withWitnesses(witnesses),
-    CompiledContract.withCompiledFileAssets(zkConfigPathV2),
+    CompiledContract.withCompiledFileAssets(zkConfigPathV3),
   )
 }
 
-/** The keeper's caller key for v2. Prefers the hot OPERATOR key (D8: the keeper
+/** The keeper's caller key for v3. Prefers the hot OPERATOR key (D8: the keeper
  *  server should never hold the owner key); falls back to the owner key with a
  *  warning so pre-rotation environments keep working. */
-export function keeperCallerSecretKeyV2(): { key: Uint8Array; role: 'operator' | 'owner' } {
+export function keeperCallerSecretKeyV3(): { key: Uint8Array; role: 'operator' | 'owner' } {
   const operator = optionalEnv('DAREU_OPERATOR_SECRET_KEY')
   if (operator) return { key: parseHexBytes(operator, 32, 'DAREU_OPERATOR_SECRET_KEY'), role: 'operator' }
   console.warn(
-    '[keeper-v2] DAREU_OPERATOR_SECRET_KEY not set — falling back to DAREU_OWNER_SECRET_KEY. ' +
+    '[keeper-v3] DAREU_OPERATOR_SECRET_KEY not set — falling back to DAREU_OWNER_SECRET_KEY. ' +
       'Set an operator key so the keeper server never holds the cold owner key (design D8).',
   )
   return { key: parseHexBytes(requiredEnv('DAREU_OWNER_SECRET_KEY'), 32, 'DAREU_OWNER_SECRET_KEY'), role: 'owner' }
 }
 
-export type KeeperV2Context = {
+export type KeeperV3Context = {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   deployed: any
   walletCtx: Awaited<ReturnType<typeof createWallet>>
-  deployment: ResolvedDeploymentV2
+  deployment: ResolvedDeploymentV3
   callerRole: 'operator' | 'owner'
 }
 
 /**
- * Connect to the deployed dareu-v2 contract for keeper writes. Mirrors
- * chain.ts#connectKeeper, with the v2 zk assets and 'all' token-kind balancing
+ * Connect to the deployed dareu-v3 contract for keeper writes. Mirrors
+ * chain.ts#connectKeeper, with the v3 zk assets and 'all' token-kind balancing
  * (`place_bet` spends an sNIGHT coin; `deposit` spends unshielded NIGHT).
  */
-export async function connectKeeperV2(network: SupportedNetwork): Promise<KeeperV2Context> {
-  ensureCompiledContractV2()
+export async function connectKeeperV3(network: SupportedNetwork): Promise<KeeperV3Context> {
+  ensureCompiledContractV3()
   const config = configureNetwork(network)
   const walletSeed = requiredWalletSeedOrMnemonic()
   const privateStoragePassword = requiredEnv('MIDNIGHT_PRIVATE_STATE_PASSWORD')
-  const { key, role } = keeperCallerSecretKeyV2()
-  const deployment = await resolveDeploymentV2(network)
+  const { key, role } = keeperCallerSecretKeyV3()
+  const deployment = await resolveDeploymentV3(network)
 
   const walletCtx = await createWallet(walletSeed, network, config)
   try {
-    // V2 consumes sNIGHT coins. Waiting only for DUST leaves shielded.availableCoins
+    // V3 consumes sNIGHT coins. Waiting only for DUST leaves shielded.availableCoins
     // empty even after a successful deposit, causing repeated bond deposits.
     await waitForSyncedState(walletCtx.wallet)
     // Exact sync is the trust boundary for last-known-good. Promote it before
@@ -266,7 +277,7 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
     const walletState = await currentWalletState(walletCtx.wallet)
     const dustBalance = walletState.dust.balance(new Date())
     console.log(
-      `[keeper-v2] DUST spendable=${dustBalance.toString()} ` +
+      `[keeper-v3] DUST spendable=${dustBalance.toString()} ` +
         `(available coins=${walletState.dust.availableCoins.length}, ` +
         `pending coins=${walletState.dust.pendingCoins.length})`,
     )
@@ -278,7 +289,7 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
         (coin: any) => !coin.meta?.registeredForDustGeneration,
       )
       console.warn(
-        `[keeper-v2] wallet=${unshieldedAddress}; NIGHT UTXOs=${nightUtxos.length} ` +
+        `[keeper-v3] wallet=${unshieldedAddress}; NIGHT UTXOs=${nightUtxos.length} ` +
           `(unregistered for DUST=${unregisteredNightUtxos.length})`,
       )
       throw new KeeperDustUnavailableError(
@@ -290,14 +301,12 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
       )
     }
     const providers = await createProviders(walletCtx, config, privateStoragePassword, {
-      zkConfigPath: zkConfigPathV2,
-      // `deposit` and `resolve_market` identify the direct-resolution V2 artifact.
-      // cannot by themselves detect that the wrong managed-contract directory was
-      // selected. Preflight every circuit this shared connection may submit.
-      expectedCircuitIds: ['deposit', 'resolve_market', 'cancel_market'],
+      zkConfigPath: zkConfigPathV3,
+      // Check both V3 keeper write circuits before opening the contract.
+      expectedCircuitIds: ['create_market', 'settle_market_action'],
       tokenKindsToBalance: 'all',
     })
-    const compiledContract = createCompiledDareuV2Contract(key)
+    const compiledContract = createCompiledDareuV3Contract(key)
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const deployed = await findDeployedContract(providers as any, {
@@ -318,7 +327,7 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
     if (error instanceof WalletSyncStalledError && error.stalledStreams.includes('dust')) {
       const recovery = await walletCtx.recoverFromSyncStall(error)
       console.error(
-        `[keeper-v2] wallet sync stalled at DUST applied=${error.dustAppliedIndex}; ` +
+        `[keeper-v3] wallet sync stalled at DUST applied=${error.dustAppliedIndex}; ` +
           `checkpoint ${recovery.quarantinedPath ? `quarantined at ${recovery.quarantinedPath}` : 'was absent'}; ` +
           `${recovery.restoredLastKnownGood ? 'restored last-known-good' : 'next start will cold-sync'}; ` +
           `recovery attempt ${recovery.attempt}.`,
@@ -330,20 +339,20 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
       try {
         await walletCtx.saveCheckpoint()
       } catch (saveError) {
-        console.warn(`[keeper-v2] could not save wallet checkpoint after setup failure: ${errorMessage(saveError)}`)
+        console.warn(`[keeper-v3] could not save wallet checkpoint after setup failure: ${errorMessage(saveError)}`)
       }
     }
-    await stopWalletSafely(walletCtx.wallet, 'connectKeeperV2 failed setup')
+    await stopWalletSafely(walletCtx.wallet, 'connectKeeperV3 failed setup')
     throw failure
   }
 }
 
-/** Read-only v2 ledger snapshot from the indexer (no wallet). */
-export async function readV2Ledger(network: SupportedNetwork): Promise<LedgerV2 | null> {
+/** Read-only v3 ledger snapshot from the indexer (no wallet). */
+export async function readV3Ledger(network: SupportedNetwork): Promise<LedgerV3 | null> {
   const config = configureNetwork(network)
-  const { contractAddress } = await resolveDeploymentV2(network)
+  const { contractAddress } = await resolveDeploymentV3(network)
   const state = await queryLatestContractState(config.indexer, contractAddress)
   if (!state) return null
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return ledgerV2((state as any).data)
+  return ledgerV3((state as any).data)
 }

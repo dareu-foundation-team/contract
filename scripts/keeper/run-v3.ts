@@ -1,17 +1,17 @@
-// Keeper SERVICE entrypoint — v2 contract. One long-running transaction process:
+// Keeper SERVICE entrypoint — v3 contract. One long-running transaction process:
 //   direct resolve → cancel → bounded/preemptible publish → direct resolve → cancel.
 // The read-only on-chain mirror is intentionally a separate 30-second process
-// (sync-v2.ts), so wallet/prover work cannot delay web metrics. This process holds
+// (sync-v3.ts), so wallet/prover work cannot delay web metrics. This process holds
 // the OPERATOR hot key (owner key stays cold — D8) + needs the proof server.
 //
-//   npm run keeper:v2:run -- preprod crypto
+//   npm run keeper:v3:run -- preprod crypto
 import { loadEnvFiles, optionalEnv, resolveNetwork } from '../shared/chain.js'
-import { publishDraftsV2 } from './publish-v2.js'
+import { publishDraftsV3 } from './publish-v3.js'
 import {
-  resolveMarketsV2,
-  cancelRequestedV2,
-} from './resolve-v2.js'
-import { resolveDeploymentV2 } from '../shared/chain-v2.js'
+  resolveMarketsV3,
+  cancelRequestedV3,
+} from './resolve-v3.js'
+import { resolveDeploymentV3 } from '../shared/chain-v3.js'
 import { isWalletSyncRecoveryExhausted } from '../shared/midnight.js'
 import {
   errorMessage,
@@ -43,13 +43,13 @@ async function main() {
     'KEEPER_MAX_EMPTY_CANCEL_LIMIT',
     10,
   )
-  const deployment = await resolveDeploymentV2(network)
+  const deployment = await resolveDeploymentV3(network)
   console.log(
-    `[keeper-v2] registry ${deployment.registryAddress} → ${deployment.symbol} ` +
+    `[keeper-v3] registry ${deployment.registryAddress} → ${deployment.symbol} ` +
       `${deployment.contractAddress} (${deployment.decimals} decimals, enabled)`,
   )
   console.log(
-    `[keeper-v2:${category}] up — settlement-priority cycle every ${cycleSec}s ` +
+    `[keeper-v3:${category}] up — settlement-priority cycle every ${cycleSec}s ` +
       `(publish quantum ${publishQuantum}, empty cleanup quantum ${emptyCancelQuantum}, ` +
       `busy retry ${busyRetrySec}s)`,
   )
@@ -60,20 +60,20 @@ async function main() {
     let madeProgress = false
     try {
       const cycle = await runKeeperPriorityCycle({
-        resolve: () => resolveMarketsV2(network),
-        cancelFunded: () => cancelRequestedV2(network, { mode: 'funded' }),
-        cancelEmpty: () => cancelRequestedV2(network, {
+        resolve: () => resolveMarketsV3(network),
+        cancelFunded: () => cancelRequestedV3(network, { mode: 'funded' }),
+        cancelEmpty: () => cancelRequestedV3(network, {
           mode: 'empty',
           limit: emptyCancelQuantum,
         }),
-        publish: () => publishDraftsV2(network, {
+        publish: () => publishDraftsV3(network, {
           limit: publishQuantum,
           preemptForSettlement: true,
         }),
       })
       madeProgress = cycle.madeProgress
       console.log(
-        `[keeper-v2:${category}] cycle: ` +
+        `[keeper-v3:${category}] cycle: ` +
           `resolve ${cycle.resolveBeforePublish.succeeded}+${cycle.resolveAfterPublish.succeeded}, ` +
           `funded-cancel ${cycle.fundedCancelBeforePublish.succeeded}+${cycle.fundedCancelAfterPublish.succeeded}, ` +
           `empty-cancel ${cycle.emptyCancelAfterPublish.succeeded}, ` +
@@ -81,7 +81,7 @@ async function main() {
           `${cycle.publish.preempted ? ' (preempted for funded settlement/refund)' : ''}.`,
       )
     } catch (err) {
-      console.error(`[keeper-v2:${category}] cycle error:`, errorMessage(err))
+      console.error(`[keeper-v3:${category}] cycle error:`, errorMessage(err))
       if (isKeeperDustUnavailable(err)) {
         dustUnavailable = true
       } else if (isKeeperTransactionTimeout(err) || isBrokenKeeperContext(err)) {
@@ -107,14 +107,14 @@ async function main() {
         : madeProgress
           ? ' (queue still active)'
           : ''
-    console.log(`[keeper-v2:${category}] next cycle in ${waitSec}s${waitReason}.`)
+    console.log(`[keeper-v3:${category}] next cycle in ${waitSec}s${waitReason}.`)
     await new Promise((r) => setTimeout(r, waitSec * 1000))
   }
 }
 
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
-    console.log(`[keeper-v2] ${sig} — shutting down`)
+    console.log(`[keeper-v3] ${sig} — shutting down`)
     process.exit(0)
   })
 }
@@ -123,7 +123,7 @@ process.on('unhandledRejection', (reason) => {
   // Wallet/RPC libraries can reject an internal transport Promise with a raw
   // ErrorEvent. Continuing would reuse an unknown wallet context, so fail in a
   // controlled, supervisor-restartable way while preserving the original cause.
-  console.error('[keeper-v2] unhandled rejection — exiting with a fresh wallet required:', errorMessage(reason))
+  console.error('[keeper-v3] unhandled rejection — exiting with a fresh wallet required:', errorMessage(reason))
   process.exit(1)
 })
 

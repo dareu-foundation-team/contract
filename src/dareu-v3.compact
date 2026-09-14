@@ -1,0 +1,827 @@
+pragma language_version >= 0.23;
+
+// DareU v3 — Ledger 8 / Compact 0.31.1 compatible implementation.
+//
+// The primary market remains parimutuel. Each bet creates one indivisible
+// Position represented by a revisioned shielded bearer ticket. The secondary
+// market transfers that ticket's future settlement claim without changing the
+// parimutuel pools. Listing escrows the claim ticket; filling atomically pays the
+// seller and mints the next revision's ticket to the buyer; cancelling restores
+// the next revision's ticket to the controller of the listing.
+//
+// Compact 0.31.1 cannot call another contract, therefore Vault, primary market,
+// and secondary market stay in this one contract. Amounts are base token units.
+
+import CompactStandardLibrary;
+
+export enum MarketStatus {
+  OPEN,
+  RESOLVED,
+  CANCELLED
+}
+
+export enum Outcome {
+  NONE,
+  YES,
+  NO
+}
+
+export enum PositionStatus {
+  ACTIVE,
+  LISTED,
+  CLAIMED
+}
+
+export enum SaleStatus {
+  OPEN,
+  FILLED,
+  CANCELLED,
+  EXPIRED
+}
+
+export enum FundingMode {
+  SHIELDED,
+  UNSHIELDED
+}
+
+export enum SettlementAction {
+  RESOLVE,
+  CANCEL
+}
+
+export struct Market {
+  metadata_hash: Bytes<32>,
+  oracle: Bytes<32>,
+  close_time: Uint<64>,
+  status: MarketStatus,
+  outcome: Outcome,
+  yes_pool: Uint<64>,
+  no_pool: Uint<64>,
+  total_pool: Uint<64>,
+  platform_fee_rate: Uint<64>,
+  betting_cutoff: Uint<64>
+}
+
+// Ownership is deliberately absent from public ledger state. The current
+// revision's shielded ticket is the sole transferable Claim Right.
+export struct Position {
+  market_id: Bytes<32>,
+  side: Outcome,
+  amount: Uint<64>,
+  fee_paid: Uint<64>,
+  revision: Uint<64>,
+  status: PositionStatus,
+  active_sale: Bytes<32>
+}
+
+// The seller's shielded payment key is committed with a per-order salt. It is
+// revealed when a buyer fills the order, because the payment output itself is
+// part of the transaction transcript. `funding_mode` fixes the buyer payment
+// rail and prevents a relayer from silently changing public/shielded execution.
+export struct SaleOrder {
+  position_id: Bytes<32>,
+  position_revision: Uint<64>,
+  ask_price: Uint<64>,
+  funding_mode: FundingMode,
+  seller_payee_commitment: Bytes<32>,
+  expires_at: Uint<64>,
+  status: SaleStatus
+}
+
+export sealed ledger owner: Bytes<32>;
+export sealed ledger underlying_token: Bytes<32>;
+export sealed ledger token_domain: Bytes<32>;
+export ledger operator: Bytes<32>;
+export ledger market_count: Counter;
+export ledger sale_count: Counter;
+export ledger markets: Map<Bytes<32>, Market>;
+export ledger positions: Map<Bytes<32>, Position>;
+export ledger sales: Map<Bytes<32>, SaleOrder>;
+export ledger market_fees: Map<Bytes<32>, Uint<64>>;
+
+witness local_secret_key(): Bytes<32>;
+
+export pure circuit participant_id(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "dareu:participant:"), sk]);
+}
+
+circuit current_participant(): Bytes<32> {
+  return participant_id(local_secret_key());
+}
+
+export pure circuit position_id(market_id: Bytes<32>, pos_nonce: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "dareu:position:v3:"), market_id, pos_nonce]);
+}
+
+export pure circuit sale_id(
+                     position: Bytes<32>,
+                     revision: Uint<64>,
+                     sale_nonce: Bytes<32>
+                     ): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>([
+    pad(32, "dareu:sale:v3:"),
+    position,
+    revision as Field as Bytes<32>,
+    sale_nonce
+  ]);
+}
+
+export pure circuit position_ticket_nonce(
+                     position: Bytes<32>,
+                     revision: Uint<64>
+                     ): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([
+    pad(32, "dareu:ticket:v3:"),
+    position,
+    revision as Field as Bytes<32>
+  ]);
+}
+
+pure circuit seller_payee_commitment(
+               order: Bytes<32>,
+               seller_pk: ZswapCoinPublicKey,
+               seller_salt: Bytes<32>
+               ): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>([
+    pad(32, "dareu:seller:v3:"),
+    order,
+    seller_pk.bytes,
+    seller_salt
+  ]);
+}
+
+circuit snight_color(): Bytes<32> {
+  return tokenType(token_domain, kernel.self());
+}
+
+// Revision is part of the token domain. Spending an earlier ticket can never
+// authorize a later revision, even when the same position changes hands often.
+export pure circuit position_ticket_domain(position: Bytes<32>, revision: Uint<64>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([
+    pad(32, "dareu:claim-ticket:v3:"),
+    position,
+    revision as Field as Bytes<32>
+  ]);
+}
+
+circuit position_ticket_color(position: Bytes<32>, revision: Uint<64>): Bytes<32> {
+  return tokenType(position_ticket_domain(position, revision), kernel.self());
+}
+
+circuit sale_control_color(order: Bytes<32>): Bytes<32> {
+  return tokenType(order, kernel.self());
+}
+
+constructor(owner_secret_key: Bytes<32>,
+            underlying: Bytes<32>,
+            domain: Bytes<32>,
+            operator_id: Bytes<32>) {
+  owner = disclose(participant_id(owner_secret_key));
+  underlying_token = disclose(underlying);
+  token_domain = disclose(domain);
+  const public_operator_id = disclose(operator_id);
+  assert(public_operator_id != empty_participant(), "Operator cannot be empty");
+  operator = public_operator_id;
+}
+
+circuit require_owner(): Bytes<32> {
+  const caller = current_participant();
+  assert(owner == caller, "Only owner can call this circuit");
+  return caller;
+}
+
+circuit require_operator_or_owner(): Bytes<32> {
+  const caller = disclose(current_participant());
+  assert(caller == owner || caller == operator, "Only owner or operator can call this circuit");
+  return caller;
+}
+
+pure circuit empty_participant(): Bytes<32> {
+  return default<Bytes<32>>;
+}
+
+pure circuit empty_id(): Bytes<32> {
+  return default<Bytes<32>>;
+}
+
+pure circuit max_uint64(): Uint<64> {
+  return 0xFFFFFFFFFFFFFFFF;
+}
+
+pure circuit max_platform_fee_rate(): Uint<64> {
+  return 500;
+}
+
+pure circuit min_betting_cutoff(): Uint<64> {
+  return 60;
+}
+
+pure circuit max_betting_cutoff(): Uint<64> {
+  return 1800;
+}
+
+pure circuit require_valid_side(side: Outcome): [] {
+  assert(side == Outcome.YES || side == Outcome.NO, "Outcome must be YES or NO");
+}
+
+pure circuit require_valid_funding_mode(mode: FundingMode): [] {
+  assert(mode == FundingMode.SHIELDED || mode == FundingMode.UNSHIELDED,
+         "Funding mode is invalid");
+}
+
+pure circuit validate_stake_fee(amount: Uint<64>, rate: Uint<64>, fee: Uint<64>): [] {
+  assert(fee * 10000 <= amount * rate, "Stake fee is too high");
+  assert(amount * rate < (fee + 1) * 10000, "Stake fee is too low");
+  assert(fee > 0, "Bet amount is too small for a nonzero fee");
+}
+
+circuit get_market(market_id: Bytes<32>): Market {
+  assert(markets.member(market_id), "Market does not exist");
+  return markets.lookup(market_id);
+}
+
+circuit get_position(pos_id: Bytes<32>): Position {
+  assert(positions.member(pos_id), "Position does not exist");
+  return positions.lookup(pos_id);
+}
+
+circuit get_sale(order_id: Bytes<32>): SaleOrder {
+  assert(sales.member(order_id), "Sale does not exist");
+  return sales.lookup(order_id);
+}
+
+pure circuit winning_pool(market: Market): Uint<64> {
+  return market.outcome == Outcome.YES ? market.yes_pool : market.no_pool;
+}
+
+pure circuit losing_pool(market: Market): Uint<64> {
+  return market.outcome == Outcome.YES ? market.no_pool : market.yes_pool;
+}
+
+circuit burn_shielded_coin(coin: ShieldedCoinInfo): [] {
+  receiveShielded(coin);
+  const burned = sendImmediateShielded(coin, shieldedBurnAddress(), coin.value);
+}
+
+circuit mint_position_ticket(
+          pos_id: Bytes<32>,
+          revision: Uint<64>,
+          recipient: ZswapCoinPublicKey,
+          nonce: Bytes<32>
+          ): [] {
+  const ticket = mintShieldedToken(
+                   position_ticket_domain(pos_id, revision),
+                   1,
+                   nonce,
+                   left<ZswapCoinPublicKey, ContractAddress>(recipient)
+                   );
+}
+
+circuit consume_position_ticket(
+          pos_id: Bytes<32>,
+          revision: Uint<64>,
+          ticket: ShieldedCoinInfo
+          ): [] {
+  assert(ticket.color == position_ticket_color(pos_id, revision), "Position ticket mismatch");
+  assert(ticket.value == 1, "Position ticket value must be 1");
+  burn_shielded_coin(ticket);
+}
+
+circuit consume_sale_control(order_id: Bytes<32>, ticket: ShieldedCoinInfo): [] {
+  assert(ticket.color == sale_control_color(order_id), "Sale control ticket mismatch");
+  assert(ticket.value == 1, "Sale control ticket value must be 1");
+  burn_shielded_coin(ticket);
+}
+
+circuit record_bet(
+          market_id: Bytes<32>,
+          market: Market,
+          side: Outcome,
+          amount: Uint<64>,
+          stake_fee: Uint<64>,
+          recipient_pk: ZswapCoinPublicKey,
+          pos_nonce: Bytes<32>
+          ): Bytes<32> {
+  const pos_id = position_id(market_id, pos_nonce);
+  assert(!positions.member(pos_id), "Position already exists");
+
+  const prior_fee = market_fees.member(market_id) ? market_fees.lookup(market_id) : 0;
+  assert(prior_fee <= (max_uint64() - stake_fee) as Uint<64>, "Market fee escrow overflow");
+
+  assert(market.yes_pool <= (max_uint64() - amount) as Uint<64>, "YES pool overflow");
+  assert(market.no_pool <= (max_uint64() - amount) as Uint<64>, "NO pool overflow");
+  assert(market.total_pool <= (max_uint64() - amount) as Uint<64>, "Total pool overflow");
+
+  const next_yes = side == Outcome.YES
+                     ? (market.yes_pool + amount) as Uint<64>
+                     : market.yes_pool;
+  const next_no = side == Outcome.NO
+                    ? (market.no_pool + amount) as Uint<64>
+                    : market.no_pool;
+
+  market_fees.insert(market_id, (prior_fee + stake_fee) as Uint<64>);
+  markets.insert(
+    market_id,
+    Market { metadata_hash: market.metadata_hash,
+             oracle: market.oracle,
+             close_time: market.close_time,
+             status: market.status,
+             outcome: market.outcome,
+             yes_pool: next_yes,
+             no_pool: next_no,
+             total_pool: (market.total_pool + amount) as Uint<64>,
+             platform_fee_rate: market.platform_fee_rate,
+             betting_cutoff: market.betting_cutoff }
+    );
+
+  positions.insert(
+    pos_id,
+    Position { market_id: market_id,
+               side: side,
+               amount: amount,
+               fee_paid: stake_fee,
+               revision: 0,
+               status: PositionStatus.ACTIVE,
+               active_sale: empty_id() }
+    );
+  mint_position_ticket(pos_id, 0, recipient_pk, position_ticket_nonce(pos_id, 0));
+  return pos_id;
+}
+
+circuit validate_open_bet(
+          market: Market,
+          side: Outcome,
+          amount: Uint<64>,
+          stake_fee: Uint<64>
+          ): [] {
+  assert(market.status == MarketStatus.OPEN, "Market is not open");
+  assert(kernel.blockTimeLessThan((market.close_time - market.betting_cutoff) as Uint<64>),
+         "Betting closed");
+  require_valid_side(side);
+  assert(amount > 0, "Bet amount must be positive");
+  validate_stake_fee(amount, market.platform_fee_rate, stake_fee);
+  assert(amount <= (max_uint64() - stake_fee) as Uint<64>, "Bet total overflow");
+}
+
+// Convert public underlying into shielded sNIGHT.
+export circuit deposit(amount: Uint<64>,
+                       recipient_pk: ZswapCoinPublicKey,
+                       mint_nonce: Bytes<32>): [] {
+  const public_amount = disclose(amount);
+  assert(public_amount > 0, "Deposit amount must be positive");
+  receiveUnshielded(underlying_token, public_amount as Uint<128>);
+  const minted = mintShieldedToken(
+                   token_domain,
+                   public_amount,
+                   disclose(mint_nonce),
+                   left<ZswapCoinPublicKey, ContractAddress>(disclose(recipient_pk))
+                   );
+}
+
+export circuit withdraw(coin: ShieldedCoinInfo, payout_address: UserAddress): [] {
+  const public_coin = disclose(coin);
+  assert(public_coin.color == snight_color(), "Coin is not sNIGHT");
+  assert(public_coin.value > 0, "Withdraw amount must be positive");
+  burn_shielded_coin(public_coin);
+  sendUnshielded(
+    underlying_token,
+    public_coin.value,
+    right<ContractAddress, UserAddress>(disclose(payout_address))
+    );
+}
+
+export circuit create_market(
+                 market_id: Bytes<32>,
+                 metadata_hash: Bytes<32>,
+                 oracle: Bytes<32>,
+                 close_time: Uint<64>,
+                 platform_fee_rate: Uint<64>,
+                 betting_cutoff: Uint<64>): [] {
+  const public_market_id = disclose(market_id);
+  const public_metadata_hash = disclose(metadata_hash);
+  const public_oracle = disclose(oracle);
+  const public_close_time = disclose(close_time);
+  const public_fee_rate = disclose(platform_fee_rate);
+  const public_cutoff = disclose(betting_cutoff);
+
+  require_operator_or_owner();
+  assert(!markets.member(public_market_id), "Market already exists");
+  assert(public_oracle != empty_participant(), "Oracle cannot be empty");
+  assert(kernel.blockTimeLessThan(public_close_time), "Close time must be in the future");
+  assert(public_close_time < (0xF000000000000000 as Uint<64>), "close_time unreasonable");
+  assert(public_fee_rate > 0, "Platform fee rate must be positive");
+  assert(public_fee_rate <= max_platform_fee_rate(), "Platform fee rate too high");
+  assert(public_cutoff >= min_betting_cutoff(), "Betting cutoff too small");
+  assert(public_cutoff <= max_betting_cutoff(), "Betting cutoff too large");
+  assert(public_close_time > public_cutoff, "close_time must exceed betting_cutoff");
+  assert(kernel.blockTimeLessThan((public_close_time - public_cutoff) as Uint<64>),
+         "Betting already closed at creation");
+
+  markets.insert(
+    public_market_id,
+    Market { metadata_hash: public_metadata_hash,
+             oracle: public_oracle,
+             close_time: public_close_time,
+             status: MarketStatus.OPEN,
+             outcome: Outcome.NONE,
+             yes_pool: 0,
+             no_pool: 0,
+             total_pool: 0,
+             platform_fee_rate: public_fee_rate,
+             betting_cutoff: public_cutoff }
+    );
+  market_count.increment(1);
+}
+
+// Unified primary-market entry. In SHIELDED mode payment_coin is burned; in
+// UNSHIELDED mode it must be the zero-value sentinel and underlying is received.
+export circuit place_bet(
+                 market_id: Bytes<32>,
+                 side: Outcome,
+                 amount: Uint<64>,
+                 stake_fee: Uint<64>,
+                 funding_mode: FundingMode,
+                 coin: ShieldedCoinInfo,
+                 recipient_pk: ZswapCoinPublicKey,
+                 pos_nonce: Bytes<32>): Bytes<32> {
+  const public_market_id = disclose(market_id);
+  const public_side = disclose(side);
+  const public_amount = disclose(amount);
+  const public_fee = disclose(stake_fee);
+  const public_mode = disclose(funding_mode);
+  const public_coin = disclose(coin);
+  const public_recipient = disclose(recipient_pk);
+  const public_nonce = disclose(pos_nonce);
+  const market = get_market(public_market_id);
+
+  validate_open_bet(market, public_side, public_amount, public_fee);
+  require_valid_funding_mode(public_mode);
+  const total_payment = (public_amount + public_fee) as Uint<64>;
+  if (public_mode == FundingMode.SHIELDED) {
+    assert(public_coin.color == snight_color(), "Bet coin is not sNIGHT");
+    assert(public_coin.value == (total_payment as Uint<128>),
+           "Coin value must equal stake plus fee");
+    burn_shielded_coin(public_coin);
+  } else {
+    assert(public_coin.value == 0, "Unshielded bet requires an empty payment coin");
+    receiveUnshielded(underlying_token, total_payment as Uint<128>);
+  }
+  return record_bet(public_market_id, market, public_side, public_amount,
+                    public_fee, public_recipient, public_nonce);
+}
+
+// Escrow the whole Position. The parimutuel pool is untouched.
+export circuit list_position(
+                 pos_id: Bytes<32>,
+                 claim_ticket: ShieldedCoinInfo,
+                 ask_price: Uint<64>,
+                 funding_mode: FundingMode,
+                 seller_pk: ZswapCoinPublicKey,
+                 seller_salt: Bytes<32>,
+                 sale_nonce: Bytes<32>,
+                 expires_at: Uint<64>): Bytes<32> {
+  const public_pos_id = disclose(pos_id);
+  const public_ticket = disclose(claim_ticket);
+  const public_ask = disclose(ask_price);
+  const public_mode = disclose(funding_mode);
+  const public_seller_pk = disclose(seller_pk);
+  const public_seller_salt = disclose(seller_salt);
+  const public_sale_nonce = disclose(sale_nonce);
+  const public_expiry = disclose(expires_at);
+  const position = get_position(public_pos_id);
+  const market = get_market(position.market_id);
+
+  assert(position.status == PositionStatus.ACTIVE, "Position is not active");
+  assert(position.active_sale == empty_id(), "Position already has an active sale");
+  assert(market.status == MarketStatus.OPEN, "Market is not open");
+  assert(kernel.blockTimeLessThan((market.close_time - market.betting_cutoff) as Uint<64>),
+         "Secondary trading closed");
+  assert(public_ask > 0, "Ask price must be positive");
+  require_valid_funding_mode(public_mode);
+  assert(kernel.blockTimeLessThan(public_expiry), "Sale expiry must be in the future");
+  assert(public_expiry <= (market.close_time - market.betting_cutoff) as Uint<64>,
+         "Sale expiry exceeds trading deadline");
+
+  consume_position_ticket(public_pos_id, position.revision, public_ticket);
+  const order_id = sale_id(public_pos_id, position.revision, public_sale_nonce);
+  assert(!sales.member(order_id), "Sale already exists");
+  sales.insert(
+    order_id,
+    SaleOrder { position_id: public_pos_id,
+                position_revision: position.revision,
+                ask_price: public_ask,
+                funding_mode: public_mode,
+                seller_payee_commitment:
+                  seller_payee_commitment(order_id, public_seller_pk, public_seller_salt),
+                expires_at: public_expiry,
+                status: SaleStatus.OPEN }
+    );
+  positions.insert(
+    public_pos_id,
+    Position { market_id: position.market_id,
+               side: position.side,
+               amount: position.amount,
+               fee_paid: position.fee_paid,
+               revision: position.revision,
+               status: PositionStatus.LISTED,
+               active_sale: order_id }
+    );
+  const control = mintShieldedToken(
+                    order_id,
+                    1,
+                    order_id,
+                    left<ZswapCoinPublicKey, ContractAddress>(public_seller_pk)
+                    );
+  sale_count.increment(1);
+  return order_id;
+}
+
+circuit validate_fill(
+          order_id: Bytes<32>,
+          order: SaleOrder,
+          position: Position,
+          seller_pk: ZswapCoinPublicKey,
+          seller_salt: Bytes<32>,
+          expected_mode: FundingMode
+          ): Market {
+  assert(order.status == SaleStatus.OPEN, "Sale is not open");
+  assert(order.funding_mode == expected_mode, "Wrong payment mode for sale");
+  assert(kernel.blockTimeLessThan(order.expires_at), "Sale has expired");
+  assert(position.status == PositionStatus.LISTED, "Position is not listed");
+  assert(position.active_sale == order_id, "Position is listed by another sale");
+  assert(position.revision == order.position_revision, "Position revision mismatch");
+  assert(seller_payee_commitment(order_id, seller_pk, seller_salt)
+           == order.seller_payee_commitment,
+         "Seller payment details do not match");
+  const market = get_market(position.market_id);
+  assert(market.status == MarketStatus.OPEN, "Market is not open");
+  assert(kernel.blockTimeLessThan((market.close_time - market.betting_cutoff) as Uint<64>),
+         "Secondary trading closed");
+  return market;
+}
+
+circuit complete_fill(
+          order_id: Bytes<32>,
+          order: SaleOrder,
+          position: Position,
+          buyer_pk: ZswapCoinPublicKey
+          ): [] {
+  assert(position.revision < max_uint64(), "Position revision exhausted");
+  const next_revision = (position.revision + 1) as Uint<64>;
+  sales.insert(
+    order_id,
+    SaleOrder { position_id: order.position_id,
+                position_revision: order.position_revision,
+                ask_price: order.ask_price,
+                funding_mode: order.funding_mode,
+                seller_payee_commitment: order.seller_payee_commitment,
+                expires_at: order.expires_at,
+                status: SaleStatus.FILLED }
+    );
+  positions.insert(
+    order.position_id,
+    Position { market_id: position.market_id,
+               side: position.side,
+               amount: position.amount,
+               fee_paid: position.fee_paid,
+               revision: next_revision,
+               status: PositionStatus.ACTIVE,
+               active_sale: empty_id() }
+    );
+  mint_position_ticket(
+    order.position_id,
+    next_revision,
+    buyer_pk,
+    position_ticket_nonce(order.position_id, next_revision)
+    );
+}
+
+// Unified secondary purchase. The listing fixes which funding branch is valid.
+export circuit fill_sale(
+                 order_id: Bytes<32>,
+                 funding_mode: FundingMode,
+                 payment_coin: ShieldedCoinInfo,
+                 seller_pk: ZswapCoinPublicKey,
+                 seller_salt: Bytes<32>,
+                 buyer_pk: ZswapCoinPublicKey,
+                 seller_payment_nonce: Bytes<32>): [] {
+  const public_order_id = disclose(order_id);
+  const public_mode = disclose(funding_mode);
+  const public_payment = disclose(payment_coin);
+  const public_seller_pk = disclose(seller_pk);
+  const public_seller_salt = disclose(seller_salt);
+  const public_buyer_pk = disclose(buyer_pk);
+  const public_payment_nonce = disclose(seller_payment_nonce);
+  const order = get_sale(public_order_id);
+  const position = get_position(order.position_id);
+  require_valid_funding_mode(public_mode);
+  validate_fill(public_order_id, order, position, public_seller_pk,
+                public_seller_salt, public_mode);
+  if (public_mode == FundingMode.SHIELDED) {
+    assert(public_payment.color == snight_color(), "Sale payment is not sNIGHT");
+    assert(public_payment.value == (order.ask_price as Uint<128>),
+           "Payment must equal ask price");
+    burn_shielded_coin(public_payment);
+  } else {
+    assert(public_payment.value == 0, "Unshielded fill requires an empty payment coin");
+    receiveUnshielded(underlying_token, order.ask_price as Uint<128>);
+  }
+  const seller_payment = mintShieldedToken(
+                           token_domain,
+                           order.ask_price,
+                           public_payment_nonce,
+                           left<ZswapCoinPublicKey, ContractAddress>(public_seller_pk)
+                           );
+  complete_fill(public_order_id, order, position, public_buyer_pk);
+}
+
+// The listing controller may cancel while the sale is live or recover the claim
+// after expiry/market settlement. Recovery increments the revision so the
+// escrowed old ticket can never be replayed.
+export circuit cancel_sale(
+                 order_id: Bytes<32>,
+                 control_ticket: ShieldedCoinInfo,
+                 recipient_pk: ZswapCoinPublicKey): [] {
+  const public_order_id = disclose(order_id);
+  const public_control = disclose(control_ticket);
+  const public_recipient = disclose(recipient_pk);
+  const order = get_sale(public_order_id);
+  assert(order.status == SaleStatus.OPEN, "Sale is not open");
+  const position = get_position(order.position_id);
+  assert(position.status == PositionStatus.LISTED, "Position is not listed");
+  assert(position.active_sale == public_order_id, "Position is listed by another sale");
+  assert(position.revision == order.position_revision, "Position revision mismatch");
+  consume_sale_control(public_order_id, public_control);
+  assert(position.revision < max_uint64(), "Position revision exhausted");
+  const next_revision = (position.revision + 1) as Uint<64>;
+  const still_live = kernel.blockTimeLessThan(order.expires_at);
+  sales.insert(
+    public_order_id,
+    SaleOrder { position_id: order.position_id,
+                position_revision: order.position_revision,
+                ask_price: order.ask_price,
+                funding_mode: order.funding_mode,
+                seller_payee_commitment: order.seller_payee_commitment,
+                expires_at: order.expires_at,
+                status: still_live ? SaleStatus.CANCELLED : SaleStatus.EXPIRED }
+    );
+  positions.insert(
+    order.position_id,
+    Position { market_id: position.market_id,
+               side: position.side,
+               amount: position.amount,
+               fee_paid: position.fee_paid,
+               revision: next_revision,
+               status: PositionStatus.ACTIVE,
+               active_sale: empty_id() }
+    );
+  mint_position_ticket(
+    order.position_id,
+    next_revision,
+    public_recipient,
+    position_ticket_nonce(order.position_id, next_revision)
+    );
+}
+
+circuit claim_resolved(position: Position, market: Market, gross_profit: Uint<64>): Uint<64> {
+  assert(position.side == market.outcome, "Position is not a winner");
+  const winners = winning_pool(market);
+  const losers = losing_pool(market);
+  assert(winners > 0, "Winning pool is empty");
+  assert(gross_profit * winners <= position.amount * losers, "Profit is too high");
+  assert(position.amount * losers < (gross_profit + 1) * winners, "Profit is too low");
+  return (position.amount + gross_profit) as Uint<64>;
+}
+
+circuit claim_cancelled(position: Position, market: Market, gross_profit: Uint<64>): Uint<64> {
+  assert(market.status == MarketStatus.CANCELLED, "Market is not cancelled");
+  assert(gross_profit == 0, "No profit on a cancelled market");
+  const escrowed = market_fees.member(position.market_id)
+                     ? market_fees.lookup(position.market_id)
+                     : 0;
+  assert(escrowed >= position.fee_paid, "Cancelled fee escrow is insufficient");
+  market_fees.insert(position.market_id, (escrowed - position.fee_paid) as Uint<64>);
+  return (position.amount + position.fee_paid) as Uint<64>;
+}
+
+// Only an ACTIVE current-revision ticket can claim. A listed Position must first
+// be recovered with cancel_sale, including after resolution.
+export circuit claim_settled(
+                 pos_id: Bytes<32>,
+                 payout_pk: ZswapCoinPublicKey,
+                 claim_ticket: ShieldedCoinInfo,
+                 gross_profit: Uint<64>): [] {
+  const public_pos_id = disclose(pos_id);
+  const public_payout_pk = disclose(payout_pk);
+  const public_ticket = disclose(claim_ticket);
+  const public_profit = disclose(gross_profit);
+  const position = get_position(public_pos_id);
+  assert(position.status == PositionStatus.ACTIVE, "Position is not active");
+  consume_position_ticket(public_pos_id, position.revision, public_ticket);
+  const market = get_market(position.market_id);
+  assert(market.status == MarketStatus.RESOLVED || market.status == MarketStatus.CANCELLED,
+         "Market is not settled");
+  const payout = market.status == MarketStatus.RESOLVED
+                   ? claim_resolved(position, market, public_profit)
+                   : claim_cancelled(position, market, public_profit);
+  positions.insert(
+    public_pos_id,
+    Position { market_id: position.market_id,
+               side: position.side,
+               amount: position.amount,
+               fee_paid: position.fee_paid,
+               revision: position.revision,
+               status: PositionStatus.CLAIMED,
+               active_sale: empty_id() }
+    );
+  const payout_coin = mintShieldedToken(
+                        token_domain,
+                        disclose(payout),
+                        persistentHash<Vector<3, Bytes<32>>>([
+                          pad(32, "dareu:claimmint:v3:"),
+                          public_pos_id,
+                          position.revision as Field as Bytes<32>
+                        ]),
+                        left<ZswapCoinPublicKey, ContractAddress>(public_payout_pk)
+                        );
+}
+
+circuit settle_market(market_id: Bytes<32>, market: Market, result: Outcome): [] {
+  const resolved =
+          Market { metadata_hash: market.metadata_hash,
+                   oracle: market.oracle,
+                   close_time: market.close_time,
+                   status: MarketStatus.RESOLVED,
+                   outcome: result,
+                   yes_pool: market.yes_pool,
+                   no_pool: market.no_pool,
+                   total_pool: market.total_pool,
+                   platform_fee_rate: market.platform_fee_rate,
+                   betting_cutoff: market.betting_cutoff };
+  assert(winning_pool(resolved) > 0, "Cannot resolve with no winners");
+  markets.insert(market_id, resolved);
+}
+
+export circuit settle_market_action(
+                 market_id: Bytes<32>,
+                 action: SettlementAction,
+                 result: Outcome): [] {
+  const public_market_id = disclose(market_id);
+  const public_action = disclose(action);
+  const public_result = disclose(result);
+  const market = get_market(public_market_id);
+  assert(market.status == MarketStatus.OPEN, "Market is not open");
+  const caller = disclose(current_participant());
+  assert(caller == owner || caller == operator || caller == market.oracle,
+         "Only owner, operator, or market oracle can settle");
+  if (public_action == SettlementAction.RESOLVE) {
+    assert(kernel.blockTimeGreaterThan(market.close_time), "Market has not closed");
+    require_valid_side(public_result);
+    settle_market(public_market_id, market, public_result);
+  } else {
+    assert(public_result == Outcome.NONE, "Cancelled market outcome must be NONE");
+    markets.insert(
+      public_market_id,
+      Market { metadata_hash: market.metadata_hash,
+               oracle: market.oracle,
+               close_time: market.close_time,
+               status: MarketStatus.CANCELLED,
+               outcome: Outcome.NONE,
+               yes_pool: market.yes_pool,
+               no_pool: market.no_pool,
+               total_pool: market.total_pool,
+               platform_fee_rate: market.platform_fee_rate,
+               betting_cutoff: market.betting_cutoff }
+      );
+  }
+}
+
+export circuit set_operator(participant: Bytes<32>, enabled: Boolean): [] {
+  require_owner();
+  const public_participant = disclose(participant);
+  const public_enabled = disclose(enabled);
+  if (public_enabled) {
+    assert(public_participant != empty_participant(), "Operator cannot be empty");
+    operator = public_participant;
+  } else {
+    operator = empty_participant();
+  }
+}
+
+export circuit withdraw_treasury(market_id: Bytes<32>, payout_address: UserAddress): [] {
+  const public_market_id = disclose(market_id);
+  require_owner();
+  const market = get_market(public_market_id);
+  assert(market.status == MarketStatus.RESOLVED,
+         "Fees are not withdrawable before resolution");
+  const amount = market_fees.member(public_market_id)
+                   ? market_fees.lookup(public_market_id)
+                   : 0;
+  assert(amount > 0, "No fees to withdraw for this market");
+  market_fees.insert(public_market_id, 0);
+  sendUnshielded(
+    underlying_token,
+    amount as Uint<128>,
+    right<ContractAddress, UserAddress>(disclose(payout_address))
+    );
+}

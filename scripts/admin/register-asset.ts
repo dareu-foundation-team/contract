@@ -33,8 +33,9 @@ import { Contract, type Witnesses } from '../../src/managed/dareu-registry/contr
 // Env (all read from contract/.env.local unless already exported):
 //   DAREU_ASSET_SYMBOL              short display symbol, e.g. "NIGHT" (<=32 bytes ascii)
 //   DAREU_ASSET_UNDERLYING_HEX      32-byte hex; unset/all-zero = native NIGHT
-//   DAREU_ASSET_MARKET_ADDRESS      the deployed dareu-v2 instance's ContractAddress hex;
-//                                   falls back to deployments/<network>-v2.json
+//   DAREU_ASSET_CONTRACT_VERSION    "v2" (default) or "v3"; reads the matching
+//                                   verified deployments/<network>-<version>.json
+//   DAREU_ASSET_MARKET_ADDRESS      intentionally rejected; use a deployment record
 //   DAREU_ASSET_DECIMALS            wrapped-token decimals (Uint<8>)
 //   DAREU_ASSET_SNIGHT_COLOR        32-byte hex; if unset, derived as
 //                                   rawTokenType(token_domain, market_address) — needs
@@ -100,6 +101,46 @@ function readDeploymentAddress(network: SupportedNetwork, suffix: 'v2' | 'regist
     throw new Error(`Deployment record ${deploymentPath} has no contractAddress.`);
   }
   return address;
+}
+
+function readAssetDeployment(network: SupportedNetwork, underlyingColor: Uint8Array, domain: Uint8Array) {
+  const version = (optionalEnv('DAREU_ASSET_CONTRACT_VERSION') ?? 'v2').toLowerCase();
+  if (version !== 'v2' && version !== 'v3') {
+    throw new Error('DAREU_ASSET_CONTRACT_VERSION must be v2 or v3.');
+  }
+  if (optionalEnv('DAREU_ASSET_MARKET_ADDRESS')) {
+    throw new Error('DAREU_ASSET_MARKET_ADDRESS is not accepted. Select v2/v3 using DAREU_ASSET_CONTRACT_VERSION.');
+  }
+
+  const deploymentPath = path.join(contractRoot, 'deployments', `${network}-${version}.json`);
+  if (!fs.existsSync(deploymentPath)) {
+    throw new Error(`No ${version.toUpperCase()} deployment record at ${deploymentPath}.`);
+  }
+  const record = JSON.parse(fs.readFileSync(deploymentPath, 'utf8')) as Record<string, unknown>;
+  const address = String(record.contractAddress ?? '');
+  const constructor = record['constructor'] as Record<string, unknown> | undefined;
+  if (record.network !== network || record.contractName !== `dareu-${version}` ||
+      record.protocolVersion !== DIRECT_PROTOCOL_VERSION || !/^[0-9a-f]{64}$/i.test(address)) {
+    throw new Error(`Invalid ${version.toUpperCase()} deployment record: ${deploymentPath}`);
+  }
+  if (constructor?.underlyingHex !== toHex(underlyingColor) || constructor?.tokenDomainHex !== toHex(domain)) {
+    throw new Error(`Asset underlying/token domain does not match ${deploymentPath}.`);
+  }
+  const derivedColor = rawTokenType(domain, address);
+  if (record.snightColorHex !== derivedColor) {
+    throw new Error(`sNIGHT color in ${deploymentPath} does not match the contract address and token domain.`);
+  }
+  if (version === 'v3') {
+    const bootstrapPath = path.join(contractRoot, 'deployments', `${network}-v3.bootstrap.json`);
+    if (!fs.existsSync(bootstrapPath)) throw new Error(`V3 completion record missing: ${bootstrapPath}`);
+    const bootstrap = JSON.parse(fs.readFileSync(bootstrapPath, 'utf8')) as Record<string, unknown>;
+    const bootstrapDeployment = bootstrap.deployment as Record<string, unknown> | undefined;
+    if (bootstrap.status !== 'complete' || bootstrapDeployment?.contractAddress !== address ||
+        !Array.isArray(bootstrap.pendingCircuits) || bootstrap.pendingCircuits.length !== 0) {
+      throw new Error(`V3 circuit installation is not complete in ${bootstrapPath}.`);
+    }
+  }
+  return { version, address, derivedColor };
 }
 
 function readRegistryPrivateStateId(network: SupportedNetwork): string {
@@ -176,7 +217,10 @@ async function addAsset(network: SupportedNetwork) {
   const underlyingHex = optionalEnv('DAREU_ASSET_UNDERLYING_HEX');
   const underlyingColor = underlyingHex ? parseHexBytes(underlyingHex, 32, 'DAREU_ASSET_UNDERLYING_HEX') : new Uint8Array(32);
 
-  const marketAddressHex = readDeploymentAddress(network, 'v2', 'DAREU_ASSET_MARKET_ADDRESS');
+  const tokenDomainStr = optionalEnv('DAREU_ASSET_TOKEN_DOMAIN') ?? 'dareu:snight:v1';
+  const domain = pad32Utf8(tokenDomainStr, 'DAREU_ASSET_TOKEN_DOMAIN');
+  const assetDeployment = readAssetDeployment(network, underlyingColor, domain);
+  const marketAddressHex = assetDeployment.address;
   const marketAddress = parseHexBytes(marketAddressHex.replace(/^0x/i, ''), 32, 'DAREU_ASSET_MARKET_ADDRESS');
 
   const decimals = BigInt(requiredEnv('DAREU_ASSET_DECIMALS'));
@@ -197,18 +241,22 @@ async function addAsset(network: SupportedNetwork) {
   if (snightColorHex) {
     snightColor = parseHexBytes(snightColorHex, 32, 'DAREU_ASSET_SNIGHT_COLOR');
   } else {
-    const tokenDomainStr = optionalEnv('DAREU_ASSET_TOKEN_DOMAIN') ?? 'dareu:snight:v1';
-    const domain = pad32Utf8(tokenDomainStr, 'DAREU_ASSET_TOKEN_DOMAIN');
-    const derivedHex = rawTokenType(domain, marketAddressHex);
+    const derivedHex = assetDeployment.derivedColor;
     snightColor = parseHexBytes(derivedHex, 32, 'derived snight_color');
     derivedSnight = true;
     console.log(`Derived snight_color from token_domain "${tokenDomainStr}" + market_address: ${derivedHex}`);
+  }
+  if (toHex(snightColor) !== assetDeployment.derivedColor) {
+    throw new Error(`DAREU_ASSET_SNIGHT_COLOR does not match the verified ${assetDeployment.version.toUpperCase()} deployment.`);
   }
 
   const enabledStr = (optionalEnv('DAREU_ASSET_ENABLED') ?? 'true').toLowerCase();
   const enabled = enabledStr === 'true' || enabledStr === '1';
 
-  console.log(`Registering asset "${symbolStr}" into the registry on ${network}.`);
+  console.log(`Registering asset "${symbolStr}" from ${assetDeployment.version.toUpperCase()} into the registry on ${network}.`);
+  if (assetDeployment.version === 'v3') {
+    console.log('WARNING: NIGHT is keyed by underlying color; this updates any existing V2 NIGHT registry record to V3.');
+  }
   console.log(`  underlying_color: ${toHex(underlyingColor)} ${underlyingHex ? '' : '(all-zero = native NIGHT)'}`);
   console.log(`  market_address:   ${toHex(marketAddress)}`);
   console.log(`  snight_color:     ${toHex(snightColor)} ${derivedSnight ? '(derived)' : '(from env)'}`);

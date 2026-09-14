@@ -1,4 +1,34 @@
-# DareU V2 Keeper
+# DareU Keeper (V3 default; V2 retained)
+
+V3 has separate `keeper:v3:*` commands and uses the deployed `dareu-v3`
+artifact. Its `create_market` ABI and market-ledger mirror match V2, while
+resolution/cancellation use `settle_market_action(market_id, RESOLVE|CANCEL,
+outcome)`. V3 SQL is restricted to rows marked with the V3 contract address;
+drafts already published on V2 are never re-published on V3. The DataProvider
+resolver now accepts both V2 and V3 published markets.
+
+Before starting a V3 keeper, register NIGHT in the registry against the V3
+market address and sNIGHT color, then check each category's operator key and
+wallet independently:
+
+```bash
+npm run keeper:v3:preflight -- preprod crypto
+npm run keeper:v3:wallet -- preprod crypto
+SYNC_INTERVAL_SEC=0 npm run keeper:v3:sync -- preprod
+```
+
+Use `stocks` and `sports` in place of `crypto` for their preflights. The
+read-only sync is one global process; the transaction keeper is one process per
+category. `keeper:run`, `keeper:publish`, `keeper:sync`, `keeper:resolve`, and
+managed `keeper:multi` now default to V3. The managed supervisor accepts
+`DAREU_KEEPER_CONTRACT_VERSION=v2` to run the retained V2 commands, but the
+registry must then still point to V2. Stop existing keeper/sync supervisors
+before switching versions; the same PID files are deliberately shared to
+prevent two versions competing for the same queue.
+
+No keeper is started or transaction submitted by this code change.
+
+## V2 operational details
 
 The Keeper consists of an independent read-only mirror and the active
 direct-resolution pipeline:
@@ -77,11 +107,20 @@ single foreground sync, for example:
 SYNC_INTERVAL_SEC=0 npm run keeper:v2:sync -- preprod
 ```
 
-The supervisor gives the initial Preprod wallet replay up to six hours and saves
-a wallet-state checkpoint every 10,000 applied DUST events. Override
-`MIDNIGHT_WALLET_SYNC_TIMEOUT_MS` or `MIDNIGHT_WALLET_CHECKPOINT_EVERY` in a
-category-specific env file when needed. Before starting wallet services, the
-keeper performs a bounded `system_health` websocket probe
+The supervisor gives a progressing initial Preprod wallet replay up to six hours
+and saves a working checkpoint every 10,000 applied DUST events. A separate
+progress watchdog defaults to ten minutes
+(`MIDNIGHT_WALLET_SYNC_STALL_TIMEOUT_MS`): if any required unsynced cursor stops
+advancing, the wallet context is restarted. A stalled DUST cursor additionally
+quarantines the working checkpoint, and the next process restores last-known-good
+or performs a cold replay. A second stall at the same DUST index
+(`MIDNIGHT_WALLET_SYNC_RECOVERY_ATTEMPTS`, default 2) exits with status 78 and
+stops the supervisor for operator inspection instead of replaying forever.
+Fully synced and post-transaction-settled states alone are promoted to
+`<cache>.last-good`; quarantined files remain recoverable as
+`<cache>.quarantine-*`. Override the timeouts or
+`MIDNIGHT_WALLET_CHECKPOINT_EVERY` in a category-specific env file when needed.
+Before starting wallet services, the keeper performs a bounded `system_health` websocket probe
 (`MIDNIGHT_RPC_PREFLIGHT_TIMEOUT_MS`, default 15 seconds). A failed setup closes
 every partially-started wallet service and exits before the supervisor starts a
 fresh process.

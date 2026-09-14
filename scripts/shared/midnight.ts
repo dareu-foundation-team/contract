@@ -59,8 +59,23 @@ export type WalletContext = {
   shieldedSecretKeys: ledger.ZswapSecretKeys;
   dustSecretKey: ledger.DustSecretKey;
   unshieldedKeystore: ReturnType<typeof createKeystore>;
-  /** Persist the current synced wallet state to disk for incremental resync next run. */
+  /** Persist a fully synced/settled state and promote it to last-known-good. */
   saveState: () => Promise<void>;
+  /** Persist partial forward progress without replacing last-known-good. */
+  saveCheckpoint: () => Promise<void>;
+  /** Quarantine a stalled checkpoint and prepare the next supervised recovery. */
+  recoverFromSyncStall: (error: WalletSyncStalledError) => Promise<WalletSyncRecoveryResult>;
+};
+
+export type WalletCachePolicy = 'prefer-checkpoint' | 'require-last-good';
+
+export type CreateWalletOptions = {
+  /**
+   * `prefer-checkpoint` is for the dedicated warm-up process: resume the newest
+   * partial checkpoint and finish the expensive replay. `require-last-good` is
+   * for short-lived transaction processes: never silently start a cold replay.
+   */
+  cachePolicy?: WalletCachePolicy;
 };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -73,8 +88,38 @@ export const zkConfigPath = path.resolve(contractRoot, 'src', 'managed', 'dareu-
 const walletCacheDir = path.join(contractRoot, '.wallet-cache');
 const WALLET_CACHE_VERSION = 1;
 
+function walletCacheFingerprint(): string {
+  try {
+    const lock = JSON.parse(fs.readFileSync(path.join(contractRoot, 'package-lock.json'), 'utf8')) as {
+      packages?: Record<string, { version?: string }>;
+    };
+    const version = (name: string) => lock.packages?.[`node_modules/${name}`]?.version ?? 'unknown';
+    return [
+      `wallet-facade@${version('@midnight-ntwrk/wallet-sdk-facade')}`,
+      `dust-wallet@${version('@midnight-ntwrk/wallet-sdk-dust-wallet')}`,
+      `ledger-v8@${version('@midnight-ntwrk/ledger-v8')}`,
+      'sync=v1',
+    ].join('|');
+  } catch {
+    // A missing lockfile should not disable wallet operation. The fallback is
+    // deliberately distinct, so a later locked install invalidates this cache.
+    return 'wallet-packages@unknown|sync=v1';
+  }
+}
+
+const WALLET_CACHE_FINGERPRINT = walletCacheFingerprint();
+
+export function isWalletCacheFingerprintCompatible(fingerprint: string | undefined): boolean {
+  // A serialized wallet contains both the ledger commitment tree and a separate
+  // sync cursor.  Legacy caches did not record which SDK/ledger implementation
+  // produced those two values, so restoring one can resume after an unapplied
+  // tree index and permanently loop with "values inserted non-linearly".
+  return fingerprint === WALLET_CACHE_FINGERPRINT;
+}
+
 type WalletStateCache = {
   version: number;
+  fingerprint?: string;
   network: SupportedNetwork;
   address: string;
   shielded: string;
@@ -96,25 +141,95 @@ function walletCachePath(network: SupportedNetwork): string {
   return path.join(walletCacheDir, `${network}${namespace ? `-${namespace}` : ''}.json`);
 }
 
+function walletLastGoodCachePath(network: SupportedNetwork): string {
+  return `${walletCachePath(network)}.last-good`;
+}
+
+function walletSyncRecoveryPath(network: SupportedNetwork): string {
+  return `${walletCachePath(network)}.sync-recovery.json`;
+}
+
 function walletCacheEnabled(): boolean {
   return (process.env.MIDNIGHT_WALLET_CACHE?.trim() ?? '1') !== '0';
 }
 
-/** Load a valid, matching cache for this network+address, or undefined. */
-function loadWalletStateCache(network: SupportedNetwork, address: string): WalletStateCache | undefined {
+/** Keep the checkpoint that existed before a supervised warm-up starts. */
+export function preserveWalletCheckpoint(
+  network: SupportedNetwork,
+  label = 'before-v3-prepare',
+): string | undefined {
   if (!walletCacheEnabled()) return undefined;
-  const file = walletCachePath(network);
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(label)) {
+    throw new Error('Wallet checkpoint backup label contains unsupported characters.');
+  }
+  const source = walletCachePath(network);
+  if (!fs.existsSync(source)) return undefined;
+  const backup = `${source}.${label}`;
   try {
-    if (!fs.existsSync(file)) return undefined;
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as WalletStateCache;
-    if (parsed.version !== WALLET_CACHE_VERSION || parsed.network !== network || parsed.address !== address) {
-      return undefined;
+    fs.copyFileSync(source, backup, fs.constants.COPYFILE_EXCL);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  return backup;
+}
+
+/** Load a valid, matching cache for this network+address, or undefined. */
+function readWalletStateCache(file: string, network: SupportedNetwork, address: string): WalletStateCache | undefined {
+  if (!fs.existsSync(file)) return undefined;
+  const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as WalletStateCache;
+  if (parsed.version !== WALLET_CACHE_VERSION || parsed.network !== network || parsed.address !== address) {
+    return undefined;
+  }
+  // Never restore an unversioned/foreign SDK snapshot. A clean replay is slower,
+  // but it is the only safe recovery when tree state and appliedIndex disagree.
+  if (!isWalletCacheFingerprintCompatible(parsed.fingerprint)) return undefined;
+  if (!parsed.shielded || !parsed.unshielded || !parsed.dust) return undefined;
+  return parsed;
+}
+
+function loadWalletStateCache(
+  network: SupportedNetwork,
+  address: string,
+  policy: WalletCachePolicy,
+): { cache: WalletStateCache; source: 'checkpoint' | 'last-good' } | undefined {
+  if (!walletCacheEnabled()) return undefined;
+  try {
+    if (policy === 'require-last-good') {
+      const cache = readWalletStateCache(walletLastGoodCachePath(network), network, address);
+      return cache ? { cache, source: 'last-good' } : undefined;
     }
-    if (!parsed.shielded || !parsed.unshielded || !parsed.dust) return undefined;
-    return parsed;
+    const checkpoint = readWalletStateCache(walletCachePath(network), network, address);
+    if (checkpoint) return { cache: checkpoint, source: 'checkpoint' };
+    const lastGood = readWalletStateCache(walletLastGoodCachePath(network), network, address);
+    return lastGood ? { cache: lastGood, source: 'last-good' } : undefined;
   } catch {
     return undefined;
   }
+}
+
+type WalletSyncRecoveryRecord = {
+  dustAppliedIndex: number;
+  attempts: number;
+  updatedAt: string;
+};
+
+export type WalletSyncRecoveryResult = {
+  attempt: number;
+  exhausted: boolean;
+  quarantinedPath?: string;
+  restoredLastKnownGood: boolean;
+};
+
+export function nextWalletSyncRecoveryAttempt(
+  previous: WalletSyncRecoveryRecord | undefined,
+  dustAppliedIndex: number,
+  updatedAt = new Date().toISOString(),
+): WalletSyncRecoveryRecord {
+  return {
+    dustAppliedIndex,
+    attempts: previous?.dustAppliedIndex === dustAppliedIndex ? previous.attempts + 1 : 1,
+    updatedAt,
+  };
 }
 export const stateRoot = path.resolve(contractRoot, '.midnight-state');
 
@@ -194,6 +309,40 @@ export function errorMessage(error: unknown, depth = 0): string {
   return String(error);
 }
 
+export class WalletSyncStalledError extends Error {
+  readonly code = 'WALLET_SYNC_STALLED';
+
+  constructor(
+    readonly stallTimeoutMs: number,
+    readonly dustAppliedIndex: number,
+    readonly stalledStreams: string[],
+    readonly progress: string,
+  ) {
+    super(
+      `Midnight wallet sync made no applied-index progress for ${stallTimeoutMs}ms ` +
+        `(stalled=${stalledStreams.join(', ')}, DUST applied=${dustAppliedIndex}). ${progress}`,
+    );
+    this.name = 'WalletSyncStalledError';
+  }
+}
+
+export class WalletSyncRecoveryExhaustedError extends Error {
+  readonly code = 'WALLET_SYNC_RECOVERY_EXHAUSTED';
+
+  constructor(readonly attempt: number, readonly dustAppliedIndex: number) {
+    super(
+      `Midnight wallet sync stalled ${attempt} times at DUST applied index ${dustAppliedIndex}. ` +
+        'The active checkpoint was quarantined; automatic restart is stopped to avoid an infinite cold-replay loop.',
+    );
+    this.name = 'WalletSyncRecoveryExhaustedError';
+  }
+}
+
+export function isWalletSyncRecoveryExhausted(error: unknown): error is WalletSyncRecoveryExhaustedError {
+  return error instanceof WalletSyncRecoveryExhaustedError ||
+    (error instanceof Error && (error as Error & { code?: string }).code === 'WALLET_SYNC_RECOVERY_EXHAUSTED');
+}
+
 function progressValue(progress: unknown, key: string) {
   const value = (progress as Record<string, unknown> | undefined)?.[key];
   if (typeof value === 'bigint') return value.toString();
@@ -225,6 +374,46 @@ function formatSyncProgress(state: WalletSyncedState) {
     `dust(${indexedProgress(state.dust.state.progress)})`,
     `unshielded(${unshieldedProgress(state.unshielded.progress)})`,
   ].join(' ');
+}
+
+function formatMemoryUsage() {
+  const memory = process.memoryUsage();
+  const mb = (bytes: number) => Math.round(bytes / 1024 / 1024);
+  return `memory(rss=${mb(memory.rss)}MB heap=${mb(memory.heapUsed)}/${mb(memory.heapTotal)}MB)`;
+}
+
+function formatDustStatus(state: WalletSyncedState) {
+  return [
+    `balance=${state.dust.balance(new Date()).toString()}`,
+    `availableCoins=${state.dust.availableCoins.length}`,
+    `pendingCoins=${state.dust.pendingCoins.length}`,
+  ].join(' ');
+}
+
+export type WalletAppliedProgress = {
+  shielded: bigint;
+  dust: bigint;
+  unshielded: bigint;
+};
+
+function bigintProgressValue(progress: unknown, key: string): bigint {
+  const value = (progress as Record<string, unknown> | undefined)?.[key];
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.max(0, Math.floor(value)));
+  if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value);
+  return 0n;
+}
+
+export function walletAppliedProgress(state: WalletSyncedState): WalletAppliedProgress {
+  return {
+    shielded: bigintProgressValue(state.shielded.state.progress, 'appliedIndex'),
+    dust: bigintProgressValue(state.dust.state.progress, 'appliedIndex'),
+    unshielded: bigintProgressValue(state.unshielded.progress, 'appliedId'),
+  };
+}
+
+export function hasWalletAppliedProgress(previous: WalletAppliedProgress, next: WalletAppliedProgress): boolean {
+  return next.shielded > previous.shielded || next.dust > previous.dust || next.unshielded > previous.unshielded;
 }
 
 export function isWalletStateSyncedWithin(
@@ -384,7 +573,12 @@ export function deriveKeys(seedOrMnemonic: string) {
   return result.keys;
 }
 
-export async function createWallet(seedHex: string, network: SupportedNetwork, config: NetworkConfig): Promise<WalletContext> {
+export async function createWallet(
+  seedHex: string,
+  network: SupportedNetwork,
+  config: NetworkConfig,
+  options: CreateWalletOptions = {},
+): Promise<WalletContext> {
   globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket;
   await assertNodeRpcResponsive(config);
   // NOTE: ledger-v8 8.1.0 parses & replays the v9 `DustGenerationDtimeUpdate` events
@@ -426,22 +620,38 @@ export async function createWallet(seedHex: string, network: SupportedNetwork, c
   // Resume from a cached synced state when available (incremental sync); otherwise
   // start fresh. Any restore failure (stale/incompatible cache) falls back to fresh.
   const address = String(unshieldedKeystore.getBech32Address());
-  const cache = loadWalletStateCache(network, address);
+  const cachePolicy = options.cachePolicy ?? 'prefer-checkpoint';
+  const cachedState = loadWalletStateCache(network, address, cachePolicy);
+  if (cachePolicy === 'require-last-good' && !cachedState) {
+    throw new Error(
+      `No valid fully-synced wallet snapshot exists at ${walletLastGoodCachePath(network)}. ` +
+        `Run "npm run wallet:v3:prepare:${network}" first. The deploy command will not perform a cold wallet replay.`,
+    );
+  }
   const buildFresh = () => ({
     shielded: shieldedClass.startWithSecretKeys(shieldedSecretKeys),
     unshielded: unshieldedClass.startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore)),
     dust: dustClass.startWithSecretKey(dustSecretKey, ledger.LedgerParameters.initialParameters().dust),
   });
   let wallets: ReturnType<typeof buildFresh>;
-  if (cache) {
+  if (cachedState) {
     try {
+      const cache = cachedState.cache;
       wallets = {
         shielded: shieldedClass.restore(cache.shielded),
         unshielded: unshieldedClass.restore(cache.unshielded),
         dust: dustClass.restore(cache.dust),
       };
-      console.log('Restored wallet state from cache; syncing incrementally from the cached point.');
+      console.log(
+        `Restored wallet state from ${cachedState.source}; syncing incrementally from the cached point.`,
+      );
     } catch (error) {
+      if (cachePolicy === 'require-last-good') {
+        throw new Error(
+          `The fully-synced wallet snapshot could not be restored; rerun the wallet preparation command: ${errorMessage(error)}`,
+          { cause: error },
+        );
+      }
       console.warn(
         `Wallet cache restore failed (${error instanceof Error ? error.message : String(error)}); doing a full sync.`,
       );
@@ -495,17 +705,28 @@ export async function createWallet(seedHex: string, network: SupportedNetwork, c
   }
   console.log('Midnight wallet services started (shielded + unshielded + DUST).');
 
-  // Persist the synced state to disk (atomic write) so the next run resumes
-  // incrementally. Best-effort: a serialize/write failure never aborts the run.
-  // A `saving` guard prevents the periodic checkpoint and an explicit save from
-  // overlapping.
-  let saving = false;
-  const writeCache = async (): Promise<boolean> => {
-    if (!walletCacheEnabled() || saving) return false;
-    saving = true;
+  // The active file is a resumable working checkpoint. Only a fully synced or
+  // post-transaction-settled state is also promoted to `.last-good`, so a failed
+  // replay can be quarantined without losing the last state known to be safe.
+  let observedApplied: number | undefined;
+  let lastSavedApplied: number | undefined;
+  let saveInFlight: Promise<boolean> | undefined;
+
+  const writeJsonAtomic = (file: string, data: WalletStateCache) => {
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, file);
+  };
+
+  const performCacheWrite = async (promoteLastKnownGood: boolean, requireProgress: boolean): Promise<boolean> => {
+    if (!walletCacheEnabled()) return false;
+    if (requireProgress && (observedApplied === undefined || observedApplied <= (lastSavedApplied ?? observedApplied))) {
+      return false;
+    }
     try {
       const data: WalletStateCache = {
         version: WALLET_CACHE_VERSION,
+        fingerprint: WALLET_CACHE_FINGERPRINT,
         network,
         address,
         shielded: await wallet.shielded.serializeState(),
@@ -513,21 +734,77 @@ export async function createWallet(seedHex: string, network: SupportedNetwork, c
         dust: await wallet.dust.serializeState(),
       };
       fs.mkdirSync(walletCacheDir, { recursive: true });
-      const file = walletCachePath(network);
-      const tmp = `${file}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(data));
-      fs.renameSync(tmp, file);
+      writeJsonAtomic(walletCachePath(network), data);
+      if (promoteLastKnownGood) {
+        writeJsonAtomic(walletLastGoodCachePath(network), data);
+        try { fs.unlinkSync(walletSyncRecoveryPath(network)); } catch { /* no recovery marker */ }
+      }
+      lastSavedApplied = observedApplied;
       return true;
     } catch (error) {
       console.warn(`Could not cache wallet state: ${error instanceof Error ? error.message : String(error)}`);
       return false;
+    }
+  };
+
+  const writeCache = async (promoteLastKnownGood: boolean, requireProgress = false): Promise<boolean> => {
+    if (saveInFlight) await saveInFlight;
+    const operation = performCacheWrite(promoteLastKnownGood, requireProgress);
+    saveInFlight = operation;
+    try {
+      return await operation;
     } finally {
-      saving = false;
+      if (saveInFlight === operation) saveInFlight = undefined;
     }
   };
 
   const saveState = async () => {
-    if (await writeCache()) console.log(`Wallet sync state cached: ${walletCachePath(network)}`);
+    if (await writeCache(true)) {
+      console.log(`Wallet sync state cached and promoted to last-known-good: ${walletCachePath(network)}`);
+    }
+  };
+
+  const saveCheckpoint = async () => {
+    if (await writeCache(false, true)) {
+      console.log(`Wallet sync checkpoint cached at applied=${observedApplied ?? 0}.`);
+    }
+  };
+
+  const recoverFromSyncStall = async (error: WalletSyncStalledError): Promise<WalletSyncRecoveryResult> => {
+    if (saveInFlight) await saveInFlight;
+    fs.mkdirSync(walletCacheDir, { recursive: true });
+    const recoveryFile = walletSyncRecoveryPath(network);
+    let previous: WalletSyncRecoveryRecord | undefined;
+    try {
+      previous = JSON.parse(fs.readFileSync(recoveryFile, 'utf8')) as WalletSyncRecoveryRecord;
+    } catch {
+      previous = undefined;
+    }
+    const recovery = nextWalletSyncRecoveryAttempt(previous, error.dustAppliedIndex);
+    fs.writeFileSync(recoveryFile, JSON.stringify(recovery, null, 2));
+
+    const activeFile = walletCachePath(network);
+    let quarantinedPath: string | undefined;
+    if (fs.existsSync(activeFile)) {
+      const suffix = recovery.updatedAt.replace(/[^0-9]/g, '').slice(0, 14);
+      quarantinedPath = `${activeFile}.quarantine-${suffix}-attempt-${recovery.attempts}`;
+      fs.renameSync(activeFile, quarantinedPath);
+    }
+
+    const lastGoodFile = walletLastGoodCachePath(network);
+    const restoredLastKnownGood = fs.existsSync(lastGoodFile);
+    if (restoredLastKnownGood) fs.copyFileSync(lastGoodFile, activeFile);
+
+    const maxAttempts = Math.max(
+      1,
+      Math.floor(Number(process.env.MIDNIGHT_WALLET_SYNC_RECOVERY_ATTEMPTS ?? 2)) || 2,
+    );
+    return {
+      attempt: recovery.attempts,
+      exhausted: recovery.attempts >= maxAttempts,
+      quarantinedPath,
+      restoredLastKnownGood,
+    };
   };
 
   // Progress-driven checkpoint DURING the (long, first-time) sync: every time the
@@ -536,24 +813,40 @@ export async function createWallet(seedHex: string, network: SupportedNetwork, c
   // resumes from the last checkpoint instead of restarting from zero.
   const checkpointEvery = Number(process.env.MIDNIGHT_WALLET_CHECKPOINT_EVERY ?? 200_000);
   if (walletCacheEnabled() && Number.isFinite(checkpointEvery) && checkpointEvery > 0) {
-    let lastCheckpointAt = 0;
+    let lastCheckpointAt: number | undefined;
     let pending = false;
     wallet
       .state()
       .pipe(Rx.auditTime(2_000))
       .subscribe((state) => {
         const applied = dustAppliedIndex(state);
+        observedApplied = applied;
+        if (lastCheckpointAt === undefined) {
+          // Establish the restored/fresh baseline without rewriting an unchanged
+          // cache as if it were new progress.
+          lastCheckpointAt = applied;
+          lastSavedApplied = applied;
+          return;
+        }
         if (pending || applied - lastCheckpointAt < checkpointEvery) return;
         pending = true;
         lastCheckpointAt = applied;
-        void writeCache().then((ok) => {
+        void writeCache(false, true).then((ok) => {
           pending = false;
           if (ok) console.log(`Sync checkpoint saved at applied=${applied}; a failed run resumes from here.`);
         });
       });
   }
 
-  return { wallet, shieldedSecretKeys, dustSecretKey, unshieldedKeystore, saveState };
+  return {
+    wallet,
+    shieldedSecretKeys,
+    dustSecretKey,
+    unshieldedKeystore,
+    saveState,
+    saveCheckpoint,
+    recoverFromSyncStall,
+  };
 }
 
 /** Read the dust wallet's applied sync index from a facade state, as a number. */
@@ -759,9 +1052,22 @@ export async function ensureDust(walletCtx: WalletContext, config: NetworkConfig
 async function RxFirstDust(walletCtx: WalletContext) {
   const timeoutMs_ = Number(process.env.MIDNIGHT_DUST_GENERATION_TIMEOUT_MS ?? 60 * 60 * 1000);
 
+  // Do not leave an operator staring at a silent terminal for up to an hour.
+  // `tap` runs before the readiness filters, so stalled/zero-DUST states remain
+  // visible together with all three cursors and process memory.
+  let lastPrintedAt = 0;
+
   return Rx.firstValueFrom(
     walletCtx.wallet.state().pipe(
-      Rx.auditTime(5000),
+      Rx.auditTime(5_000),
+      Rx.tap((state) => {
+        const now = Date.now();
+        if (now - lastPrintedAt < 5_000) return;
+        lastPrintedAt = now;
+        console.log(
+          `DUST wait progress: ${formatSyncProgress(state)} ${formatDustStatus(state)} ${formatMemoryUsage()}`,
+        );
+      }),
       Rx.filter((state) => state.dust.state.progress.isCompleteWithin(syncAllowedGap())),
       Rx.filter((state) => state.dust.balance(new Date()) > 0n),
       Rx.timeout({
@@ -779,21 +1085,90 @@ async function RxFirstDust(walletCtx: WalletContext) {
   );
 }
 
-export async function waitForSyncedState(wallet: WalletFacade) {
-  const allowedGap = syncAllowedGap();
+export async function waitForSyncedState(wallet: WalletFacade, allowedGap = syncAllowedGap()) {
+  const stallTimeoutMs = timeoutMs('MIDNIGHT_WALLET_SYNC_STALL_TIMEOUT_MS', 10 * 60 * 1000);
   const progressSubscription = wallet.state().pipe(Rx.auditTime(5_000)).subscribe({
-    next: (state) => console.log(formatSyncProgress(state)),
+    next: (state) => console.log(`${formatSyncProgress(state)} ${formatDustStatus(state)} ${formatMemoryUsage()}`),
   });
 
-  console.log(`Waiting for Midnight wallet sync (allowed gap: ${allowedGap.toString()})...`);
+  console.log(
+    `Waiting for Midnight wallet sync (allowed gap: ${allowedGap.toString()}, ` +
+      `stall timeout: ${stallTimeoutMs}ms)...`,
+  );
+
+  let latestProgress: WalletAppliedProgress | undefined;
+  let latestWalletState: WalletSyncedState | undefined;
+  let latestStateText = 'Wallet sync progress has not emitted a state yet.';
+  const watchStartedAt = Date.now();
+  const lastAppliedProgressAt = {
+    shielded: watchStartedAt,
+    dust: watchStartedAt,
+    unshielded: watchStartedAt,
+  };
+  let rejectStall: ((error: WalletSyncStalledError) => void) | undefined;
+  const stallPromise = new Promise<never>((_resolve, reject) => {
+    rejectStall = reject;
+  });
+  const appliedProgressSubscription = wallet.state().subscribe({
+    next: (state) => {
+      const next = walletAppliedProgress(state);
+      latestWalletState = state;
+      latestStateText = formatSyncProgress(state);
+      const now = Date.now();
+      if (!latestProgress || next.shielded > latestProgress.shielded) {
+        lastAppliedProgressAt.shielded = now;
+      }
+      if (!latestProgress || next.dust > latestProgress.dust) {
+        lastAppliedProgressAt.dust = now;
+      }
+      if (!latestProgress || next.unshielded > latestProgress.unshielded) {
+        lastAppliedProgressAt.unshielded = now;
+      }
+      latestProgress = next;
+    },
+  });
+  const stallCheckEveryMs = Math.max(1_000, Math.min(30_000, Math.floor(stallTimeoutMs / 4)));
+  const stallTimer = setInterval(() => {
+    const now = Date.now();
+    const stalledStreams: string[] = [];
+    if (!latestProgress || !latestWalletState) {
+      if (now - watchStartedAt < stallTimeoutMs) return;
+      stalledStreams.push('all (no wallet state emitted)');
+    } else {
+      if (
+        !latestWalletState.shielded.state.progress.isCompleteWithin(allowedGap) &&
+        now - lastAppliedProgressAt.shielded >= stallTimeoutMs
+      ) stalledStreams.push('shielded');
+      if (
+        !latestWalletState.dust.state.progress.isCompleteWithin(allowedGap) &&
+        now - lastAppliedProgressAt.dust >= stallTimeoutMs
+      ) stalledStreams.push('dust');
+      if (
+        !latestWalletState.unshielded.progress.isCompleteWithin(allowedGap) &&
+        now - lastAppliedProgressAt.unshielded >= stallTimeoutMs
+      ) stalledStreams.push('unshielded');
+    }
+    if (stalledStreams.length === 0) return;
+    rejectStall?.(
+      new WalletSyncStalledError(
+        stallTimeoutMs,
+        Number(latestProgress?.dust ?? 0n),
+        stalledStreams,
+        `Stalled stream(s): ${stalledStreams.join(', ')}. ${latestStateText}`,
+      ),
+    );
+  }, stallCheckEveryMs);
 
   try {
     const [shielded, unshielded, dust, pending] = await withTimeout(
-      Promise.all([
-        wallet.shielded.waitForSyncedState(allowedGap),
-        wallet.unshielded.waitForSyncedState(allowedGap),
-        wallet.dust.waitForSyncedState(allowedGap),
-        Rx.firstValueFrom(wallet.pendingTransactionsService.state()),
+      Promise.race([
+        Promise.all([
+          wallet.shielded.waitForSyncedState(allowedGap),
+          wallet.unshielded.waitForSyncedState(allowedGap),
+          wallet.dust.waitForSyncedState(allowedGap),
+          Rx.firstValueFrom(wallet.pendingTransactionsService.state()),
+        ]),
+        stallPromise,
       ]),
       timeoutMs('MIDNIGHT_WALLET_SYNC_TIMEOUT_MS', 300_000),
       'Timed out while waiting for Midnight wallet sync. Check the Indexer websocket, Preprod connectivity, and wallet seed.',
@@ -812,6 +1187,8 @@ export async function waitForSyncedState(wallet: WalletFacade) {
     console.log('Midnight wallet synced.');
     return state;
   } finally {
+    clearInterval(stallTimer);
+    appliedProgressSubscription.unsubscribe();
     progressSubscription.unsubscribe();
   }
 }
@@ -910,7 +1287,13 @@ export async function createProviders(
     proofProvider: httpClientProofProvider(config.proofServer, zkConfigProvider),
     walletProvider,
     midnightProvider: {
-      submitTx: (tx: any) => walletCtx.wallet.submitTransaction(tx) as any,
+      submitTx: (tx: any) => {
+        // Size is public operational telemetry; never print the serialized tx.
+        // This makes block-limit failures distinguishable from fee/proof errors.
+        const serializedBytes = tx.serialize().length;
+        console.log(`Submitting finalized transaction: ${serializedBytes} bytes.`);
+        return walletCtx.wallet.submitTransaction(tx) as any;
+      },
     },
   };
 }

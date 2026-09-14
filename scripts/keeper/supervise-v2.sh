@@ -4,6 +4,7 @@ set -u
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 NETWORK="${1:-preprod}"
 CATEGORY="${2:-}"
+KEEPER_CONTRACT_VERSION="${DAREU_KEEPER_CONTRACT_VERSION:-v3}"
 RESTART_DELAY_SEC="${KEEPER_RESTART_DELAY_SEC:-20}"
 RESTART_MAX_DELAY_SEC="${KEEPER_RESTART_MAX_DELAY_SEC:-300}"
 RESTART_STABLE_SEC="${KEEPER_RESTART_STABLE_SEC:-600}"
@@ -12,6 +13,11 @@ CHILD_PID=""
 CONSECUTIVE_FAILURES=0
 
 cd "$ROOT_DIR"
+
+case "$KEEPER_CONTRACT_VERSION" in
+  v2|v3) ;;
+  *) echo "Unsupported DAREU_KEEPER_CONTRACT_VERSION: $KEEPER_CONTRACT_VERSION" >&2; exit 2 ;;
+esac
 
 case "$CATEGORY" in
   crypto|stocks|sports) ;;
@@ -64,9 +70,9 @@ stop_child() {
 trap stop_child INT TERM
 
 while [[ "$STOPPING" -eq 0 ]]; do
-  echo "[keeper-supervisor:$CATEGORY] $(date -u +%Y-%m-%dT%H:%M:%SZ) starting V2 keeper on $NETWORK"
+  echo "[keeper-supervisor:$CATEGORY] $(date -u +%Y-%m-%dT%H:%M:%SZ) starting ${KEEPER_CONTRACT_VERSION} keeper on $NETWORK"
   STARTED_AT=$(date +%s)
-  npm run keeper:run -- "$NETWORK" "$CATEGORY" &
+  npm run "keeper:${KEEPER_CONTRACT_VERSION}:run" -- "$NETWORK" "$CATEGORY" &
   CHILD_PID=$!
   wait "$CHILD_PID"
   STATUS=$?
@@ -74,6 +80,11 @@ while [[ "$STOPPING" -eq 0 ]]; do
 
   if [[ "$STOPPING" -ne 0 ]]; then
     break
+  fi
+
+  if [[ "$STATUS" -eq 78 ]]; then
+    echo "[keeper-supervisor:$CATEGORY] keeper exhausted wallet-sync recovery; automatic restart stopped for operator inspection"
+    exit 78
   fi
 
   RUNTIME_SEC=$(( $(date +%s) - STARTED_AT ))

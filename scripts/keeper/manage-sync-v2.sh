@@ -35,7 +35,7 @@ start_sync() {
     return 0
   fi
   local discovered
-  discovered="$(pgrep -f "scripts/keeper/sync-v2.ts ${NETWORK}$|scripts/keeper/supervise-sync-v2.sh ${NETWORK}$" 2>/dev/null || true)"
+  discovered="$(pgrep -f "scripts/keeper/sync-v[23].ts ${NETWORK}$|scripts/keeper/supervise-sync-v2.sh ${NETWORK}$" 2>/dev/null || true)"
   if [[ -n "$discovered" ]]; then
     echo "[sync] refusing duplicate start; mirror process already exists: $discovered" >&2
     return 1

@@ -53,7 +53,7 @@ start_one() {
     return 0
   fi
   local discovered
-  discovered="$(pgrep -f "scripts/keeper/run-v2.ts ${NETWORK} ${category}$|scripts/keeper/supervise-v2.sh ${NETWORK} ${category}$" 2>/dev/null || true)"
+  discovered="$(pgrep -f "scripts/keeper/run-v[23].ts ${NETWORK} ${category}$|scripts/keeper/supervise-v2.sh ${NETWORK} ${category}$" 2>/dev/null || true)"
   if [[ -n "$discovered" ]]; then
     echo "[$category] refusing duplicate start; Keeper process already exists: $discovered" >&2
     return 1
@@ -126,7 +126,7 @@ status_one() {
 
 case "$ACTION" in
   start)
-    legacy="$(pgrep -f "scripts/keeper/run-v2.ts ${NETWORK}$|scripts/keeper/supervise-v2.sh ${NETWORK}$" 2>/dev/null || true)"
+    legacy="$(pgrep -f "scripts/keeper/run-v[23].ts ${NETWORK}$|scripts/keeper/supervise-v2.sh ${NETWORK}$" 2>/dev/null || true)"
     if [[ -n "$legacy" ]]; then
       echo "Refusing to start category Keepers while an unscoped legacy Keeper is running: $legacy" >&2
       echo "Stop the old supervisor and run-v2 process first." >&2

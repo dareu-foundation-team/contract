@@ -108,6 +108,10 @@ export function isKeeperDustUnavailable(error: unknown): boolean {
 }
 
 export function isBrokenKeeperContext(error: unknown): boolean {
+  // A DUST shortage message can legitimately mention that it was observed after
+  // "wallet sync". Classify the more specific expected condition first so that
+  // phrase does not trigger the broad transport/sync recovery regex below.
+  if (isKeeperDustUnavailable(error)) return false
   if (isKeeperTransactionTimeout(error) || error instanceof KeeperContextBrokenError) return true
   const message = errorMessage(error)
   const code = error instanceof Error ? (error as Error & { code?: string }).code : undefined
