@@ -11,17 +11,19 @@ import {
   resolveMarketsV3,
   cancelRequestedV3,
 } from './resolve-v3.js'
-import { resolveDeploymentV3 } from '../shared/chain-v3.js'
+import { connectKeeperV3, resolveDeploymentV3 } from '../shared/chain-v3.js'
 import { isWalletSyncRecoveryExhausted } from '../shared/midnight.js'
+import { startWalletHealthMetrics } from '../shared/midnight.js'
 import {
   errorMessage,
   isBrokenKeeperContext,
   isKeeperDustUnavailable,
   isKeeperTransactionTimeout,
   keeperBatchLimit,
+  stopWalletSafely,
 } from './reliability.js'
 import { configureKeeperCategory } from './scope-v2.js'
-import { runKeeperPriorityCycle } from './scheduling-v2.js'
+import { runKeeperPriorityCycle, type KeeperPriorityCycle } from './scheduling-v2.js'
 
 async function main() {
   const category = configureKeeperCategory(process.argv[3])
@@ -59,18 +61,27 @@ async function main() {
     let dustUnavailable = false
     let madeProgress = false
     try {
-      const cycle = await runKeeperPriorityCycle({
-        resolve: () => resolveMarketsV3(network),
-        cancelFunded: () => cancelRequestedV3(network, { mode: 'funded' }),
-        cancelEmpty: () => cancelRequestedV3(network, {
-          mode: 'empty',
-          limit: emptyCancelQuantum,
-        }),
-        publish: () => publishDraftsV3(network, {
-          limit: publishQuantum,
-          preemptForSettlement: true,
-        }),
-      })
+      const context = await connectKeeperV3(network)
+      const stopHealthMetrics = startWalletHealthMetrics(context.walletCtx.wallet, network)
+      let cycle: KeeperPriorityCycle
+      try {
+        cycle = await runKeeperPriorityCycle({
+          resolve: () => resolveMarketsV3(network, context),
+          cancelFunded: () => cancelRequestedV3(network, { mode: 'funded' }, context),
+          cancelEmpty: () => cancelRequestedV3(network, {
+            mode: 'empty',
+            limit: emptyCancelQuantum,
+          }, context),
+          publish: () => publishDraftsV3(network, {
+            limit: publishQuantum,
+            preemptForSettlement: true,
+            context,
+          }),
+        })
+      } finally {
+        stopHealthMetrics()
+        await stopWalletSafely(context.walletCtx.wallet, `keeper-v3:${category} cycle`)
+      }
       madeProgress = cycle.madeProgress
       console.log(
         `[keeper-v3:${category}] cycle: ` +

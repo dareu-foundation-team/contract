@@ -15,10 +15,11 @@ import {
   createWallet,
   ensureDust,
   errorMessage,
-  requiredWalletSeedOrMnemonic,
+  requiredDeployerWalletSeedOrMnemonic,
   waitForUnshieldedSyncedState,
   waitForSyncedState,
   waitForWalletTransactionSettlement,
+  WalletSyncStalledError,
 } from '../shared/midnight.js';
 import { resolveNetwork } from '../shared/network.js';
 import { resolveContractMaintenanceAuthority } from '../shared/chain.js';
@@ -206,7 +207,7 @@ async function main() {
   const network = resolveNetwork(process.argv[2]);
   setNetworkId(network);
   const config = configureNetwork(network);
-  const walletSeed = requiredWalletSeedOrMnemonic();
+  const walletSeed = requiredDeployerWalletSeedOrMnemonic();
   const privateStoragePassword = requiredEnv('MIDNIGHT_PRIVATE_STATE_PASSWORD');
 
   // Owner secret key (cold key) — never persisted, only its participant_id is
@@ -252,18 +253,20 @@ async function main() {
   // preparation command first so replay memory is released before this process.
   const walletCtx = await createWallet(walletSeed, network, config, {
     cachePolicy: 'require-last-good',
+    ignoreConfiguredMnemonic: true,
   });
 
+  let promoteWalletAfterStop = false;
   try {
     logMemory('wallet-restored');
     await waitForSyncedState(walletCtx.wallet, 0n);
+    promoteWalletAfterStop = true;
     const funding = await ensureFunding(walletCtx, config);
     const dustBalance = await ensureDust(walletCtx, config);
-    await walletCtx.saveState();
     logMemory('wallet-ready');
     const providers = await createProviders(walletCtx, config, privateStoragePassword, {
       zkConfigPath: zkConfigPathV3,
-      expectedCircuitIds: ['deposit', 'place_bet', 'settle_market_action', ...V3_DEFERRED_CIRCUITS],
+      expectedCircuitIds: ['deposit', 'place_bet', 'pay_smart_darer_subscription', 'settle_market_action', ...V3_DEFERRED_CIRCUITS],
       tokenKindsToBalance: 'all',
     });
     const compiledContract = createCompiledDareuV3Contract(ownerSecretKey);
@@ -338,7 +341,6 @@ async function main() {
         updatedAt: new Date().toISOString(),
       };
       writeJsonAtomic(bootstrapPath, bootstrapRecord);
-      await walletCtx.saveState();
       console.log(`Bootstrap contract deployed at ${contractAddress}. Recovery record: ${bootstrapPath}`);
     }
 
@@ -360,7 +362,6 @@ async function main() {
           verifierKey,
         );
         await waitForWalletTransactionSettlement(walletCtx.wallet, String(result.txId), checkpoint);
-        await walletCtx.saveState();
       }
 
       if (!bootstrapRecord.installedCircuits.includes(circuitId)) {
@@ -403,8 +404,21 @@ async function main() {
     console.log(`Deployment record: ${deploymentPath}`);
     console.log('Owner/operator secret keys were read from env; only participant_ids are recorded on disk.');
     console.log('Next: npm run market:v3:create -- preprod   (creates one demo market for the wallet-support checklist)');
+  } catch (error) {
+    promoteWalletAfterStop = false;
+    if (error instanceof WalletSyncStalledError) {
+      const recovery = await walletCtx.recoverFromSyncStall(error);
+      throw new Error(
+        `The prepared wallet snapshot is not safe to deploy from and was quarantined ` +
+          `(recovery=${recovery.recoveryMode}, attempt=${recovery.attempt}). ` +
+          `Run "npm run wallet:v3:prepare:${network}" again before retrying deployment.`,
+        { cause: error },
+      );
+    }
+    throw error;
   } finally {
     await walletCtx.wallet.stop();
+    if (promoteWalletAfterStop) await walletCtx.saveState();
   }
 }
 

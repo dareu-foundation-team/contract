@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 import { httpClientProofProvider } from '@midnight-ntwrk/midnight-js-http-client-proof-provider';
 import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
@@ -62,7 +63,7 @@ export type WalletContext = {
   /** Persist a fully synced/settled state and promote it to last-known-good. */
   saveState: () => Promise<void>;
   /** Persist partial forward progress without replacing last-known-good. */
-  saveCheckpoint: () => Promise<void>;
+  saveCheckpoint: () => Promise<boolean>;
   /** Quarantine a stalled checkpoint and prepare the next supervised recovery. */
   recoverFromSyncStall: (error: WalletSyncStalledError) => Promise<WalletSyncRecoveryResult>;
 };
@@ -76,6 +77,8 @@ export type CreateWalletOptions = {
    * for short-lived transaction processes: never silently start a cold replay.
    */
   cachePolicy?: WalletCachePolicy;
+  /** Use the supplied deployer secret even when the generic wallet mnemonic is configured. */
+  ignoreConfiguredMnemonic?: boolean;
 };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -85,7 +88,7 @@ export const zkConfigPath = path.resolve(contractRoot, 'src', 'managed', 'dareu-
 
 // On-disk cache of synced wallet state so repeated deploy/keeper runs sync
 // incrementally instead of replaying ~1M events from scratch each time.
-const walletCacheDir = path.join(contractRoot, '.wallet-cache');
+const walletLockDir = path.join(contractRoot, '.wallet-locks');
 const WALLET_CACHE_VERSION = 1;
 
 function walletCacheFingerprint(): string {
@@ -119,8 +122,15 @@ export function isWalletCacheFingerprintCompatible(fingerprint: string | undefin
 
 type WalletStateCache = {
   version: number;
+  schemaVersion?: number;
   fingerprint?: string;
   network: SupportedNetwork;
+  genesisHash?: string;
+  walletRole?: string;
+  createdAt?: string;
+  applied?: Record<'shielded' | 'dust' | 'unshielded', string>;
+  highest?: Record<'shielded' | 'dust' | 'unshielded', string>;
+  blobHashes?: Record<'shielded' | 'dust' | 'unshielded', string>;
   address: string;
   shielded: string;
   unshielded: string;
@@ -138,7 +148,24 @@ function storageNamespace(name: 'MIDNIGHT_WALLET_CACHE_NAMESPACE' | 'MIDNIGHT_PR
 
 function walletCachePath(network: SupportedNetwork): string {
   const namespace = storageNamespace('MIDNIGHT_WALLET_CACHE_NAMESPACE');
-  return path.join(walletCacheDir, `${network}${namespace ? `-${namespace}` : ''}.json`);
+  return path.join(walletCacheDirectory(), `${network}${namespace ? `-${namespace}` : ''}.json`);
+}
+
+function walletCacheDirectory(): string {
+  const configured = process.env.MIDNIGHT_WALLET_CACHE_DIR?.trim();
+  return configured ? path.resolve(configured) : path.join(contractRoot, '.wallet-cache');
+}
+
+function assertWalletCacheStorage(): void {
+  if (!walletCacheEnabled()) return;
+  const directory = walletCacheDirectory();
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.accessSync(directory, fs.constants.R_OK | fs.constants.W_OK);
+  const marker = path.join(directory, '.durable-wallet-cache');
+  if (!fs.existsSync(marker)) {
+    fs.writeFileSync(marker, 'Mount this directory on durable storage in deployed environments.\n', { mode: 0o600 });
+  }
+  console.log(`Wallet cache storage: ${directory}`);
 }
 
 function walletLastGoodCachePath(network: SupportedNetwork): string {
@@ -149,8 +176,78 @@ function walletSyncRecoveryPath(network: SupportedNetwork): string {
   return `${walletCachePath(network)}.sync-recovery.json`;
 }
 
+function walletCanaryPath(network: SupportedNetwork): string {
+  return `${walletCachePath(network)}.requires-canary.json`;
+}
+
+function fileSha256(file: string): string | undefined {
+  if (!fs.existsSync(file)) return undefined;
+  return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+export function walletRequiresCanary(network: SupportedNetwork): boolean {
+  return fs.existsSync(walletCanaryPath(network));
+}
+
+export function clearWalletCanaryRequirement(network: SupportedNetwork): void {
+  try { fs.unlinkSync(walletCanaryPath(network)); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
+
+export function chooseWalletSyncRecoveryMode(
+  activeHash: string | undefined,
+  lastGoodHash: string | undefined,
+): 'last-good' | 'cold' {
+  return lastGoodHash && lastGoodHash !== activeHash ? 'last-good' : 'cold';
+}
+
 function walletCacheEnabled(): boolean {
   return (process.env.MIDNIGHT_WALLET_CACHE?.trim() ?? '1') !== '0';
+}
+
+function acquireWalletAddressLock(address: string): () => void {
+  fs.mkdirSync(walletLockDir, { recursive: true });
+  const lockFile = path.join(walletLockDir, `${createHash('sha256').update(address).digest('hex')}.lock`);
+  const record = () => JSON.stringify({
+    pid: process.pid,
+    address,
+    role: storageNamespace('MIDNIGHT_WALLET_CACHE_NAMESPACE') ?? 'deployer',
+    startedAt: new Date().toISOString(),
+  });
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockFile, 'wx', 0o600);
+      fs.writeFileSync(fd, record());
+      fs.closeSync(fd);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      let ownerPid = 0;
+      try {
+        ownerPid = Number((JSON.parse(fs.readFileSync(lockFile, 'utf8')) as { pid?: number }).pid ?? 0);
+      } catch { /* malformed locks are treated as stale */ }
+      try {
+        if (ownerPid > 0) process.kill(ownerPid, 0);
+      } catch {
+        try { fs.unlinkSync(lockFile); } catch { /* another process won recovery */ }
+        continue;
+      }
+      throw new Error(
+        `Wallet address ${address} is already owned by live process ${ownerPid}. ` +
+          'Two processes may not submit transactions with the same Midnight wallet.',
+      );
+    }
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    try {
+      const owner = JSON.parse(fs.readFileSync(lockFile, 'utf8')) as { pid?: number };
+      if (owner.pid === process.pid) fs.unlinkSync(lockFile);
+    } catch { /* already removed */ }
+  };
 }
 
 /** Keep the checkpoint that existed before a supervised warm-up starts. */
@@ -174,33 +271,52 @@ export function preserveWalletCheckpoint(
 }
 
 /** Load a valid, matching cache for this network+address, or undefined. */
-function readWalletStateCache(file: string, network: SupportedNetwork, address: string): WalletStateCache | undefined {
+function readWalletStateCache(
+  file: string,
+  network: SupportedNetwork,
+  address: string,
+  genesisHash: string,
+): WalletStateCache | undefined {
   if (!fs.existsSync(file)) return undefined;
   const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as WalletStateCache;
   if (parsed.version !== WALLET_CACHE_VERSION || parsed.network !== network || parsed.address !== address) {
     return undefined;
   }
+  if (parsed.genesisHash && parsed.genesisHash !== genesisHash) return undefined;
   // Never restore an unversioned/foreign SDK snapshot. A clean replay is slower,
   // but it is the only safe recovery when tree state and appliedIndex disagree.
   if (!isWalletCacheFingerprintCompatible(parsed.fingerprint)) return undefined;
   if (!parsed.shielded || !parsed.unshielded || !parsed.dust) return undefined;
+  if (parsed.schemaVersion && parsed.schemaVersion >= 3) {
+    if (parsed.genesisHash !== genesisHash) return undefined;
+    if (parsed.walletRole !== (storageNamespace('MIDNIGHT_WALLET_CACHE_NAMESPACE') ?? 'deployer')) return undefined;
+    const expected = parsed.blobHashes;
+    if (!expected) return undefined;
+    const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+    if (
+      digest(parsed.shielded) !== expected.shielded ||
+      digest(parsed.unshielded) !== expected.unshielded ||
+      digest(parsed.dust) !== expected.dust
+    ) return undefined;
+  }
   return parsed;
 }
 
 function loadWalletStateCache(
   network: SupportedNetwork,
   address: string,
+  genesisHash: string,
   policy: WalletCachePolicy,
 ): { cache: WalletStateCache; source: 'checkpoint' | 'last-good' } | undefined {
   if (!walletCacheEnabled()) return undefined;
   try {
     if (policy === 'require-last-good') {
-      const cache = readWalletStateCache(walletLastGoodCachePath(network), network, address);
+      const cache = readWalletStateCache(walletLastGoodCachePath(network), network, address, genesisHash);
       return cache ? { cache, source: 'last-good' } : undefined;
     }
-    const checkpoint = readWalletStateCache(walletCachePath(network), network, address);
+    const checkpoint = readWalletStateCache(walletCachePath(network), network, address, genesisHash);
     if (checkpoint) return { cache: checkpoint, source: 'checkpoint' };
-    const lastGood = readWalletStateCache(walletLastGoodCachePath(network), network, address);
+    const lastGood = readWalletStateCache(walletLastGoodCachePath(network), network, address, genesisHash);
     return lastGood ? { cache: lastGood, source: 'last-good' } : undefined;
   } catch {
     return undefined;
@@ -210,6 +326,8 @@ function loadWalletStateCache(
 type WalletSyncRecoveryRecord = {
   dustAppliedIndex: number;
   attempts: number;
+  checkpointHash?: string;
+  recoveryMode?: 'last-good' | 'cold';
   updatedAt: string;
 };
 
@@ -217,17 +335,31 @@ export type WalletSyncRecoveryResult = {
   attempt: number;
   exhausted: boolean;
   quarantinedPath?: string;
+  quarantinedLastGoodPath?: string;
   restoredLastKnownGood: boolean;
+  recoveryMode: 'last-good' | 'cold';
 };
 
 export function nextWalletSyncRecoveryAttempt(
   previous: WalletSyncRecoveryRecord | undefined,
   dustAppliedIndex: number,
   updatedAt = new Date().toISOString(),
+  checkpointHash?: string,
+  recoveryMode?: 'last-good' | 'cold',
 ): WalletSyncRecoveryRecord {
+  // The applied index remains the safety breaker. The checkpoint hash explains
+  // whether a retry reused the same bytes, but must not reset the breaker after
+  // a cold replay reaches the same poisoned Indexer position.
+  // Legacy recovery markers did not identify the checkpoint. Reset them once so
+  // the new cold-replay path gets a chance instead of immediately inheriting an
+  // already-exhausted counter from the old restore loop.
+  const sameFailure = previous?.checkpointHash !== undefined &&
+    previous.dustAppliedIndex === dustAppliedIndex;
   return {
     dustAppliedIndex,
-    attempts: previous?.dustAppliedIndex === dustAppliedIndex ? previous.attempts + 1 : 1,
+    attempts: sameFailure ? previous!.attempts + 1 : 1,
+    checkpointHash,
+    recoveryMode,
     updatedAt,
   };
 }
@@ -317,6 +449,7 @@ export class WalletSyncStalledError extends Error {
     readonly dustAppliedIndex: number,
     readonly stalledStreams: string[],
     readonly progress: string,
+    readonly disconnectedStreams: string[] = [],
   ) {
     super(
       `Midnight wallet sync made no applied-index progress for ${stallTimeoutMs}ms ` +
@@ -336,6 +469,46 @@ export class WalletSyncRecoveryExhaustedError extends Error {
     );
     this.name = 'WalletSyncRecoveryExhaustedError';
   }
+}
+
+export class WalletReplayMemoryLimitError extends Error {
+  readonly code = 'WALLET_REPLAY_MEMORY_LIMIT';
+
+  constructor(readonly heapUsedMb: number, readonly limitMb: number) {
+    super(
+      `Wallet replay reached the ${limitMb}MB heap segment limit ` +
+        `(heapUsed=${heapUsedMb}MB); checkpointing before a fresh-process resume.`,
+    );
+    this.name = 'WalletReplayMemoryLimitError';
+  }
+}
+
+export class WalletReplaySegmentBoundaryError extends Error {
+  readonly code = 'WALLET_REPLAY_SEGMENT_BOUNDARY';
+
+  constructor(
+    readonly reason: 'cursor' | 'elapsed',
+    readonly dustAppliedIndex: number,
+    readonly detail: string,
+  ) {
+    super(
+      `Wallet replay reached a safe ${reason} segment boundary at DUST applied=${dustAppliedIndex} ` +
+        `(${detail}); checkpointing before a fresh-process resume.`,
+    );
+    this.name = 'WalletReplaySegmentBoundaryError';
+  }
+}
+
+export function isWalletReplayMemoryLimit(error: unknown): error is WalletReplayMemoryLimitError {
+  return error instanceof WalletReplayMemoryLimitError ||
+    (error instanceof Error && (error as Error & { code?: string }).code === 'WALLET_REPLAY_MEMORY_LIMIT');
+}
+
+export function isWalletReplaySegmentBoundary(
+  error: unknown,
+): error is WalletReplayMemoryLimitError | WalletReplaySegmentBoundaryError {
+  return isWalletReplayMemoryLimit(error) || error instanceof WalletReplaySegmentBoundaryError ||
+    (error instanceof Error && (error as Error & { code?: string }).code === 'WALLET_REPLAY_SEGMENT_BOUNDARY');
 }
 
 export function isWalletSyncRecoveryExhausted(error: unknown): error is WalletSyncRecoveryExhaustedError {
@@ -396,6 +569,16 @@ export type WalletAppliedProgress = {
   unshielded: bigint;
 };
 
+type WalletHighestProgress = WalletAppliedProgress;
+
+function walletHighestProgress(state: WalletSyncedState): WalletHighestProgress {
+  return {
+    shielded: bigintProgressValue(state.shielded.state.progress, 'highestRelevantWalletIndex'),
+    dust: bigintProgressValue(state.dust.state.progress, 'highestRelevantWalletIndex'),
+    unshielded: bigintProgressValue(state.unshielded.progress, 'highestTransactionId'),
+  };
+}
+
 function bigintProgressValue(progress: unknown, key: string): bigint {
   const value = (progress as Record<string, unknown> | undefined)?.[key];
   if (typeof value === 'bigint') return value;
@@ -416,6 +599,17 @@ export function hasWalletAppliedProgress(previous: WalletAppliedProgress, next: 
   return next.shielded > previous.shielded || next.dust > previous.dust || next.unshielded > previous.unshielded;
 }
 
+export function walletReplaySegmentStream(
+  baseline: WalletAppliedProgress,
+  next: WalletAppliedProgress,
+  threshold: bigint,
+): 'dust' | undefined {
+  // DUST is the slow replay bottleneck and MIDNIGHT_WALLET_CHECKPOINT_EVERY is
+  // explicitly its checkpoint cadence. Shielded/unshielded can jump quickly;
+  // elapsed-time and heap boundaries still protect those streams.
+  return next.dust - baseline.dust >= threshold ? 'dust' : undefined;
+}
+
 export function isWalletStateSyncedWithin(
   state: WalletSyncedState,
   allowedGap = syncAllowedGap(),
@@ -430,6 +624,24 @@ export function isWalletStateSyncedWithin(
 export function configureNetwork(network: SupportedNetwork): NetworkConfig {
   setNetworkId(network);
   return resolveNetworkConfig(network);
+}
+
+async function queryGenesisHash(config: NetworkConfig): Promise<string> {
+  const response = await withTimeout(
+    fetch(config.node, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'chain_getBlockHash', params: [0] }),
+    }),
+    timeoutMs('MIDNIGHT_RPC_PREFLIGHT_TIMEOUT_MS', 15_000),
+    `Timed out while reading the genesis hash from ${config.node}.`,
+  );
+  if (!response.ok) throw new Error(`Genesis hash RPC failed with HTTP ${response.status}.`);
+  const payload = await response.json() as { result?: unknown; error?: unknown };
+  if (typeof payload.result !== 'string' || !payload.result) {
+    throw new Error(`Genesis hash RPC returned an invalid response: ${JSON.stringify(payload.error ?? payload)}`);
+  }
+  return payload.result;
 }
 
 /**
@@ -504,11 +716,13 @@ const SEED_HEX_RE = /^[0-9a-fA-F]+$/;
  * otherwise it is treated as raw hex. `MIDNIGHT_WALLET_MNEMONIC` (if set) forces
  * the mnemonic path and takes precedence over a hex `MIDNIGHT_WALLET_SEED`.
  */
-export function resolveWalletSeedHex(rawSeedOrMnemonic: string): string {
+export function resolveWalletSeedHex(rawSeedOrMnemonic: string, ignoreConfiguredMnemonic = false): string {
   // Strip surrounding whitespace and any quote characters — including the curly/
   // smart quotes (“ ” ‘ ’) that copy-paste often introduces — from both ends.
   const dequote = (s: string) => s.replace(/^[\s"'“”‘’]+|[\s"'“”‘’]+$/g, '');
-  const explicitMnemonic = dequote(process.env.MIDNIGHT_WALLET_MNEMONIC ?? '');
+  const explicitMnemonic = ignoreConfiguredMnemonic
+    ? ''
+    : dequote(process.env.MIDNIGHT_WALLET_MNEMONIC ?? '');
   const candidate = explicitMnemonic || dequote(rawSeedOrMnemonic);
   const looksLikeMnemonic = /\s/.test(candidate);
 
@@ -539,8 +753,8 @@ export function resolveWalletSeedHex(rawSeedOrMnemonic: string): string {
  * single clear error if neither is set, so callers don't need to require both.
  */
 export function requiredWalletSeedOrMnemonic(): string {
-  const mnemonic = process.env.MIDNIGHT_WALLET_MNEMONIC?.trim();
-  const seed = process.env.MIDNIGHT_WALLET_SEED?.trim();
+  const mnemonic = secretValue('MIDNIGHT_WALLET_MNEMONIC');
+  const seed = secretValue('MIDNIGHT_WALLET_SEED');
   const value = mnemonic || seed;
   if (!value) {
     throw new Error(
@@ -551,8 +765,53 @@ export function requiredWalletSeedOrMnemonic(): string {
   return value;
 }
 
-export function deriveKeys(seedOrMnemonic: string) {
-  const seedHex = resolveWalletSeedHex(seedOrMnemonic);
+/**
+ * Deployment uses a dedicated wallet identity so admin transactions can never
+ * race a category keeper for the same DUST coins. Do not fall back to the
+ * generic wallet secret: a missing deployer secret must fail closed.
+ */
+export function requiredDeployerWalletSeedOrMnemonic(): string {
+  const value = secretValue('MIDNIGHT_DEPLOYER_WALLET_MNEMONIC')
+    || secretValue('MIDNIGHT_DEPLOYER_WALLET_SEED');
+  if (!value) {
+    throw new Error(
+      'Set MIDNIGHT_DEPLOYER_WALLET_MNEMONIC (a BIP39 recovery phrase) or ' +
+        'MIDNIGHT_DEPLOYER_WALLET_SEED (a hex HD seed) in contract/.env.local.',
+    );
+  }
+  return value;
+}
+
+/** Manual/demo market commands use a disposable wallet, never the deployer. */
+export function requiredTestWalletSeedOrMnemonic(): string {
+  const value = secretValue('MIDNIGHT_TEST_WALLET_MNEMONIC')
+    || secretValue('MIDNIGHT_TEST_WALLET_SEED');
+  if (!value) {
+    throw new Error(
+      'Set MIDNIGHT_TEST_WALLET_MNEMONIC (a BIP39 recovery phrase) or ' +
+        'MIDNIGHT_TEST_WALLET_SEED (a hex HD seed) before running a manual market command.',
+    );
+  }
+  return value;
+}
+
+function secretValue(name: string): string | undefined {
+  const direct = process.env[name]?.trim();
+  if (direct) return direct;
+  const file = process.env[`${name}_FILE`]?.trim();
+  if (!file) return undefined;
+  const resolved = path.isAbsolute(file) ? file : path.resolve(contractRoot, file);
+  const stat = fs.statSync(resolved);
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error(`${name}_FILE must not be group/world accessible: ${resolved}`);
+  }
+  const value = fs.readFileSync(resolved, 'utf8').trim();
+  if (!value) throw new Error(`${name}_FILE is empty: ${resolved}`);
+  return value;
+}
+
+export function deriveKeys(seedOrMnemonic: string, ignoreConfiguredMnemonic = false) {
+  const seedHex = resolveWalletSeedHex(seedOrMnemonic, ignoreConfiguredMnemonic);
   const hdWallet = HDWallet.fromSeed(Buffer.from(seedHex, 'hex'));
 
   if (hdWallet.type !== 'seedOk') {
@@ -580,12 +839,14 @@ export async function createWallet(
   options: CreateWalletOptions = {},
 ): Promise<WalletContext> {
   globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket;
+  assertWalletCacheStorage();
   await assertNodeRpcResponsive(config);
+  const genesisHash = await queryGenesisHash(config);
   // NOTE: ledger-v8 8.1.0 parses & replays the v9 `DustGenerationDtimeUpdate` events
   // natively, so the old replay-filter workaround (removed) is no longer needed. If
   // DUST replay errors ever return, recover the patch from git history.
 
-  const keys = deriveKeys(seedHex);
+  const keys = deriveKeys(seedHex, options.ignoreConfiguredMnemonic);
   const shieldedSecretKeys = ledger.ZswapSecretKeys.fromSeed(keys[Roles.Zswap]);
   const dustSecretKey = ledger.DustSecretKey.fromSeed(keys[Roles.Dust]);
   const unshieldedKeystore = createKeystore(keys[Roles.NightExternal], network);
@@ -621,7 +882,7 @@ export async function createWallet(
   // start fresh. Any restore failure (stale/incompatible cache) falls back to fresh.
   const address = String(unshieldedKeystore.getBech32Address());
   const cachePolicy = options.cachePolicy ?? 'prefer-checkpoint';
-  const cachedState = loadWalletStateCache(network, address, cachePolicy);
+  const cachedState = loadWalletStateCache(network, address, genesisHash, cachePolicy);
   if (cachePolicy === 'require-last-good' && !cachedState) {
     throw new Error(
       `No valid fully-synced wallet snapshot exists at ${walletLastGoodCachePath(network)}. ` +
@@ -643,7 +904,11 @@ export async function createWallet(
         dust: dustClass.restore(cache.dust),
       };
       console.log(
-        `Restored wallet state from ${cachedState.source}; syncing incrementally from the cached point.`,
+        `Restored wallet state from ${cachedState.source}; syncing incrementally from the cached point` +
+          `${cache.applied ? ` (applied shielded=${cache.applied.shielded} dust=${cache.applied.dust} unshielded=${cache.applied.unshielded})` : ''}` +
+          `${fileSha256(cachedState.source === 'checkpoint' ? walletCachePath(network) : walletLastGoodCachePath(network))
+            ? ` checkpointHash=${fileSha256(cachedState.source === 'checkpoint' ? walletCachePath(network) : walletLastGoodCachePath(network))}`
+            : ''}.`,
       );
     } catch (error) {
       if (cachePolicy === 'require-last-good') {
@@ -662,7 +927,10 @@ export async function createWallet(
   }
   const { shielded: shieldedWallet, unshielded: unshieldedWallet, dust: dustWallet } = wallets;
 
-  const wallet = await WalletFacade.init({
+  const releaseAddressLock = acquireWalletAddressLock(address);
+  let wallet: WalletFacade;
+  try {
+    wallet = await WalletFacade.init({
     configuration: {
       networkId: network,
       indexerClientConnection,
@@ -674,7 +942,21 @@ export async function createWallet(
     shielded: () => shieldedWallet,
     unshielded: () => unshieldedWallet,
     dust: () => dustWallet,
-  });
+    });
+  } catch (error) {
+    releaseAddressLock();
+    throw error;
+  }
+  let cacheProgressSubscription: Rx.Subscription | undefined;
+  const originalStop = wallet.stop.bind(wallet);
+  wallet.stop = async () => {
+    try {
+      return await originalStop();
+    } finally {
+      cacheProgressSubscription?.unsubscribe();
+      releaseAddressLock();
+    }
+  };
 
   console.log('Starting Midnight wallet services...');
   try {
@@ -709,37 +991,74 @@ export async function createWallet(
   // post-transaction-settled state is also promoted to `.last-good`, so a failed
   // replay can be quarantined without losing the last state known to be safe.
   let observedApplied: number | undefined;
-  let lastSavedApplied: number | undefined;
+  let observedProgress: WalletAppliedProgress | undefined;
+  let observedHighest: WalletHighestProgress | undefined;
+  let lastSavedProgress: WalletAppliedProgress | undefined;
   let saveInFlight: Promise<boolean> | undefined;
 
   const writeJsonAtomic = (file: string, data: WalletStateCache) => {
     const tmp = `${file}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data));
-    fs.renameSync(tmp, file);
+    const lock = `${file}.write.lock`;
+    const fd = fs.openSync(lock, 'wx', 0o600);
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 });
+      if (!readWalletStateCache(tmp, network, address, genesisHash)) {
+        throw new Error(`Wallet checkpoint verification failed for ${tmp}.`);
+      }
+      fs.renameSync(tmp, file);
+    } finally {
+      fs.closeSync(fd);
+      try { fs.unlinkSync(lock); } catch { /* cleanup on best effort */ }
+      try { fs.unlinkSync(tmp); } catch { /* renamed or cleanup on best effort */ }
+    }
   };
 
   const performCacheWrite = async (promoteLastKnownGood: boolean, requireProgress: boolean): Promise<boolean> => {
     if (!walletCacheEnabled()) return false;
-    if (requireProgress && (observedApplied === undefined || observedApplied <= (lastSavedApplied ?? observedApplied))) {
+    if (
+      requireProgress &&
+      (!observedProgress || !lastSavedProgress || !hasWalletAppliedProgress(lastSavedProgress, observedProgress))
+    ) {
       return false;
     }
     try {
+      const shielded = await wallet.shielded.serializeState();
+      const unshielded = await wallet.unshielded.serializeState();
+      const dust = await wallet.dust.serializeState();
+      // Verify that all three opaque SDK blobs are actually deserializable before
+      // any file is promoted. Hash/read-back checks alone cannot detect a
+      // structurally invalid wallet state.
+      shieldedClass.restore(shielded);
+      unshieldedClass.restore(unshielded);
+      dustClass.restore(dust);
+      const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+      const stringifyProgress = (progress: WalletAppliedProgress | WalletHighestProgress | undefined) =>
+        progress
+          ? Object.fromEntries(Object.entries(progress).map(([key, value]) => [key, value.toString()])) as Record<'shielded' | 'dust' | 'unshielded', string>
+          : undefined;
       const data: WalletStateCache = {
         version: WALLET_CACHE_VERSION,
+        schemaVersion: 3,
         fingerprint: WALLET_CACHE_FINGERPRINT,
         network,
+        genesisHash,
+        walletRole: storageNamespace('MIDNIGHT_WALLET_CACHE_NAMESPACE') ?? 'deployer',
+        createdAt: new Date().toISOString(),
         address,
-        shielded: await wallet.shielded.serializeState(),
-        unshielded: await wallet.unshielded.serializeState(),
-        dust: await wallet.dust.serializeState(),
+        applied: stringifyProgress(observedProgress),
+        highest: stringifyProgress(observedHighest),
+        blobHashes: { shielded: digest(shielded), unshielded: digest(unshielded), dust: digest(dust) },
+        shielded,
+        unshielded,
+        dust,
       };
-      fs.mkdirSync(walletCacheDir, { recursive: true });
+      fs.mkdirSync(walletCacheDirectory(), { recursive: true });
       writeJsonAtomic(walletCachePath(network), data);
       if (promoteLastKnownGood) {
         writeJsonAtomic(walletLastGoodCachePath(network), data);
         try { fs.unlinkSync(walletSyncRecoveryPath(network)); } catch { /* no recovery marker */ }
       }
-      lastSavedApplied = observedApplied;
+      lastSavedProgress = observedProgress ? { ...observedProgress } : undefined;
       return true;
     } catch (error) {
       console.warn(`Could not cache wallet state: ${error instanceof Error ? error.message : String(error)}`);
@@ -759,20 +1078,23 @@ export async function createWallet(
   };
 
   const saveState = async () => {
-    if (await writeCache(true)) {
-      console.log(`Wallet sync state cached and promoted to last-known-good: ${walletCachePath(network)}`);
+    if (!await writeCache(true)) {
+      throw new Error('Could not persist and verify the fully-synced wallet last-known-good snapshot.');
     }
+    console.log(`Wallet sync state cached and promoted to last-known-good: ${walletCachePath(network)}`);
   };
 
   const saveCheckpoint = async () => {
-    if (await writeCache(false, true)) {
+    const saved = await writeCache(false, true);
+    if (saved) {
       console.log(`Wallet sync checkpoint cached at applied=${observedApplied ?? 0}.`);
     }
+    return saved;
   };
 
   const recoverFromSyncStall = async (error: WalletSyncStalledError): Promise<WalletSyncRecoveryResult> => {
     if (saveInFlight) await saveInFlight;
-    fs.mkdirSync(walletCacheDir, { recursive: true });
+    fs.mkdirSync(walletCacheDirectory(), { recursive: true });
     const recoveryFile = walletSyncRecoveryPath(network);
     let previous: WalletSyncRecoveryRecord | undefined;
     try {
@@ -780,20 +1102,44 @@ export async function createWallet(
     } catch {
       previous = undefined;
     }
-    const recovery = nextWalletSyncRecoveryAttempt(previous, error.dustAppliedIndex);
+    const activeFile = walletCachePath(network);
+    const lastGoodFile = walletLastGoodCachePath(network);
+    const activeHash = fileSha256(activeFile);
+    const lastGoodHash = fileSha256(lastGoodFile);
+    // Restoring an identical snapshot repeats the same incompatible commitment
+    // tree forever. Quarantine both copies and force a clean replay instead.
+    const recoveryMode = chooseWalletSyncRecoveryMode(activeHash, lastGoodHash);
+    const recovery = nextWalletSyncRecoveryAttempt(
+      previous,
+      error.dustAppliedIndex,
+      new Date().toISOString(),
+      activeHash,
+      recoveryMode,
+    );
     fs.writeFileSync(recoveryFile, JSON.stringify(recovery, null, 2));
 
-    const activeFile = walletCachePath(network);
     let quarantinedPath: string | undefined;
+    const suffix = recovery.updatedAt.replace(/[^0-9]/g, '').slice(0, 14);
     if (fs.existsSync(activeFile)) {
-      const suffix = recovery.updatedAt.replace(/[^0-9]/g, '').slice(0, 14);
       quarantinedPath = `${activeFile}.quarantine-${suffix}-attempt-${recovery.attempts}`;
       fs.renameSync(activeFile, quarantinedPath);
     }
 
-    const lastGoodFile = walletLastGoodCachePath(network);
-    const restoredLastKnownGood = fs.existsSync(lastGoodFile);
+    let quarantinedLastGoodPath: string | undefined;
+    const restoredLastKnownGood = recoveryMode === 'last-good' && fs.existsSync(lastGoodFile);
     if (restoredLastKnownGood) fs.copyFileSync(lastGoodFile, activeFile);
+    if (recoveryMode === 'cold' && fs.existsSync(lastGoodFile)) {
+      quarantinedLastGoodPath = `${lastGoodFile}.quarantine-${suffix}-attempt-${recovery.attempts}`;
+      fs.renameSync(lastGoodFile, quarantinedLastGoodPath);
+    }
+    if (recoveryMode === 'cold') {
+      fs.writeFileSync(walletCanaryPath(network), JSON.stringify({
+        reason: 'wallet-sync-cold-recovery',
+        dustAppliedIndex: error.dustAppliedIndex,
+        checkpointHash: activeHash,
+        createdAt: recovery.updatedAt,
+      }, null, 2));
+    }
 
     const maxAttempts = Math.max(
       1,
@@ -803,40 +1149,22 @@ export async function createWallet(
       attempt: recovery.attempts,
       exhausted: recovery.attempts >= maxAttempts,
       quarantinedPath,
+      quarantinedLastGoodPath,
       restoredLastKnownGood,
+      recoveryMode,
     };
   };
 
-  // Progress-driven checkpoint DURING the (long, first-time) sync: every time the
-  // applied index advances by MIDNIGHT_WALLET_CHECKPOINT_EVERY events (default
-  // 200k) we persist, so an interruption — dropped websocket, timeout, Ctrl-C —
-  // resumes from the last checkpoint instead of restarting from zero.
-  const checkpointEvery = Number(process.env.MIDNIGHT_WALLET_CHECKPOINT_EVERY ?? 200_000);
-  if (walletCacheEnabled() && Number.isFinite(checkpointEvery) && checkpointEvery > 0) {
-    let lastCheckpointAt: number | undefined;
-    let pending = false;
-    wallet
-      .state()
-      .pipe(Rx.auditTime(2_000))
-      .subscribe((state) => {
-        const applied = dustAppliedIndex(state);
-        observedApplied = applied;
-        if (lastCheckpointAt === undefined) {
-          // Establish the restored/fresh baseline without rewriting an unchanged
-          // cache as if it were new progress.
-          lastCheckpointAt = applied;
-          lastSavedApplied = applied;
-          return;
-        }
-        if (pending || applied - lastCheckpointAt < checkpointEvery) return;
-        pending = true;
-        lastCheckpointAt = applied;
-        void writeCache(false, true).then((ok) => {
-          pending = false;
-          if (ok) console.log(`Sync checkpoint saved at applied=${applied}; a failed run resumes from here.`);
-        });
-      });
-  }
+  // Observe progress in every process, including replay children. Serialization
+  // stays separate and is only requested by callers after wallet.stop(), because
+  // wallet-sdk 4.x can produce an incoherent tree/cursor snapshot while live.
+  cacheProgressSubscription = wallet.state().subscribe((state) => {
+    const applied = dustAppliedIndex(state);
+    observedApplied = applied;
+    observedProgress = walletAppliedProgress(state);
+    observedHighest = walletHighestProgress(state);
+    if (lastSavedProgress === undefined) lastSavedProgress = { ...observedProgress };
+  });
 
   return {
     wallet,
@@ -858,6 +1186,63 @@ function dustAppliedIndex(state: Awaited<ReturnType<typeof currentWalletState>>)
 
 export async function currentWalletState(wallet: WalletFacade) {
   return Rx.firstValueFrom(wallet.state());
+}
+
+export async function walletHealthSnapshot(wallet: WalletFacade, network: SupportedNetwork) {
+  const state = await currentWalletState(wallet);
+  const applied = walletAppliedProgress(state);
+  const highest = walletHighestProgress(state);
+  const connected = {
+    shielded: Boolean(state.shielded.state.progress.isConnected),
+    dust: Boolean(state.dust.state.progress.isConnected),
+    unshielded: Boolean(state.unshielded.progress.isConnected),
+  };
+  return {
+    event: 'wallet_health',
+    timestamp: new Date().toISOString(),
+    network,
+    role: storageNamespace('MIDNIGHT_WALLET_CACHE_NAMESPACE') ?? 'deployer',
+    connected,
+    applied: Object.fromEntries(Object.entries(applied).map(([key, value]) => [key, value.toString()])),
+    highest: Object.fromEntries(Object.entries(highest).map(([key, value]) => [key, value.toString()])),
+    pendingTransactions: state.pending.all.length,
+    dustPendingCoins: state.dust.pendingCoins.length,
+    dustAvailableCoins: state.dust.availableCoins.length,
+    checkpointHash: fileSha256(walletCachePath(network)) ?? null,
+    healthy: Object.values(connected).every(Boolean) && state.pending.all.length === 0,
+  };
+}
+
+export function startWalletHealthMetrics(wallet: WalletFacade, network: SupportedNetwork): () => void {
+  const intervalMs = timeoutMs('KEEPER_WALLET_HEALTH_INTERVAL_MS', 60_000);
+  const emit = async () => {
+    try {
+      const snapshot = await walletHealthSnapshot(wallet, network);
+      const line = JSON.stringify(snapshot);
+      if (snapshot.healthy) console.log(line);
+      else {
+        console.error(line);
+        const webhook = process.env.KEEPER_WALLET_ALERT_WEBHOOK_URL?.trim();
+        if (webhook) {
+          void fetch(webhook, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: line,
+          }).catch((error) => console.error(`[wallet-alert] delivery failed: ${errorMessage(error)}`));
+        }
+      }
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: 'wallet_health_error',
+        timestamp: new Date().toISOString(),
+        network,
+        error: errorMessage(error),
+      }));
+    }
+  };
+  void emit();
+  const timer = setInterval(() => void emit(), intervalMs);
+  return () => clearInterval(timer);
 }
 
 export type WalletTransactionCheckpoint = {
@@ -1105,13 +1490,25 @@ export async function waitForSyncedState(wallet: WalletFacade, allowedGap = sync
     dust: watchStartedAt,
     unshielded: watchStartedAt,
   };
+  const disconnectedSince: Partial<Record<'shielded' | 'dust' | 'unshielded', number>> = {};
   let rejectStall: ((error: WalletSyncStalledError) => void) | undefined;
   const stallPromise = new Promise<never>((_resolve, reject) => {
     rejectStall = reject;
   });
+  const replayHeapLimitMb = Number(process.env.MIDNIGHT_WALLET_REPLAY_MAX_HEAP_MB ?? '0');
+  const segmentedReplay = process.env.DAREU_WALLET_SEGMENTED_REPLAY === '1';
+  const replayCursorSegment = Number(process.env.MIDNIGHT_WALLET_CHECKPOINT_EVERY ?? '0');
+  const replaySegmentMs = Number(process.env.MIDNIGHT_WALLET_REPLAY_SEGMENT_MS ?? 30 * 60 * 1000);
+  let segmentBaseline: WalletAppliedProgress | undefined;
+  let rejectMemoryLimit: ((error: WalletReplayMemoryLimitError | WalletReplaySegmentBoundaryError) => void) | undefined;
+  let memoryLimitTriggered = false;
+  const memoryLimitPromise = new Promise<never>((_resolve, reject) => {
+    rejectMemoryLimit = reject;
+  });
   const appliedProgressSubscription = wallet.state().subscribe({
     next: (state) => {
       const next = walletAppliedProgress(state);
+      const nextHighest = walletHighestProgress(state);
       latestWalletState = state;
       latestStateText = formatSyncProgress(state);
       const now = Date.now();
@@ -1125,6 +1522,38 @@ export async function waitForSyncedState(wallet: WalletFacade, allowedGap = sync
         lastAppliedProgressAt.unshielded = now;
       }
       latestProgress = next;
+      segmentBaseline ??= next;
+      const connectivity = {
+        shielded: Boolean(state.shielded.state.progress.isConnected),
+        dust: Boolean(state.dust.state.progress.isConnected),
+        unshielded: Boolean(state.unshielded.progress.isConnected),
+      };
+      for (const stream of ['shielded', 'dust', 'unshielded'] as const) {
+        if (connectivity[stream]) delete disconnectedSince[stream];
+        else disconnectedSince[stream] ??= now;
+      }
+      if (!memoryLimitTriggered && Number.isFinite(replayHeapLimitMb) && replayHeapLimitMb > 0) {
+        const heapUsedMb = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+        if (!isWalletStateSyncedWithin(state, allowedGap) && heapUsedMb >= replayHeapLimitMb) {
+          memoryLimitTriggered = true;
+          rejectMemoryLimit?.(new WalletReplayMemoryLimitError(heapUsedMb, replayHeapLimitMb));
+        }
+      }
+      if (
+        !memoryLimitTriggered && segmentedReplay && segmentBaseline &&
+        Number.isFinite(replayCursorSegment) && replayCursorSegment > 0
+      ) {
+        const threshold = BigInt(Math.floor(replayCursorSegment));
+        const advanced = walletReplaySegmentStream(segmentBaseline, next, threshold);
+        if (advanced && !isWalletStateSyncedWithin(state, allowedGap)) {
+          memoryLimitTriggered = true;
+          rejectMemoryLimit?.(new WalletReplaySegmentBoundaryError(
+            'cursor',
+            Number(next.dust),
+            `${advanced} advanced by at least ${threshold.toString()}`,
+          ));
+        }
+      }
     },
   });
   const stallCheckEveryMs = Math.max(1_000, Math.min(30_000, Math.floor(stallTimeoutMs / 4)));
@@ -1135,18 +1564,29 @@ export async function waitForSyncedState(wallet: WalletFacade, allowedGap = sync
       if (now - watchStartedAt < stallTimeoutMs) return;
       stalledStreams.push('all (no wallet state emitted)');
     } else {
+      // Wallet streams commonly emit a disconnected bootstrap state while their
+      // websocket subscription is being established. Give transport recovery the
+      // same grace as an applied-index stall; never treat a 15-second startup
+      // transition as evidence that a checkpoint tree is corrupt.
+      const disconnectGraceMs = timeoutMs('MIDNIGHT_WALLET_DISCONNECT_GRACE_MS', stallTimeoutMs);
+      for (const stream of ['shielded', 'dust', 'unshielded'] as const) {
+        const since = disconnectedSince[stream];
+        if (since !== undefined && now - since >= disconnectGraceMs) {
+          stalledStreams.push(stream);
+        }
+      }
       if (
         !latestWalletState.shielded.state.progress.isCompleteWithin(allowedGap) &&
         now - lastAppliedProgressAt.shielded >= stallTimeoutMs
-      ) stalledStreams.push('shielded');
+      && !stalledStreams.includes('shielded')) stalledStreams.push('shielded');
       if (
         !latestWalletState.dust.state.progress.isCompleteWithin(allowedGap) &&
         now - lastAppliedProgressAt.dust >= stallTimeoutMs
-      ) stalledStreams.push('dust');
+      && !stalledStreams.includes('dust')) stalledStreams.push('dust');
       if (
         !latestWalletState.unshielded.progress.isCompleteWithin(allowedGap) &&
         now - lastAppliedProgressAt.unshielded >= stallTimeoutMs
-      ) stalledStreams.push('unshielded');
+      && !stalledStreams.includes('unshielded')) stalledStreams.push('unshielded');
     }
     if (stalledStreams.length === 0) return;
     rejectStall?.(
@@ -1155,13 +1595,28 @@ export async function waitForSyncedState(wallet: WalletFacade, allowedGap = sync
         Number(latestProgress?.dust ?? 0n),
         stalledStreams,
         `Stalled stream(s): ${stalledStreams.join(', ')}. ${latestStateText}`,
+        stalledStreams.filter((stream) => disconnectedSince[stream as 'shielded' | 'dust' | 'unshielded'] !== undefined),
       ),
     );
   }, stallCheckEveryMs);
+  const segmentTimer = segmentedReplay && Number.isFinite(replaySegmentMs) && replaySegmentMs > 0
+    ? setTimeout(() => {
+        if (
+          !memoryLimitTriggered && latestProgress && segmentBaseline &&
+          hasWalletAppliedProgress(segmentBaseline, latestProgress)
+        ) {
+          memoryLimitTriggered = true;
+          rejectMemoryLimit?.(new WalletReplaySegmentBoundaryError(
+            'elapsed',
+            Number(latestProgress.dust),
+            `${Math.floor(replaySegmentMs)}ms elapsed with forward progress`,
+          ));
+        }
+      }, replaySegmentMs)
+    : undefined;
 
   try {
-    const [shielded, unshielded, dust, pending] = await withTimeout(
-      Promise.race([
+    const [shielded, unshielded, dust, pending] = await Promise.race([
         Promise.all([
           wallet.shielded.waitForSyncedState(allowedGap),
           wallet.unshielded.waitForSyncedState(allowedGap),
@@ -1169,10 +1624,8 @@ export async function waitForSyncedState(wallet: WalletFacade, allowedGap = sync
           Rx.firstValueFrom(wallet.pendingTransactionsService.state()),
         ]),
         stallPromise,
-      ]),
-      timeoutMs('MIDNIGHT_WALLET_SYNC_TIMEOUT_MS', 300_000),
-      'Timed out while waiting for Midnight wallet sync. Check the Indexer websocket, Preprod connectivity, and wallet seed.',
-    );
+        memoryLimitPromise,
+      ]);
 
     const state: Awaited<ReturnType<WalletFacade['waitForSyncedState']>> = {
       shielded,
@@ -1188,6 +1641,7 @@ export async function waitForSyncedState(wallet: WalletFacade, allowedGap = sync
     return state;
   } finally {
     clearInterval(stallTimer);
+    if (segmentTimer) clearTimeout(segmentTimer);
     appliedProgressSubscription.unsubscribe();
     progressSubscription.unsubscribe();
   }

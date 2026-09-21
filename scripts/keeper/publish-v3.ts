@@ -12,19 +12,18 @@ import {
   requiredEnv,
   resolveNetwork,
 } from '../shared/chain.js'
-import { connectKeeperV3, ensureV3MarketColumns, resolveDeploymentV3 } from '../shared/chain-v3.js'
+import { connectKeeperV3, ensureV3MarketColumns, type KeeperV3Context, resolveDeploymentV3 } from '../shared/chain-v3.js'
 import {
-  captureWalletTransactionCheckpoint,
-  waitForWalletTransactionSettlement,
+  clearWalletCanaryRequirement,
+  walletRequiresCanary,
 } from '../shared/midnight.js'
 import {
   abortBatchIfWalletUnavailable,
   errorMessage,
-  KeeperContextBrokenError,
   keeperBatchLimit,
   stopWalletSafely,
-  withKeeperTransactionTimeout,
 } from './reliability.js'
+import { executeKeeperTransaction } from './transaction-executor.js'
 import { configureKeeperCategory, requiredKeeperCategory } from './scope-v2.js'
 import type { KeeperWorkResult } from './scheduling-v2.js'
 
@@ -33,6 +32,12 @@ type PublishOptions = {
   limit?: number
   /** Yield between transactions when settlement/refund work appears. */
   preemptForSettlement?: boolean
+  /** Reuse the scheduler's one wallet/contract context for this whole cycle. */
+  context?: KeeperV3Context
+}
+
+export function publishLimitForWallet(requestedLimit: number, canaryRequired: boolean): number {
+  return canaryRequired ? 1 : requestedLimit
 }
 
 export const PRIORITY_MARKET_EXISTS_SQL = `SELECT EXISTS (
@@ -77,10 +82,17 @@ export async function publishDraftsV3(
   // preempt creation between transactions. Wallet rotation below prevents one
   // websocket/UTXO context from living for hundreds of proofs.
   const configuredLimit = keeperBatchLimit('PUBLISH_LIMIT', 500, 'KEEPER_MAX_PUBLISH_LIMIT', 1000)
-  const limit = options.limit == null
+  let limit = options.limit == null
     ? configuredLimit
     : Math.min(configuredLimit, Math.max(1, Math.floor(options.limit)))
-  const sessionSize = Math.min(keeperBatchLimit('PUBLISH_SESSION_SIZE', 20), limit)
+  const canaryRequired = walletRequiresCanary(network)
+  if (canaryRequired) {
+    limit = publishLimitForWallet(limit, true)
+    console.warn('[publish-v3] wallet recovered by cold replay; limiting this run to one canary market.')
+  }
+  const sessionSize = options.context
+    ? limit
+    : Math.min(keeperBatchLimit('PUBLISH_SESSION_SIZE', 20), limit)
   const minLeadSec = keeperBatchLimit('PUBLISH_MIN_LEAD_SEC', 120, 'PUBLISH_MAX_MIN_LEAD_SEC', 3600)
   await ensureV3MarketColumns(dbUrl)
   const deployment = await resolveDeploymentV3(network)
@@ -143,7 +155,8 @@ export async function publishDraftsV3(
       break
     }
 
-    const { deployed, walletCtx } = await connectKeeperV3(network)
+    const context = options.context ?? await connectKeeperV3(network)
+    const { deployed, walletCtx } = context
     try {
       for (const row of chunk) {
         // A proof/call already in flight cannot be cancelled safely. Check only
@@ -172,8 +185,9 @@ export async function publishDraftsV3(
             continue
           }
 
-          const walletCheckpoint = await captureWalletTransactionCheckpoint(walletCtx.wallet)
-          const result = await withKeeperTransactionTimeout(
+          const { txId } = await executeKeeperTransaction(
+            walletCtx,
+            network,
             `create_market ${row.id.slice(0, 12)}`,
             () => deployed.callTx.create_market(
               parseHexBytes(row.id, 32, 'market_id'),
@@ -185,11 +199,8 @@ export async function publishDraftsV3(
             ),
           )
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const r = result as any
-          const txId: string = r?.public?.txId ?? r?.txId ?? r?.finalizedTxData?.txId ?? ''
-          // callTx is blocking and returns only after Indexer finalization. From
-          // this point on, any local DB/barrier failure must destroy the session:
-          // proceeding would build the next proof from an unconfirmed wallet view.
+          // The shared executor returns only after Indexer finalization and exact
+          // wallet/DUST settlement, so every write path has the same barrier.
           confirmedOnChain = true
           await pgExec(
             dbUrl,
@@ -204,24 +215,9 @@ export async function publishDraftsV3(
           ok++
           console.log(`  ✓ ${row.id.slice(0, 12)}… published (tx ${txId ? txId.slice(0, 12) + '…' : '?'})`)
 
-          // callTx returns only after the Indexer has finalized the transaction,
-          // but the wallet's DUST stream and pending service can still lag that
-          // observation. Never build the next proof until both have caught up.
-          try {
-            await withKeeperTransactionTimeout(
-              `post-transaction wallet sync ${row.id.slice(0, 12)}`,
-              () => waitForWalletTransactionSettlement(
-                walletCtx.wallet,
-                txId,
-                walletCheckpoint,
-              ),
-            )
-            await walletCtx.saveState()
-          } catch (error) {
-            throw new KeeperContextBrokenError(
-              `post-transaction wallet sync ${row.id.slice(0, 12)}`,
-              error,
-            )
+          if (canaryRequired) {
+            clearWalletCanaryRequirement(network)
+            console.log('[publish-v3] canary finalized and wallet settled; normal publish limits are restored.')
           }
         } catch (err) {
           const msg = errorMessage(err)
@@ -231,11 +227,7 @@ export async function publishDraftsV3(
                 `${recordedInDatabase ? 'the market remains marked open' : 'the database will reconcile it on retry'} ` +
                 `and this wallet session will be destroyed: ${msg}`,
             )
-            if (err instanceof KeeperContextBrokenError) throw err
-            throw new KeeperContextBrokenError(
-              `post-confirmation handling ${row.id.slice(0, 12)}`,
-              err,
-            )
+            throw err
           } else if (/Market already exists/i.test(msg)) {
             await pgExec(
               dbUrl,
@@ -267,7 +259,9 @@ export async function publishDraftsV3(
       } catch (error) {
         console.warn(`[publish-v3] wallet cache save failed: ${errorMessage(error)}`)
       }
-      await stopWalletSafely(walletCtx.wallet, `publish-v3 session ${sessionNumber}`)
+      if (!options.context) {
+        await stopWalletSafely(walletCtx.wallet, `publish-v3 session ${sessionNumber}`)
+      }
     }
     if (preempted) break
   }

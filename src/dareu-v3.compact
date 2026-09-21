@@ -98,6 +98,10 @@ export ledger markets: Map<Bytes<32>, Market>;
 export ledger positions: Map<Bytes<32>, Position>;
 export ledger sales: Map<Bytes<32>, SaleOrder>;
 export ledger market_fees: Map<Bytes<32>, Uint<64>>;
+// One-time receipts for Smart Darer subscription payments. The payment id is
+// supplied by the server-created intent and prevents the same intent being paid
+// twice, even across wallets or browser sessions.
+export ledger subscription_payments: Set<Bytes<32>>;
 
 witness local_secret_key(): Bytes<32>;
 
@@ -206,6 +210,25 @@ pure circuit empty_id(): Bytes<32> {
 
 pure circuit max_uint64(): Uint<64> {
   return 0xFFFFFFFFFFFFFFFF;
+}
+
+// A domain-separated pseudo market id lets Smart Darer fees share the existing
+// treasury accounting and owner withdrawal path without creating a second vault.
+export pure circuit smart_darer_fee_bucket(): Bytes<32> {
+  return persistentHash<Vector<1, Bytes<32>>>([pad(32, "dareu:smart-darer-fee:v1")]);
+}
+
+pure circuit validate_subscription_fee(amount: Uint<64>, fee: Uint<64>): [] {
+  assert(amount > 0, "Subscription amount must be positive");
+  assert(fee > 0, "Subscription amount is too small for a nonzero fee");
+  // These explicit bounds keep both multiplication checks below Uint<64>'s
+  // ceiling. They only exclude amounts within 66 base units of the type limit.
+  assert(amount <= (18446744073709551549 as Uint<64>), "Subscription amount is too large");
+  assert(fee <= (184467440737095515 as Uint<64>), "Subscription fee is too large");
+  // Exact equivalent of floor((amount + 50) / 100), preserving the WebApp's
+  // current rounded one-percent fee rule without trusting a caller-supplied fee.
+  assert(fee * 100 <= amount + 50, "Subscription fee is too high");
+  assert(amount + 50 < (fee + 1) * 100, "Subscription fee is too low");
 }
 
 pure circuit max_platform_fee_rate(): Uint<64> {
@@ -406,6 +429,7 @@ export circuit create_market(
 
   require_operator_or_owner();
   assert(!markets.member(public_market_id), "Market already exists");
+  assert(public_market_id != smart_darer_fee_bucket(), "Market id is reserved");
   assert(public_oracle != empty_participant(), "Oracle cannot be empty");
   assert(kernel.blockTimeLessThan(public_close_time), "Close time must be in the future");
   assert(public_close_time < (0xF000000000000000 as Uint<64>), "close_time unreasonable");
@@ -459,15 +483,57 @@ export circuit place_bet(
   const total_payment = (public_amount + public_fee) as Uint<64>;
   if (public_mode == FundingMode.SHIELDED) {
     assert(public_coin.color == snight_color(), "Bet coin is not sNIGHT");
-    assert(public_coin.value == (total_payment as Uint<128>),
-           "Coin value must equal stake plus fee");
+    assert(public_coin.value >= (total_payment as Uint<128>),
+           "Coin value must cover stake plus fee");
     burn_shielded_coin(public_coin);
+    // Wallet connectors expose an aggregate shielded balance, not arbitrary coin
+    // enumeration/splitting. Accept a larger known vault coin and return its
+    // remainder privately so an earlier vault deposit can fund many bets.
+    const change = (public_coin.value - (total_payment as Uint<128>)) as Uint<64>;
+    if (change > 0) {
+      const returned = mintShieldedToken(
+                         token_domain,
+                         change,
+                         public_nonce,
+                         left<ZswapCoinPublicKey, ContractAddress>(public_recipient)
+                         );
+    }
   } else {
     assert(public_coin.value == 0, "Unshielded bet requires an empty payment coin");
     receiveUnshielded(underlying_token, total_payment as Uint<128>);
   }
   return record_bet(public_market_id, market, public_side, public_amount,
                     public_fee, public_recipient, public_nonce);
+}
+
+// Atomically pays the Smart Darer and retains DareU's platform fee inside this
+// contract. Both transfers now share one contract call and one replay-protected
+// payment intent instead of trusting a browser-built two-recipient transfer.
+export circuit pay_smart_darer_subscription(
+                 payment_id: Bytes<32>,
+                 darer_address: UserAddress,
+                 subscription_amount: Uint<64>,
+                 platform_fee: Uint<64>): [] {
+  const public_payment_id = disclose(payment_id);
+  const public_darer = disclose(darer_address);
+  const public_amount = disclose(subscription_amount);
+  const public_fee = disclose(platform_fee);
+  assert(!subscription_payments.member(public_payment_id), "Subscription payment already processed");
+  validate_subscription_fee(public_amount, public_fee);
+  assert(public_amount <= (max_uint64() - public_fee) as Uint<64>, "Subscription total overflow");
+  const total = (public_amount + public_fee) as Uint<64>;
+  const bucket = smart_darer_fee_bucket();
+  const accrued = market_fees.member(bucket) ? market_fees.lookup(bucket) : 0;
+  assert(accrued <= (max_uint64() - public_fee) as Uint<64>, "Smart Darer fee escrow overflow");
+
+  receiveUnshielded(underlying_token, total as Uint<128>);
+  sendUnshielded(
+    underlying_token,
+    public_amount as Uint<128>,
+    right<ContractAddress, UserAddress>(public_darer)
+    );
+  market_fees.insert(bucket, (accrued + public_fee) as Uint<64>);
+  subscription_payments.insert(public_payment_id);
 }
 
 // Escrow the whole Position. The parimutuel pool is untouched.
@@ -811,9 +877,11 @@ export circuit set_operator(participant: Bytes<32>, enabled: Boolean): [] {
 export circuit withdraw_treasury(market_id: Bytes<32>, payout_address: UserAddress): [] {
   const public_market_id = disclose(market_id);
   require_owner();
-  const market = get_market(public_market_id);
-  assert(market.status == MarketStatus.RESOLVED,
-         "Fees are not withdrawable before resolution");
+  if (public_market_id != smart_darer_fee_bucket()) {
+    const market = get_market(public_market_id);
+    assert(market.status == MarketStatus.RESOLVED,
+           "Fees are not withdrawable before resolution");
+  }
   const amount = market_fees.member(public_market_id)
                    ? market_fees.lookup(public_market_id)
                    : 0;

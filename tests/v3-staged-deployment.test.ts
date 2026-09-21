@@ -17,10 +17,10 @@ const witnesses = {
   ] as [Record<string, never>, Uint8Array],
 };
 
-test('V3 bootstrap installs nine operations and defers the two sale operations', () => {
+test('V3 bootstrap installs nine operations and defers three large operations', () => {
   const contract = new V3BootstrapContract(witnesses as any);
   assert.equal(Object.keys(contract.provableCircuits).length, 9);
-  assert.equal(Object.keys(new Contract(witnesses as any).provableCircuits).length, 11);
+  assert.equal(Object.keys(new Contract(witnesses as any).provableCircuits).length, 12);
   for (const circuitId of V3_DEFERRED_CIRCUITS) {
     assert.equal(circuitId in contract.provableCircuits, false, circuitId);
     assert.equal(circuitId in contract.circuits, true, circuitId);

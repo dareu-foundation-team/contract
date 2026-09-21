@@ -102,6 +102,10 @@ export function saleId(
   return pureCircuits.sale_id(posId, revision, saleNonce);
 }
 
+export function smartDarerFeeBucket(): Uint8Array {
+  return pureCircuits.smart_darer_fee_bucket();
+}
+
 export const EMPTY_ID = new Uint8Array(32); // empty_participant() / empty_pk() sentinel
 
 // ---- Token-effect capture --------------------------------------------------------
@@ -225,7 +229,7 @@ export class DareuV3Sim {
     return floorDiv(amount * market.platform_fee_rate, 10000n);
   }
 
-  /** Build the exact stake+fee payment coin accepted by place_bet. */
+  /** Build the smallest stake+fee payment coin accepted by place_bet. */
   betCoin(marketId: Uint8Array, amount: bigint, nonceTag: string | number): {
     nonce: Uint8Array;
     color: Uint8Array;
@@ -375,6 +379,21 @@ export class DareuV3Sim {
         { nonce: new Uint8Array(32), color: new Uint8Array(32), value: 0n },
         payoutPk,
         posNonce,
+      ),
+    );
+  }
+
+  paySmartDarerSubscription(
+    caller: Uint8Array,
+    paymentId: Uint8Array,
+    darerAddress: { bytes: Uint8Array },
+    amount: bigint,
+    fee: bigint,
+    time: number,
+  ): void {
+    this.run(caller, time, (c, ctx) =>
+      c.impureCircuits.pay_smart_darer_subscription(
+        ctx, paymentId, darerAddress, amount, fee,
       ),
     );
   }

@@ -14,6 +14,8 @@ src/managed/
 
 # Cached synced wallet state (contains wallet state — keep private)
 .wallet-cache/
+.wallet-locks/
+.secrets/
 
 # Midnight private-state LevelDB (wallet/contract private state — keep private)
 .midnight-state/

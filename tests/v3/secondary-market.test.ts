@@ -67,6 +67,27 @@ describe('DareU v3 primary funding modes', () => {
     );
     assert.deepEqual(poolSnapshot(sim, marketId), [100n, 200n, 300n]);
   });
+
+  test('shielded entry spends a larger vault coin and privately returns change', () => {
+    const { sim, seller, marketId } = fixture();
+    const amount = 100n;
+    const fee = sim.stakeFee(marketId, amount);
+    const vaultCoin = sim.snightCoin(740n, 'vault');
+
+    sim.placeBet(
+      seller,
+      marketId,
+      Outcome.YES,
+      amount,
+      vaultCoin,
+      zswapPk('seller'),
+      bytes32('change-pos'),
+      NOW + 1,
+    );
+
+    assert.ok([...sim.lastEffects.shieldedMints.values()].includes(740n - amount - fee));
+    assert.ok([...sim.lastEffects.shieldedMints.values()].includes(1n));
+  });
 });
 
 describe('DareU v3 whole-position sales', () => {

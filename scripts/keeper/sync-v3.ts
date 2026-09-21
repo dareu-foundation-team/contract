@@ -76,6 +76,43 @@ export async function syncOnceV3(network: ReturnType<typeof resolveNetwork>): Pr
     return { scanned: 0, updated: 0, durationMs: Date.now() - startedAt }
   }
 
+  // Idempotent chain-to-DB reconciliation. This repairs the crash window where
+  // callTx finalized but the keeper died before recording the transaction.
+  const reconciled = await pgExec(
+    dbUrl,
+    `WITH chain_market AS (
+       SELECT * FROM unnest($1::text[], $2::text[], $3::numeric[], $4::numeric[], $5::text[])
+         AS c(id, status, yes_pool, no_pool, outcome)
+     )
+     UPDATE markets AS m
+        SET onchain_tx_id = COALESCE(m.onchain_tx_id, 'reconciled-from-chain'),
+            onchain_contract_version = 'v3',
+            onchain_contract_address = $6,
+            onchain_status = c.status,
+            onchain_yes_pool = c.yes_pool,
+            onchain_no_pool = c.no_pool,
+            onchain_outcome = c.outcome,
+            status = CASE
+              WHEN c.status IN ('resolved', 'cancelled') THEN c.status
+              WHEN m.status = 'draft' THEN 'open'
+              ELSE m.status
+            END,
+            synced_at = now(),
+            onchain_observed_at = now(),
+            updated_at = now()
+       FROM chain_market AS c
+      WHERE m.id = c.id
+        AND (m.onchain_tx_id IS NULL
+          OR (m.onchain_contract_version = 'v3' AND m.onchain_contract_address = $6))
+        AND (m.onchain_tx_id IS NULL
+          OR m.onchain_contract_version IS DISTINCT FROM 'v3'
+          OR m.onchain_contract_address IS DISTINCT FROM $6)`,
+    [ids, statuses, yesPools, noPools, outcomes, deployment.contractAddress],
+  )
+  if ((reconciled.rowCount ?? 0) > 0) {
+    console.warn(`[sync-v3] reconciled ${reconciled.rowCount} finalized on-chain market(s) into Postgres.`)
+  }
+
   const result = await pgExec(
     dbUrl,
     V3_MARKET_MIRROR_UPDATE_SQL,

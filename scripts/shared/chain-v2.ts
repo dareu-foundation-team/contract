@@ -254,7 +254,7 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
   const { key, role } = keeperCallerSecretKeyV2()
   const deployment = await resolveDeploymentV2(network)
 
-  const walletCtx = await createWallet(walletSeed, network, config)
+  const walletCtx = await createWallet(walletSeed, network, config, { cachePolicy: 'require-last-good' })
   try {
     // V2 consumes sNIGHT coins. Waiting only for DUST leaves shielded.availableCoins
     // empty even after a successful deposit, causing repeated bond deposits.
@@ -315,12 +315,17 @@ export async function connectKeeperV2(network: SupportedNetwork): Promise<Keeper
     // A stalled replay is quarantined instead of being promoted. Other failures
     // may retain only genuinely advanced working-checkpoint progress.
     let failure: unknown = error
-    if (error instanceof WalletSyncStalledError && error.stalledStreams.includes('dust')) {
+    if (
+      error instanceof WalletSyncStalledError &&
+      error.stalledStreams.includes('dust') &&
+      error.disconnectedStreams.length === 0
+    ) {
       const recovery = await walletCtx.recoverFromSyncStall(error)
       console.error(
         `[keeper-v2] wallet sync stalled at DUST applied=${error.dustAppliedIndex}; ` +
           `checkpoint ${recovery.quarantinedPath ? `quarantined at ${recovery.quarantinedPath}` : 'was absent'}; ` +
-          `${recovery.restoredLastKnownGood ? 'restored last-known-good' : 'next start will cold-sync'}; ` +
+          `${recovery.restoredLastKnownGood ? 'restored a distinct last-known-good' : 'identical/absent last-known-good quarantined; next start will cold-sync'}; ` +
+          `recovery mode ${recovery.recoveryMode}; ` +
           `recovery attempt ${recovery.attempt}.`,
       )
       if (recovery.exhausted) {

@@ -34,6 +34,8 @@ test('transport failures invalidate the current wallet context', () => {
     'FATAL: Unable to initialize the API: No response received from RPC endpoint in 60s',
     'API-WS disconnected: 1006 Abnormal Closure',
     'RPC preflight timed out after 15000ms',
+    'values inserted non-linearly into dust commitment tree; expected to insert index 1128463, but received 1128443',
+    'values inserted non-linearly into zswap commitment tree; expected to insert index 21419, but received 21416',
   ]) {
     assert.equal(isBrokenKeeperContext(new Error(message)), true, message)
   }

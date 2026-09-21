@@ -15,6 +15,7 @@ import {
 import {
   connectKeeperV3,
   ensureV3MarketColumns,
+  type KeeperV3Context,
   resolveDeploymentV3,
 } from '../shared/chain-v3.js'
 import {
@@ -22,8 +23,8 @@ import {
   errorMessage,
   keeperBatchLimit,
   stopWalletSafely,
-  withKeeperTransactionTimeout,
 } from './reliability.js'
+import { executeKeeperTransaction } from './transaction-executor.js'
 import { configureKeeperCategory, requiredKeeperCategory } from './scope-v2.js'
 import type { KeeperWorkResult } from './scheduling-v2.js'
 
@@ -44,6 +45,7 @@ export const EMPTY_CANCEL_PREDICATE = `
 
 export async function resolveMarketsV3(
   network: ReturnType<typeof resolveNetwork>,
+  sharedContext?: KeeperV3Context,
 ): Promise<KeeperWorkResult> {
   const dbUrl = requiredEnv('DATABASE_URL')
   const category = requiredKeeperCategory()
@@ -74,12 +76,15 @@ export async function resolveMarketsV3(
 
   console.log(`[resolve-v3] resolving ${rows.length} market(s) directly on-chain…`)
   let succeeded = 0
-  const { deployed, walletCtx } = await connectKeeperV3(network)
+  const context = sharedContext ?? await connectKeeperV3(network)
+  const { deployed, walletCtx } = context
   try {
     for (const row of rows as Array<{ id: string; outcome: 'yes' | 'no' }>) {
       try {
         const outcome = row.outcome === 'yes' ? Outcome.YES : Outcome.NO
-        await withKeeperTransactionTimeout(
+        await executeKeeperTransaction(
+          walletCtx,
+          network,
           `settle_market_action RESOLVE ${row.id.slice(0, 12)}`,
           () => deployed.callTx.settle_market_action(
             parseHexBytes(row.id, 32, 'market_id'),
@@ -102,7 +107,7 @@ export async function resolveMarketsV3(
       }
     }
   } finally {
-    await stopWalletSafely(walletCtx.wallet, 'resolve-v3')
+    if (!sharedContext) await stopWalletSafely(walletCtx.wallet, 'resolve-v3')
   }
   return { selected: rows.length, succeeded }
 }
@@ -110,6 +115,7 @@ export async function resolveMarketsV3(
 export async function cancelRequestedV3(
   network: ReturnType<typeof resolveNetwork>,
   options: CancelOptions = {},
+  sharedContext?: KeeperV3Context,
 ): Promise<KeeperWorkResult> {
   const dbUrl = requiredEnv('DATABASE_URL')
   const category = requiredKeeperCategory()
@@ -154,11 +160,14 @@ export async function cancelRequestedV3(
 
   console.log(`[cancel-v3:${mode}] cancelling ${rows.length} market(s) on-chain…`)
   let succeeded = 0
-  const { deployed, walletCtx } = await connectKeeperV3(network)
+  const context = sharedContext ?? await connectKeeperV3(network)
+  const { deployed, walletCtx } = context
   try {
     for (const row of rows as Array<{ id: string }>) {
       try {
-        await withKeeperTransactionTimeout(
+        await executeKeeperTransaction(
+          walletCtx,
+          network,
           `settle_market_action CANCEL ${row.id.slice(0, 12)}`,
           () => deployed.callTx.settle_market_action(parseHexBytes(row.id, 32, 'market_id'), SettlementAction.CANCEL, Outcome.NONE),
         )
@@ -177,7 +186,7 @@ export async function cancelRequestedV3(
       }
     }
   } finally {
-    await stopWalletSafely(walletCtx.wallet, 'cancel-v3')
+    if (!sharedContext) await stopWalletSafely(walletCtx.wallet, 'cancel-v3')
   }
   return { selected: rows.length, succeeded }
 }

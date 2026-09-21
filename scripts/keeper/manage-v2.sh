@@ -126,6 +126,7 @@ status_one() {
 
 case "$ACTION" in
   start)
+    npm run wallet:verify-isolation -- "$NETWORK" || exit 1
     legacy="$(pgrep -f "scripts/keeper/run-v[23].ts ${NETWORK}$|scripts/keeper/supervise-v2.sh ${NETWORK}$" 2>/dev/null || true)"
     if [[ -n "$legacy" ]]; then
       echo "Refusing to start category Keepers while an unscoped legacy Keeper is running: $legacy" >&2
@@ -147,6 +148,7 @@ case "$ACTION" in
     failed=0
     for category in "${CATEGORIES[@]}"; do stop_one "$category" || failed=1; done
     bash scripts/keeper/manage-sync-v2.sh restart "$NETWORK" || failed=1
+    npm run wallet:verify-isolation -- "$NETWORK" || exit 1
     for category in "${CATEGORIES[@]}"; do start_one "$category" || failed=1; done
     exit "$failed"
     ;;

@@ -41,12 +41,9 @@ export DAREU_ENV_FILE="$KEEPER_ENV_FILE"
 export DAREU_KEEPER_CATEGORY="$CATEGORY"
 export MIDNIGHT_WALLET_CACHE_NAMESPACE="${MIDNIGHT_WALLET_CACHE_NAMESPACE:-$CATEGORY}"
 export MIDNIGHT_PRIVATE_STATE_NAMESPACE="${MIDNIGHT_PRIVATE_STATE_NAMESPACE:-$CATEGORY}"
-# A new wallet can need hours to replay the preprod DUST history. The generic
-# five-minute SDK guard is suitable for interactive commands, but it makes a
-# keeper repeatedly abandon healthy progress. Checkpoint often so an actual
-# disconnect/restart resumes close to the last applied event.
-export MIDNIGHT_WALLET_SYNC_TIMEOUT_MS="${MIDNIGHT_WALLET_SYNC_TIMEOUT_MS:-21600000}"
-export MIDNIGHT_WALLET_CHECKPOINT_EVERY="${MIDNIGHT_WALLET_CHECKPOINT_EVERY:-10000}"
+# Operational Keepers require a fully prepared last-good snapshot. Their sync
+# guard is progress-based: a healthy advancing cursor has no wall-clock limit.
+export MIDNIGHT_WALLET_SYNC_STALL_TIMEOUT_MS="${MIDNIGHT_WALLET_SYNC_STALL_TIMEOUT_MS:-600000}"
 
 stop_process_tree() {
   local parent_pid="$1"
@@ -67,6 +64,15 @@ stop_child() {
   fi
 }
 
+assert_previous_process_tree_stopped() {
+  local remaining
+  remaining="$(pgrep -f "scripts/keeper/run-v[23].ts ${NETWORK} ${CATEGORY}$" 2>/dev/null || true)"
+  if [[ -n "$remaining" ]]; then
+    echo "[keeper-supervisor:$CATEGORY] refusing restart; previous Keeper descendants are still alive: $remaining" >&2
+    return 1
+  fi
+}
+
 trap stop_child INT TERM
 
 while [[ "$STOPPING" -eq 0 ]]; do
@@ -77,6 +83,10 @@ while [[ "$STOPPING" -eq 0 ]]; do
   wait "$CHILD_PID"
   STATUS=$?
   CHILD_PID=""
+
+  if ! assert_previous_process_tree_stopped; then
+    exit 79
+  fi
 
   if [[ "$STOPPING" -ne 0 ]]; then
     break

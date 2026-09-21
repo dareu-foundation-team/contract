@@ -13,7 +13,7 @@ import {
   createWallet,
   ensureDust,
   errorMessage,
-  requiredWalletSeedOrMnemonic,
+  requiredDeployerWalletSeedOrMnemonic,
   waitForUnshieldedSyncedState,
 } from '../shared/midnight.js';
 import { resolveNetwork } from '../shared/network.js';
@@ -99,7 +99,7 @@ async function main() {
   const network = resolveNetwork(process.argv[2]);
   setNetworkId(network);
   const config = configureNetwork(network);
-  const walletSeed = requiredWalletSeedOrMnemonic();
+  const walletSeed = requiredDeployerWalletSeedOrMnemonic();
   const privateStoragePassword = requiredEnv('MIDNIGHT_PRIVATE_STATE_PASSWORD');
 
   // Owner secret key (cold key) — same key/domain-tag family as dareu-v2's owner.
@@ -125,7 +125,9 @@ async function main() {
   const cma = resolveContractMaintenanceAuthority();
   await ensureProofServer(config.proofServer);
 
-  const walletCtx = await createWallet(walletSeed, network, config);
+  const walletCtx = await createWallet(walletSeed, network, config, {
+    ignoreConfiguredMnemonic: true,
+  });
 
   try {
     const funding = await ensureFunding(walletCtx, config);

@@ -2,10 +2,12 @@ import { Contract, type Witnesses } from '../../src/managed/dareu-v3/contract/in
 import { ContractState } from '@midnight-ntwrk/onchain-runtime-v3';
 
 // Keep the merged V3 bootstrap at nine operations; install the two secondary
-// market entry points separately through CMA maintenance transactions.
+// market entry points and Smart Darer payment separately through CMA maintenance
+// transactions so the initial deployment stays below the proven size ceiling.
 export const V3_DEFERRED_CIRCUITS = [
   'list_position',
   'fill_sale',
+  'pay_smart_darer_subscription',
 ] as const;
 
 export type V3DeferredCircuit = (typeof V3_DEFERRED_CIRCUITS)[number];

@@ -107,19 +107,29 @@ single foreground sync, for example:
 SYNC_INTERVAL_SEC=0 npm run keeper:v2:sync -- preprod
 ```
 
-The supervisor gives a progressing initial Preprod wallet replay up to six hours
-and saves a working checkpoint every 10,000 applied DUST events. A separate
-progress watchdog defaults to ten minutes
+Run `keeper:v2:prepare-wallet` or `keeper:v3:prepare-wallet` before starting the
+service. Preparation has no absolute wall-clock limit while cursors advance. It
+stops all wallet streams and writes a verified working checkpoint every 50,000
+applied DUST events, every 30 minutes, or at the heap safety limit, then resumes in a
+fresh process. A separate progress watchdog defaults to ten minutes
 (`MIDNIGHT_WALLET_SYNC_STALL_TIMEOUT_MS`): if any required unsynced cursor stops
-advancing, the wallet context is restarted. A stalled DUST cursor additionally
+advancing, the wallet context is restarted. The operational Keeper accepts only
+a fully prepared `.last-good` snapshot and never performs a silent cold replay.
+A stalled DUST cursor additionally
 quarantines the working checkpoint, and the next process restores last-known-good
-or performs a cold replay. A second stall at the same DUST index
+or performs a cold replay. If the active checkpoint and last-known-good have the
+same SHA-256 fingerprint, both are quarantined because restoring identical tree
+state cannot repair a non-linear replay. A cold recovery creates a canary marker;
+the next publish run is limited to one market until that transaction finalizes
+and the wallet completes its post-transaction sync. A second stall at the same
+DUST index
 (`MIDNIGHT_WALLET_SYNC_RECOVERY_ATTEMPTS`, default 2) exits with status 78 and
 stops the supervisor for operator inspection instead of replaying forever.
 Fully synced and post-transaction-settled states alone are promoted to
 `<cache>.last-good`; quarantined files remain recoverable as
-`<cache>.quarantine-*`. Override the timeouts or
-`MIDNIGHT_WALLET_CHECKPOINT_EVERY` in a category-specific env file when needed.
+`<cache>.quarantine-*`. Override `MIDNIGHT_WALLET_CHECKPOINT_EVERY`,
+`MIDNIGHT_WALLET_REPLAY_SEGMENT_MS`, or the stall timeout in a category-specific
+env file when needed.
 Before starting wallet services, the keeper performs a bounded `system_health` websocket probe
 (`MIDNIGHT_RPC_PREFLIGHT_TIMEOUT_MS`, default 15 seconds). A failed setup closes
 every partially-started wallet service and exits before the supervisor starts a
@@ -169,6 +179,19 @@ Required configuration includes:
 - category-specific wallet seed/mnemonic
 - `MIDNIGHT_PRIVATE_STATE_PASSWORD`
 - Midnight network endpoints and proof server
+
+Wallet caches are operational state, not build artifacts. In containers set
+`MIDNIGHT_WALLET_CACHE_DIR` to a durable mounted volume; startup verifies that
+the directory is readable/writable and creates a `.durable-wallet-cache` marker.
+Each checkpoint records its schema, wallet role, network, genesis hash, three
+cursor sets and per-wallet blob hashes. It is read-back verified and replaced
+atomically under a write lock. Configure
+`KEEPER_WALLET_ALERT_WEBHOOK_URL` to receive unhealthy structured wallet-health
+snapshots; logs always contain the same JSON metrics even without a webhook.
+
+Wallet secrets support `*_MNEMONIC_FILE` / `*_SEED_FILE`. Production should
+mount those mode-0600 files from its Secret Manager/sidecar instead of placing
+seed material directly in `.env.local` or category env files.
 
 The Keeper must use the same deployment manifest and nine V2 proving circuits as
 the WebApp. It must not load the cold owner secret as a runtime fallback.

@@ -12,7 +12,7 @@ import {
   contractRoot,
   createProviders,
   createWallet,
-  requiredWalletSeedOrMnemonic,
+  requiredTestWalletSeedOrMnemonic,
   waitForDustSyncedState,
 } from '../shared/midnight.js';
 import { resolveNetwork } from '../shared/network.js';
@@ -27,6 +27,9 @@ import { Contract, Outcome, SettlementAction, pureCircuits, type Witnesses } fro
 //
 //   npm run market:v3:create -- preprod   (reads DAREU_V3_MARKET_* env, or uses
 //                                           built-in defaults for a quick demo)
+//
+// Wallet: requires the disposable MIDNIGHT_TEST_WALLET_MNEMONIC/SEED and stores
+// its cache/private state under the isolated "admin-test" namespace.
 //
 // Auth: the CLI always uses the least-privilege hot operator key. The owner key
 // remains cold and is not a runtime fallback.
@@ -103,11 +106,15 @@ async function connectDemoV3(
   expectedCircuitId: 'create_market' | 'settle_market_action',
 ) {
   const config = configureNetwork(network);
-  const walletSeed = requiredWalletSeedOrMnemonic();
+  const walletSeed = requiredTestWalletSeedOrMnemonic();
   const privateStoragePassword = requiredEnv('MIDNIGHT_PRIVATE_STATE_PASSWORD');
   const { contractAddress, privateStateId } = readDeploymentV3(network);
 
-  const walletCtx = await createWallet(walletSeed, network, config);
+  process.env.MIDNIGHT_WALLET_CACHE_NAMESPACE = 'admin-test';
+  process.env.MIDNIGHT_PRIVATE_STATE_NAMESPACE = 'admin-test';
+  const walletCtx = await createWallet(walletSeed, network, config, {
+    ignoreConfiguredMnemonic: true,
+  });
   await waitForDustSyncedState(walletCtx.wallet);
   await walletCtx.saveState();
 
