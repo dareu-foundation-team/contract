@@ -13,6 +13,7 @@ import {
   isWalletReplayMemoryLimit,
   isWalletReplaySegmentBoundary,
   nextWalletSyncRecoveryAttempt,
+  nextWalletReplayHeapLimitMb,
   walletReplaySegmentStream,
 } from '../scripts/shared/midnight.js'
 
@@ -26,6 +27,13 @@ test('wallet replay memory limits request a clean-process checkpoint resume', ()
   assert.equal(isWalletReplayMemoryLimit(error), true)
   assert.equal(isWalletReplayMemoryLimit(new Error('ordinary failure')), false)
   assert.match(error.message, /checkpointing before a fresh-process resume/)
+})
+
+test('wallet replay OOM recovery lowers the next soft boundary with a floor', () => {
+  assert.equal(nextWalletReplayHeapLimitMb(4096, 2048), 3072)
+  assert.equal(nextWalletReplayHeapLimitMb(3072, 2048), 2304)
+  assert.equal(nextWalletReplayHeapLimitMb(2304, 2048), 2048)
+  assert.equal(nextWalletReplayHeapLimitMb(2048, 2048), 2048)
 })
 
 test('wallet replay cursor/time boundaries request a clean-process checkpoint resume', () => {

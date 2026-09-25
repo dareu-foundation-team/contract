@@ -9,6 +9,7 @@ import {
   isBrokenKeeperContext,
   isKeeperDustUnavailable,
   keeperBatchLimit,
+  shouldPersistWalletSessionState,
   withKeeperTransactionTimeout,
 } from '../scripts/keeper/reliability.js'
 
@@ -76,6 +77,11 @@ test('DUST insufficiency stops the whole batch without marking the context broke
     isKeeperDustUnavailable(new Error('Wallet.InsufficientFunds: shielded NIGHT is missing')),
     false,
   )
+})
+
+test('an unconfirmed transaction failure cannot be promoted to the wallet last-known-good cache', () => {
+  assert.equal(shouldPersistWalletSessionState(false), true)
+  assert.equal(shouldPersistWalletSessionState(true), false)
 })
 
 test('keeper batch limit caps an unsafe requested batch', () => {

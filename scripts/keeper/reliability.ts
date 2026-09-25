@@ -131,6 +131,16 @@ export function abortBatchIfWalletUnavailable(operation: string, error: unknown)
   abortBatchIfContextBroken(operation, error)
 }
 
+/**
+ * A failed, unconfirmed transaction may already have changed the wallet SDK's
+ * in-memory DUST coin selection. Persisting that state can promote a rejected
+ * spend (notably Custom error 170) to `.last-good`, leaving the next process
+ * with no spendable coin even though the chain never accepted the spend.
+ */
+export function shouldPersistWalletSessionState(hadUnconfirmedTransactionFailure: boolean): boolean {
+  return !hadUnconfirmedTransactionFailure
+}
+
 export async function stopWalletSafely(
   wallet: { stop(): Promise<unknown> },
   label: string,

@@ -22,6 +22,7 @@ import {
   errorMessage,
   KeeperContextBrokenError,
   keeperBatchLimit,
+  shouldPersistWalletSessionState,
   stopWalletSafely,
   withKeeperTransactionTimeout,
 } from './reliability.js'
@@ -144,6 +145,7 @@ export async function publishDraftsV2(
     }
 
     const { deployed, walletCtx } = await connectKeeperV2(network)
+    let hadUnconfirmedTransactionFailure = false
     try {
       for (const row of chunk) {
         // A proof/call already in flight cannot be cancelled safely. Check only
@@ -247,6 +249,7 @@ export async function publishDraftsV2(
             ok++
             console.log(`  • ${row.id.slice(0, 12)}… already on-chain — marked`)
           } else {
+            hadUnconfirmedTransactionFailure = true
             console.error(`  ✗ ${row.id.slice(0, 12)}… failed (left as draft): ${msg}`)
             // A transport failure or InvalidDustSpendProof (Custom error 170)
             // invalidates the wallet's view of DUST/UTXOs. 170 is deliberately
@@ -260,12 +263,17 @@ export async function publishDraftsV2(
         }
       }
     } finally {
-      // Preserve the latest DUST/shielded progress so the next session performs
-      // only a short incremental sync, not a full wallet replay.
-      try {
-        await walletCtx.saveState()
-      } catch (error) {
-        console.warn(`[publish-v2] wallet cache save failed: ${errorMessage(error)}`)
+      // Successful transactions save only after their wallet/DUST settlement
+      // barrier. A rejected transaction may have mutated in-memory coin
+      // selection, so it must never replace the last-known-good snapshot.
+      if (shouldPersistWalletSessionState(hadUnconfirmedTransactionFailure)) {
+        try {
+          await walletCtx.saveState()
+        } catch (error) {
+          console.warn(`[publish-v2] wallet cache save failed: ${errorMessage(error)}`)
+        }
+      } else {
+        console.warn('[publish-v2] unsafe post-failure wallet state was not cached; retaining the previous last-known-good snapshot.')
       }
       await stopWalletSafely(walletCtx.wallet, `publish-v2 session ${sessionNumber}`)
     }

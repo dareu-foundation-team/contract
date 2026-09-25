@@ -85,6 +85,18 @@ npm run keeper:multi -- restart preprod
 npm run keeper:multi -- stop preprod
 ```
 
+The optional third argument targets exactly one service and leaves every other
+Keeper and the global sync process untouched:
+
+```bash
+npm run keeper:multi -- stop preprod crypto
+npm run keeper:multi -- start preprod stocks
+npm run keeper:multi -- restart preprod sports
+npm run keeper:multi -- status preprod sync
+```
+
+Valid targets are `crypto`, `stocks`, `sports`, `sync`, and `all` (the default).
+
 Every `start` or `restart` creates a fresh log for each category under `logs/`,
 named `keeper-<category>-YYYYMMDD-HHMMSS.log`. The status command prints the
 log path associated with the current process (or the most recently stopped one).
@@ -109,9 +121,13 @@ SYNC_INTERVAL_SEC=0 npm run keeper:v2:sync -- preprod
 
 Run `keeper:v2:prepare-wallet` or `keeper:v3:prepare-wallet` before starting the
 service. Preparation has no absolute wall-clock limit while cursors advance. It
-stops all wallet streams and writes a verified working checkpoint every 50,000
-applied DUST events, every 30 minutes, or at the heap safety limit, then resumes in a
-fresh process. A separate progress watchdog defaults to ten minutes
+stops all wallet streams and writes a verified working checkpoint every 25,000
+applied DUST events, every 15 minutes, or at the 4GB soft heap boundary, then
+resumes in a fresh process with a 12GB V8 heap ceiling. If a child still reaches
+OOM before committing its atomic checkpoint, the parent preserves the previous
+checkpoint, lowers the next soft boundary toward a 2GB floor, and retries at
+most three times. Only a fully synchronized wallet is promoted to `.last-good`.
+A separate progress watchdog defaults to ten minutes
 (`MIDNIGHT_WALLET_SYNC_STALL_TIMEOUT_MS`): if any required unsynced cursor stops
 advancing, the wallet context is restarted. The operational Keeper accepts only
 a fully prepared `.last-good` snapshot and never performs a silent cold replay.
@@ -143,7 +159,9 @@ defaults to five minutes and can be changed with
 `MIDNIGHT_WALLET_POST_TX_SYNC_TIMEOUT_MS`. A barrier failure or node
 `Custom error: 170` destroys the current wallet context; only the supervisor's
 fresh process may retry. A transaction rejected with 170 stays `draft`, while a
-transaction finalized before a barrier failure stays marked `open`.
+transaction finalized before a barrier failure stays marked `open`. Wallet state
+mutated by an unconfirmed/rejected transaction is never cached or promoted to
+`.last-good`; the fresh process restores the last post-settlement snapshot.
 
 Consecutive short-lived process failures use exponential restart backoff instead
 of reconnecting every 20 seconds. Configure the base, cap and stable-runtime reset

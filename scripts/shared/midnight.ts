@@ -250,6 +250,40 @@ function acquireWalletAddressLock(address: string): () => void {
   };
 }
 
+function acquireCheckpointWriteLock(lockFile: string): () => void {
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockFile, 'wx', 0o600);
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+      fs.closeSync(fd);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      let ownerPid = 0;
+      try {
+        ownerPid = Number((JSON.parse(fs.readFileSync(lockFile, 'utf8')) as { pid?: number }).pid ?? 0);
+      } catch { /* malformed checkpoint locks are stale */ }
+      let ownerAlive = false;
+      if (ownerPid > 0) {
+        try {
+          process.kill(ownerPid, 0);
+          ownerAlive = true;
+        } catch { /* dead owner */ }
+      }
+      if (ownerAlive) {
+        throw new Error(`Wallet checkpoint is already being written by live process ${ownerPid}.`);
+      }
+      try { fs.unlinkSync(lockFile); } catch { /* another process recovered it first */ }
+    }
+  }
+  return () => {
+    try {
+      const owner = JSON.parse(fs.readFileSync(lockFile, 'utf8')) as { pid?: number };
+      if (owner.pid === process.pid) fs.unlinkSync(lockFile);
+    } catch { /* already released */ }
+  };
+}
+
 /** Keep the checkpoint that existed before a supervised warm-up starts. */
 export function preserveWalletCheckpoint(
   network: SupportedNetwork,
@@ -509,6 +543,14 @@ export function isWalletReplaySegmentBoundary(
 ): error is WalletReplayMemoryLimitError | WalletReplaySegmentBoundaryError {
   return isWalletReplayMemoryLimit(error) || error instanceof WalletReplaySegmentBoundaryError ||
     (error instanceof Error && (error as Error & { code?: string }).code === 'WALLET_REPLAY_SEGMENT_BOUNDARY');
+}
+
+/** Lower the next replay child's soft heap boundary after an OOM. */
+export function nextWalletReplayHeapLimitMb(currentMb: number, minimumMb = 2_048): number {
+  const current = Number.isFinite(currentMb) && currentMb > 0 ? Math.floor(currentMb) : 4_096;
+  const minimum = Number.isFinite(minimumMb) && minimumMb > 0 ? Math.floor(minimumMb) : 2_048;
+  const reduced = Math.floor((current * 0.75) / 256) * 256;
+  return Math.max(minimum, reduced);
 }
 
 export function isWalletSyncRecoveryExhausted(error: unknown): error is WalletSyncRecoveryExhaustedError {
@@ -884,9 +926,13 @@ export async function createWallet(
   const cachePolicy = options.cachePolicy ?? 'prefer-checkpoint';
   const cachedState = loadWalletStateCache(network, address, genesisHash, cachePolicy);
   if (cachePolicy === 'require-last-good' && !cachedState) {
+    const walletRole = storageNamespace('MIDNIGHT_WALLET_CACHE_NAMESPACE');
+    const prepareCommand = walletRole
+      ? `npm run keeper:v3:prepare-wallet -- ${network} ${walletRole}`
+      : `npm run wallet:v3:prepare:${network}`;
     throw new Error(
       `No valid fully-synced wallet snapshot exists at ${walletLastGoodCachePath(network)}. ` +
-        `Run "npm run wallet:v3:prepare:${network}" first. The deploy command will not perform a cold wallet replay.`,
+        `Run "${prepareCommand}" first. Transaction processes will not perform a cold wallet replay.`,
     );
   }
   const buildFresh = () => ({
@@ -999,16 +1045,21 @@ export async function createWallet(
   const writeJsonAtomic = (file: string, data: WalletStateCache) => {
     const tmp = `${file}.tmp`;
     const lock = `${file}.write.lock`;
-    const fd = fs.openSync(lock, 'wx', 0o600);
+    const releaseWriteLock = acquireCheckpointWriteLock(lock);
     try {
-      fs.writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 });
+      const fd = fs.openSync(tmp, 'w', 0o600);
+      try {
+        fs.writeFileSync(fd, JSON.stringify(data));
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
       if (!readWalletStateCache(tmp, network, address, genesisHash)) {
         throw new Error(`Wallet checkpoint verification failed for ${tmp}.`);
       }
       fs.renameSync(tmp, file);
     } finally {
-      fs.closeSync(fd);
-      try { fs.unlinkSync(lock); } catch { /* cleanup on best effort */ }
+      releaseWriteLock();
       try { fs.unlinkSync(tmp); } catch { /* renamed or cleanup on best effort */ }
     }
   };

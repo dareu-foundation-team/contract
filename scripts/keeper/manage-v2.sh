@@ -4,6 +4,7 @@ set -u
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ACTION="${1:-status}"
 NETWORK="${2:-preprod}"
+TARGET="${3:-all}"
 CATEGORIES=(crypto stocks sports)
 LOG_TIMESTAMP="${KEEPER_LOG_TIMESTAMP:-$(date '+%Y%m%d-%H%M%S')}"
 
@@ -124,40 +125,93 @@ status_one() {
   fi
 }
 
+is_category() {
+  local wanted="$1"
+  local category
+  for category in "${CATEGORIES[@]}"; do
+    [[ "$wanted" == "$category" ]] && return 0
+  done
+  return 1
+}
+
+validate_target() {
+  if [[ "$TARGET" == "all" || "$TARGET" == "sync" ]] || is_category "$TARGET"; then
+    return 0
+  fi
+  echo "Invalid target '$TARGET'. Expected: all|crypto|stocks|sports|sync" >&2
+  echo "Usage: $0 <start|stop|restart|status> [network] [all|crypto|stocks|sports|sync]" >&2
+  exit 2
+}
+
+check_transaction_keeper_start() {
+  npm run wallet:verify-isolation -- "$NETWORK" || exit 1
+  local legacy
+  legacy="$(pgrep -f "scripts/keeper/run-v[23].ts ${NETWORK}$|scripts/keeper/supervise-v2.sh ${NETWORK}$" 2>/dev/null || true)"
+  if [[ -n "$legacy" ]]; then
+    echo "Refusing to start category Keepers while an unscoped legacy Keeper is running: $legacy" >&2
+    echo "Stop the old supervisor and run-v2 process first." >&2
+    exit 1
+  fi
+}
+
+validate_target
+
 case "$ACTION" in
   start)
-    npm run wallet:verify-isolation -- "$NETWORK" || exit 1
-    legacy="$(pgrep -f "scripts/keeper/run-v[23].ts ${NETWORK}$|scripts/keeper/supervise-v2.sh ${NETWORK}$" 2>/dev/null || true)"
-    if [[ -n "$legacy" ]]; then
-      echo "Refusing to start category Keepers while an unscoped legacy Keeper is running: $legacy" >&2
-      echo "Stop the old supervisor and run-v2 process first." >&2
-      exit 1
+    if [[ "$TARGET" == "sync" ]]; then
+      exec bash scripts/keeper/manage-sync-v2.sh start "$NETWORK"
     fi
+    check_transaction_keeper_start
     failed=0
-    bash scripts/keeper/manage-sync-v2.sh start "$NETWORK" || failed=1
-    for category in "${CATEGORIES[@]}"; do start_one "$category" || failed=1; done
+    if [[ "$TARGET" == "all" ]]; then
+      bash scripts/keeper/manage-sync-v2.sh start "$NETWORK" || failed=1
+      for category in "${CATEGORIES[@]}"; do start_one "$category" || failed=1; done
+    else
+      start_one "$TARGET" || failed=1
+    fi
     exit "$failed"
     ;;
   stop)
     failed=0
-    for category in "${CATEGORIES[@]}"; do stop_one "$category" || failed=1; done
-    bash scripts/keeper/manage-sync-v2.sh stop "$NETWORK" || failed=1
+    if [[ "$TARGET" == "all" ]]; then
+      for category in "${CATEGORIES[@]}"; do stop_one "$category" || failed=1; done
+      bash scripts/keeper/manage-sync-v2.sh stop "$NETWORK" || failed=1
+    elif [[ "$TARGET" == "sync" ]]; then
+      bash scripts/keeper/manage-sync-v2.sh stop "$NETWORK" || failed=1
+    else
+      stop_one "$TARGET" || failed=1
+    fi
     exit "$failed"
     ;;
   restart)
     failed=0
-    for category in "${CATEGORIES[@]}"; do stop_one "$category" || failed=1; done
-    bash scripts/keeper/manage-sync-v2.sh restart "$NETWORK" || failed=1
-    npm run wallet:verify-isolation -- "$NETWORK" || exit 1
-    for category in "${CATEGORIES[@]}"; do start_one "$category" || failed=1; done
+    if [[ "$TARGET" == "sync" ]]; then
+      exec bash scripts/keeper/manage-sync-v2.sh restart "$NETWORK"
+    fi
+    if [[ "$TARGET" == "all" ]]; then
+      for category in "${CATEGORIES[@]}"; do stop_one "$category" || failed=1; done
+      bash scripts/keeper/manage-sync-v2.sh restart "$NETWORK" || failed=1
+      check_transaction_keeper_start
+      for category in "${CATEGORIES[@]}"; do start_one "$category" || failed=1; done
+    else
+      stop_one "$TARGET" || failed=1
+      check_transaction_keeper_start
+      start_one "$TARGET" || failed=1
+    fi
     exit "$failed"
     ;;
   status)
-    bash scripts/keeper/manage-sync-v2.sh status "$NETWORK"
-    for category in "${CATEGORIES[@]}"; do status_one "$category"; done
+    if [[ "$TARGET" == "all" ]]; then
+      bash scripts/keeper/manage-sync-v2.sh status "$NETWORK"
+      for category in "${CATEGORIES[@]}"; do status_one "$category"; done
+    elif [[ "$TARGET" == "sync" ]]; then
+      bash scripts/keeper/manage-sync-v2.sh status "$NETWORK"
+    else
+      status_one "$TARGET"
+    fi
     ;;
   *)
-    echo "Usage: $0 <start|stop|restart|status> [network]" >&2
+    echo "Usage: $0 <start|stop|restart|status> [network] [all|crypto|stocks|sports|sync]" >&2
     exit 2
     ;;
 esac

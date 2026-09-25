@@ -21,6 +21,7 @@ import {
   abortBatchIfWalletUnavailable,
   errorMessage,
   keeperBatchLimit,
+  shouldPersistWalletSessionState,
   stopWalletSafely,
 } from './reliability.js'
 import { executeKeeperTransaction } from './transaction-executor.js'
@@ -157,6 +158,7 @@ export async function publishDraftsV3(
 
     const context = options.context ?? await connectKeeperV3(network)
     const { deployed, walletCtx } = context
+    let hadUnconfirmedTransactionFailure = false
     try {
       for (const row of chunk) {
         // A proof/call already in flight cannot be cancelled safely. Check only
@@ -239,6 +241,7 @@ export async function publishDraftsV3(
             ok++
             console.log(`  • ${row.id.slice(0, 12)}… already on-chain — marked`)
           } else {
+            hadUnconfirmedTransactionFailure = true
             console.error(`  ✗ ${row.id.slice(0, 12)}… failed (left as draft): ${msg}`)
             // A transport failure or InvalidDustSpendProof (Custom error 170)
             // invalidates the wallet's view of DUST/UTXOs. 170 is deliberately
@@ -252,12 +255,18 @@ export async function publishDraftsV3(
         }
       }
     } finally {
-      // Preserve the latest DUST/shielded progress so the next session performs
-      // only a short incremental sync, not a full wallet replay.
-      try {
-        await walletCtx.saveState()
-      } catch (error) {
-        console.warn(`[publish-v3] wallet cache save failed: ${errorMessage(error)}`)
+      // Each confirmed transaction is saved by executeKeeperTransaction after
+      // its exact wallet/DUST settlement barrier. Never overwrite that safe
+      // snapshot with SDK state mutated while balancing/finalizing a transaction
+      // that the node rejected (for example InvalidDustSpendProof / error 170).
+      if (shouldPersistWalletSessionState(hadUnconfirmedTransactionFailure)) {
+        try {
+          await walletCtx.saveState()
+        } catch (error) {
+          console.warn(`[publish-v3] wallet cache save failed: ${errorMessage(error)}`)
+        }
+      } else {
+        console.warn('[publish-v3] unsafe post-failure wallet state was not cached; retaining the previous last-known-good snapshot.')
       }
       if (!options.context) {
         await stopWalletSafely(walletCtx.wallet, `publish-v3 session ${sessionNumber}`)
